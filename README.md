@@ -12,6 +12,9 @@ O pacote não contém tokens OpenAI, cookies, conversas, chaves SSH, contas de
 nuvem, identificadores OAuth ou configurações do servidor de origem. Cada conta
 é autenticada pelo proprietário depois da instalação.
 
+[Código-fonte](https://github.com/sasocq-web/dex-remote-installer) ·
+[Downloads e checksums](https://github.com/sasocq-web/dex-remote-installer/releases/latest)
+
 ## Compatibilidade
 
 Um `.deb` é instalável nativamente em Debian, Ubuntu e derivados com systemd.
