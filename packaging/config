@@ -1,0 +1,6 @@
+#!/bin/sh
+set -e
+. /usr/share/debconf/confmodule
+db_input critical dex-remote-installer/mode || true
+db_go || true
+exit 0

@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+APP_DIR="${CLC_APP_DIR:-/opt/dex-remote/app}"
+export PYTHONPATH="$APP_DIR${PYTHONPATH:+:$PYTHONPATH}"
+exec /usr/bin/python3 -m clc.system_mcp

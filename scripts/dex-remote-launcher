@@ -1,0 +1,27 @@
+#!/bin/sh
+set -eu
+
+URL="${DEX_REMOTE_URL:-http://127.0.0.1:8787}"
+ACTIVE_USER=""
+if [ -r /etc/dex-remote/active-user ]; then
+  ACTIVE_USER="$(tr -cd 'A-Za-z0-9._-' </etc/dex-remote/active-user)"
+fi
+
+if [ -n "$ACTIVE_USER" ] && command -v systemctl >/dev/null 2>&1; then
+  systemctl start "dex-remote@$ACTIVE_USER.service" >/dev/null 2>&1 || true
+fi
+
+tries=0
+while [ "$tries" -lt 80 ]; do
+  if curl -fsS "$URL/api/session" >/dev/null 2>&1; then
+    exec xdg-open "$URL"
+  fi
+  tries=$((tries + 1))
+  sleep 0.25
+done
+
+if command -v notify-send >/dev/null 2>&1; then
+  notify-send --urgency=critical "Dex Remoto" "O serviço não respondeu. Execute: sudo systemctl status dex-remote@${ACTIVE_USER:-USUARIO}.service"
+fi
+echo "O Dex Remoto não respondeu em $URL" >&2
+exit 1

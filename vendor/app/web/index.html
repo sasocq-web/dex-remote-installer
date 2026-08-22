@@ -1,0 +1,613 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,interactive-widget=resizes-content">
+  <meta name="theme-color" content="#101828">
+  <meta name="color-scheme" content="light dark">
+  <meta name="app-version" content="0.9.0">
+  <title>Codex Linux Control</title>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icons/codex-remoto-192.png" type="image/png">
+  <link rel="apple-touch-icon" href="/icons/codex-remoto-192.png">
+  <link rel="stylesheet" href="/styles.css?v=approval-card-compact-20260822-223-portable">
+</head>
+<body>
+  <div id="app" class="app-shell inspector-collapsed">
+    <nav id="operation-rail" class="operation-rail" aria-label="Áreas do Codex Operations">
+      <button class="rail-button" data-operation-view="projects" title="Projetos"><span>◇</span><small>Projetos</small></button>
+      <button class="rail-button" data-operation-view="queue" title="Fila"><span>☷</span><small>Fila</small><b id="rail-queue-count" class="rail-badge">0</b></button>
+      <button class="rail-button" data-operation-view="plugins" title="Plugins e ferramentas"><span>⬡</span><small>Plugins</small></button>
+      <button class="rail-button" data-operation-view="remote" title="Acesso remoto"><span>▣</span><small>Remoto</small></button>
+      <button id="rail-open-codex" class="rail-button codex-rail-button" data-operation-view="codex" title="Abrir Codex Sistema conectado"><span>›_</span><small>Codex</small></button>
+      <button class="rail-button" data-operation-view="system" title="Sistema"><span>◉</span><small>Sistema</small></button>
+      <button id="rail-open-settings" class="rail-button" type="button" title="Configurações"><span>⚙</span><small>Ajustes</small></button>
+    </nav>
+    <aside id="sidebar" class="sidebar">
+      <div class="brand-row">
+        <img src="/icons/codex-remoto-192.png" alt="" class="brand-icon">
+        <div>
+          <strong>Codex Linux</strong>
+          <small id="connection-label">Conectando…</small>
+        </div>
+        <button class="icon-button mobile-only" id="close-sidebar" aria-label="Recolher menu lateral" title="Recolher menu lateral">×</button>
+      </div>
+
+      <button id="new-thread" class="primary-button full-width">＋ Nova conversa</button>
+
+      <section class="side-section project-sidebar-section">
+        <div class="section-title-row">
+          <h2>Sistema e projetos</h2>
+          <button id="add-project" class="icon-button" title="Escolher uma pasta de projeto">＋</button>
+        </div>
+        <div id="project-list" class="nav-list"></div>
+        <details class="project-actions-menu">
+          <summary>Opções dos projetos</summary>
+          <div class="project-actions-grid">
+            <button class="ghost-button suggestion" data-prompt="Analise este projeto e explique sua estrutura, riscos e próximos passos.">Analisar projeto</button>
+            <button class="ghost-button suggestion" data-prompt="Verifique o estado do Git, execute os testes existentes e resuma os problemas encontrados.">Verificar projeto</button>
+            <button class="ghost-button suggestion" data-prompt="Revise as alterações não commitadas, identifique erros e proponha correções seguras.">Revisar alterações</button>
+            <button id="create-project" class="ghost-button">＋ Criar projeto</button>
+            <button id="select-project-folder" class="ghost-button">Selecionar pasta</button>
+            <button id="manage-projects" class="ghost-button">Gerenciar projetos</button>
+          </div>
+        </details>
+      </section>
+
+      <div class="side-footer">
+        <button id="open-pc-data" class="sidebar-pc-button" type="button">
+          <span class="sidebar-pc-icon" aria-hidden="true">▤</span>
+          <span><strong>Dados do PC</strong><small>CPU, memória e SSD</small></span>
+          <span aria-hidden="true">›</span>
+        </button>
+        <nav class="mobile-sidebar-navigation" aria-label="Navegação do aplicativo">
+          <button class="mobile-sidebar-action" data-operation-view="projects"><span aria-hidden="true">◇</span><span>Projetos</span></button>
+          <button class="mobile-sidebar-action" data-operation-view="queue"><span aria-hidden="true">☷</span><span>Fila</span></button>
+          <button class="mobile-sidebar-action" data-operation-view="plugins"><span aria-hidden="true">⬡</span><span>Plugins</span></button>
+          <button class="mobile-sidebar-action" data-operation-view="remote"><span aria-hidden="true">▣</span><span>Acesso remoto</span></button>
+          <button id="sidebar-open-codex" class="mobile-sidebar-action" data-operation-view="codex"><span aria-hidden="true">›_</span><span>Codex Sistema</span></button>
+          <button id="open-settings" class="mobile-sidebar-action"><span aria-hidden="true">⚙</span><span>Configurações</span></button>
+        </nav>
+        <button id="install-pwa" class="secondary-button full-width hidden">Instalar no dispositivo</button>
+        <button id="open-system" class="hidden" tabindex="-1" aria-hidden="true">Sistema</button>
+      </div>
+    </aside>
+
+    <main class="workspace">
+      <header class="topbar">
+        <button id="open-sidebar" class="icon-button mobile-only" aria-label="Abrir menu lateral" title="Abrir menu lateral">☰</button>
+        <div class="topbar-title">
+          <strong id="active-title">Nova conversa</strong>
+          <small id="active-project-label">Selecione um projeto</small>
+        </div>
+        <button id="open-conversation-home" class="icon-button page-refresh-button" type="button" aria-label="Conversas recentes" title="Conversas recentes">⌂</button>
+        <button id="reload-page" class="icon-button page-refresh-button" type="button" aria-label="Atualizar página" title="Atualizar página">↻</button>
+        <button id="system-update" class="icon-button page-refresh-button system-update-button" type="button" aria-label="Verificar atualização do sistema" title="Verificar atualização do sistema" data-update-pending="false" disabled>⇧</button>
+        <div class="topbar-actions">
+          <span id="status-pill" class="status-pill muted">Inicializando</span>
+          <details id="codex-usage-menu" class="codex-usage-menu">
+            <summary title="Ver a cota semanal e os demais detalhes de uso do Codex">
+              <span>Cota semanal</span>
+              <strong id="codex-usage-summary">Consultando…</strong>
+            </summary>
+            <div id="home-codex-usage" class="home-codex-usage" aria-live="polite">
+              <article class="maintenance-card quota-card"><h3>Plano e cotas do Codex</h3><p>Consultando o uso da conta…</p></article>
+            </div>
+          </details>
+          <button id="open-terminal" class="secondary-button compact-button context-shortcut" title="Abrir o Codex Sistema conectado">Codex Sistema</button>
+          <button id="open-tools" class="secondary-button compact-button context-shortcut" title="Abrir ferramentas no painel contextual">Ferramentas <span id="tool-count" class="badge">0</span></button>
+          <button id="rename-thread" class="icon-button" title="Renomear conversa" disabled>✎</button>
+          <button id="archive-thread" class="icon-button" title="Arquivar conversa" disabled>▣</button>
+          <button id="open-inspector" class="icon-button mobile-only" aria-label="Mostrar ou recolher painel direito" aria-pressed="true" title="Mostrar ou recolher painel direito">☷</button>
+        </div>
+      </header>
+
+      <div id="login-banner" class="login-banner hidden">
+        <div>
+          <strong>Entre com sua conta do ChatGPT</strong>
+          <span>O workspace ativo ainda não está autenticado neste computador.</span>
+        </div>
+        <button id="start-login" class="primary-button">Entrar</button>
+      </div>
+
+      <section id="chat" class="chat" aria-live="polite">
+        <div id="empty-state" class="empty-state">
+          <div class="recent-conversations-header">
+            <div>
+              <h1 id="conversation-home-title">Conversas recentes</h1>
+              <p id="conversation-home-description">Atividade mais recente de todos os projetos.</p>
+            </div>
+            <div class="recent-conversations-actions">
+              <button id="project-new-thread" class="primary-button compact-button hidden">＋ Nova conversa</button>
+              <button id="refresh-threads" class="icon-button" title="Atualizar conversas" aria-label="Atualizar conversas">↻</button>
+            </div>
+          </div>
+          <button id="resource-alert" class="resource-alert hidden" type="button" aria-live="polite" aria-label="Abrir dados do PC">
+            <span class="resource-alert-icon" aria-hidden="true">!</span>
+            <span class="resource-alert-copy"><strong>Atenção aos recursos do PC</strong><small id="resource-alert-message"></small></span>
+            <span class="resource-alert-action">Ver dados</span>
+          </button>
+          <input id="thread-search" class="search-input recent-search" type="search" placeholder="Pesquisar conversas">
+          <div id="thread-list" class="recent-thread-list"></div>
+          <div id="conversation-home-empty" class="recent-empty hidden">
+            <strong>Nenhuma conversa encontrada</strong>
+            <span>Selecione um projeto e inicie uma nova conversa.</span>
+          </div>
+        </div>
+        <div id="message-list" class="message-list"></div>
+      </section>
+
+      <footer class="composer-wrap">
+        <div id="composer-queue-tray" class="composer-queue-tray hidden" aria-live="polite"></div>
+        <div class="composer-options">
+          <details id="composer-settings-menu" class="composer-settings-menu">
+            <summary title="Modelo, raciocínio, velocidade e internet"><span aria-hidden="true">⚙</span> Ajustes</summary>
+            <div class="composer-settings-popover">
+              <label>Modelo<select id="model-select" aria-label="Modelo" title="Modelo usado nesta e nas próximas mensagens"><option value="">Carregando modelo…</option></select></label>
+              <label>Raciocínio<select id="effort-select" aria-label="Intensidade do raciocínio" title="Mais raciocínio pode melhorar tarefas difíceis, mas leva mais tempo"><option value="">Carregando raciocínio…</option></select></label>
+              <label>Velocidade<select id="speed-select" aria-label="Velocidade" title="Velocidades disponibilizadas pelo modelo e pelo seu plano"><option value="">Carregando velocidade…</option></select></label>
+              <label>Internet<select id="network-select" aria-label="Acesso à internet" title="Permite ou bloqueia o acesso do Codex a sites, APIs e servidores durante a execução">
+                <option value="enabled">Permitida</option>
+                <option value="restricted">Bloqueada</option>
+              </select></label>
+            </div>
+          </details>
+          <button id="composer-tools" class="tool-profile-chip" title="Ferramentas associadas à conversa">Sem ferramentas</button>
+          <button id="composer-mode" class="composer-mode-chip hidden" type="button" title="Desativar modo especial"></button>
+        </div>
+        <div class="composer">
+          <button id="add-button" class="icon-button composer-icon" type="button" aria-label="Adicionar" title="Adicionar arquivos, imagens, meta, planejamento ou plugins">＋</button>
+          <button id="mention-button" class="icon-button composer-icon" aria-label="Mencionar" title="Referenciar projeto, pasta, conversa, skill, plugin, Chrome ou servidor">@</button>
+          <textarea id="prompt" rows="1" placeholder="Converse com o Codex…" maxlength="200000"></textarea>
+          <div class="composer-running-actions" role="group" aria-label="Controles da execução">
+            <button id="interrupt-button" class="danger-button composer-action hidden" aria-label="Parar" title="Parar execução"><span aria-hidden="true">■</span><span class="composer-action-label">Parar</span></button>
+            <button id="queue-button" class="primary-button composer-action hidden" aria-label="Adicionar à fila" title="Adicionar à fila"><span aria-hidden="true">☷</span><span class="composer-action-label">Fila</span></button>
+          </div>
+          <button id="send-button" class="primary-button composer-send" aria-label="Enviar" title="Enviar">↑</button>
+        </div>
+        <input id="composer-file-input" class="hidden" type="file" multiple>
+        <input id="composer-image-input" class="hidden" type="file" accept="image/*" multiple>
+        <input id="composer-folder-input" class="hidden" type="file" webkitdirectory directory multiple>
+        <div id="add-menu" class="add-menu hidden" role="menu">
+          <button type="button" data-add-action="files"><span>📎</span><span><strong>Arquivos</strong><small>Anexar um ou mais arquivos</small></span></button>
+          <button type="button" data-add-action="images"><span>▧</span><span><strong>Imagens</strong><small>Anexar, colar ou arrastar imagens</small></span></button>
+          <button type="button" data-add-action="folder"><span>▱</span><span><strong>Pasta</strong><small>Anexar os arquivos de uma pasta</small></span></button>
+          <button type="button" data-add-action="goal"><span>◎</span><span><strong>Meta</strong><small>Usar a próxima solicitação como objetivo</small></span></button>
+          <button type="button" data-add-action="plan"><span>✦</span><span><strong>Modo de planejamento</strong><small>Planejar antes de executar mudanças</small></span></button>
+          <button type="button" data-add-action="plugins"><span>⬡</span><span><strong>Plugins</strong><small>Disponíveis, instalados e conectados</small></span></button>
+        </div>
+        <div id="mention-picker" class="mention-picker hidden" role="listbox" aria-label="Adicionar referência"></div>
+        <div id="reference-chips" class="reference-chips" aria-live="polite"></div>
+        <small class="composer-hint">Enter quebra a linha • envie somente pelo botão ↑ • operações sensíveis pedem aprovação</small>
+      </footer>
+
+    </main>
+
+    <aside id="inspector" class="inspector">
+      <div class="inspector-header">
+        <div class="tabs">
+          <button class="tab" data-tab="queue">Fila <span id="queue-count" class="badge">0</span></button>
+          <button class="tab active" data-tab="approvals">Aprovações <span id="approval-count" class="badge">0</span></button>
+          <button class="tab" data-tab="diff">Alterações</button>
+          <button class="tab" data-tab="activity">Atividade</button>
+          <button class="tab" data-tab="terminal">Terminal</button>
+          <button class="tab" data-tab="tools">Ferramentas</button>
+          <button class="tab" data-tab="screen">Tela</button>
+        </div>
+        <button id="close-inspector" class="icon-button mobile-only" aria-label="Recolher painel direito" title="Recolher painel direito">×</button>
+      </div>
+      <div id="tab-queue" class="tab-panel"><div id="queue-list" class="panel-content"></div></div>
+      <div id="tab-approvals" class="tab-panel active"><div id="approval-list" class="panel-content"></div></div>
+      <div id="tab-diff" class="tab-panel"><pre id="diff-view" class="diff-view">Nenhuma alteração registrada nesta conversa.</pre></div>
+      <div id="tab-activity" class="tab-panel"><div id="activity-list" class="panel-content"></div></div>
+      <div id="tab-terminal" class="tab-panel"><div class="context-launch-panel"><h3>Codex Sistema</h3><p id="context-terminal-copy">Converse em linguagem simples para verificar, operar ou reparar o mini PC e seus serviços.</p><div class="card-actions"><button id="context-open-terminal" class="primary-button">Entrar no Codex conectado</button><button id="context-open-shell" class="secondary-button">Abrir shell avançado</button></div></div></div>
+      <div id="tab-tools" class="tab-panel"><div class="context-launch-panel"><h3>Ferramentas da conversa</h3><p>Skills, apps, plugins, MCPs, navegador e desktop associados ao contexto atual.</p><button id="context-open-tools" class="primary-button">Gerenciar ferramentas</button></div></div>
+      <div id="tab-screen" class="tab-panel">
+        <div class="remote-summary-panel">
+          <div class="remote-summary-icon" aria-hidden="true">▣</div>
+          <h3>Área de trabalho remota</h3>
+          <p id="remote-summary-status">Verificando o ambiente gráfico seguro…</p>
+          <button id="open-remote-desktop" class="primary-button full-width">Escolher ambiente remoto</button>
+          <button id="open-remote-browser" class="secondary-button full-width">Abrir navegador adaptado</button>
+          <div class="remote-feature-list" aria-label="Recursos da tela remota">
+            <span>✓ toque e gestos</span><span>✓ teclado virtual</span><span>✓ mouse e teclado</span><span>✓ ajuste automático</span>
+          </div>
+          <small>A transmissão usa HTTPS privado, sessão autenticada e uma ponte para socket Unix. Nenhuma porta VNC fica exposta.</small>
+        </div>
+      </div>
+    </aside>
+  </div>
+
+  <section id="setup-overlay" class="setup-overlay hidden" aria-modal="true" role="dialog">
+    <div class="setup-window">
+      <header class="setup-header">
+        <div class="setup-brand">
+          <img src="/icons/codex-remoto-192.png" alt="" class="setup-icon">
+          <div>
+            <strong>Configuração do Codex Linux Control</strong>
+            <small>Todo o processo é feito por botões e janelas gráficas.</small>
+          </div>
+        </div>
+        <span id="setup-version" class="version-chip">v0.9.0</span>
+      </header>
+      <ol id="setup-progress" class="setup-progress" aria-label="Etapas da configuração">
+        <li data-step="0" class="active"><span>1</span>Início</li>
+        <li data-step="1"><span>2</span>Codex</li>
+        <li data-step="2"><span>3</span>Experiência completa</li>
+        <li data-step="3"><span>4</span>Projetos</li>
+        <li data-step="4"><span>5</span>Sincronização</li>
+        <li data-step="5"><span>6</span>Acesso externo</li>
+        <li data-step="6"><span>7</span>Concluir</li>
+      </ol>
+      <main id="setup-body" class="setup-body"></main>
+      <footer class="setup-footer">
+        <button id="setup-back" class="secondary-button" disabled>Voltar</button>
+        <div class="setup-footer-spacer"></div>
+        <button id="setup-refresh" class="ghost-button">Atualizar verificação</button>
+        <button id="setup-next" class="primary-button">Continuar</button>
+      </footer>
+    </div>
+  </section>
+
+  <section id="device-auth-overlay" class="device-auth-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="device-auth-title">
+    <div class="device-auth-card">
+      <img src="/icons/codex-remoto-192.png" alt="" class="setup-icon">
+      <h1 id="device-auth-title">Autorizar este dispositivo</h1>
+      <p id="device-auth-message">Este dispositivo precisa ser confirmado pelo Authenticator.</p>
+      <div id="device-auth-progress" class="device-auth-progress hidden" role="status">Verificando a chave do dispositivo…</div>
+      <div class="security-note">
+        <strong>Proteção em duas camadas</strong>
+        <span>Seu e-mail confirmado e uma chave criptográfica exclusiva deste dispositivo são verificados antes do acesso.</span>
+      </div>
+      <p class="device-auth-help">No computador Linux, abra <strong>Configurações → Dispositivos remotos → Parear dispositivo</strong> e leia o QR Code.</p>
+      <button id="retry-device-auth" class="primary-button">Tentar novamente</button>
+    </div>
+  </section>
+
+  <dialog id="project-dialog" class="dialog project-dialog" aria-labelledby="project-dialog-title">
+    <div class="dialog-header">
+      <div><strong id="project-dialog-title">Projetos Codex</strong><small>Crie, selecione ou retome projetos no mini PC.</small></div>
+      <button id="close-project-dialog" class="icon-button" aria-label="Fechar">×</button>
+    </div>
+    <div class="project-manager-body">
+      <section class="settings-card project-root-card">
+        <h3>1. Pasta raiz dos projetos</h3>
+        <p>Escolha onde os projetos ficarão guardados. Você também pode cadastrar ou criar outra pasta raiz no mini PC.</p>
+        <div class="project-root-form"><select id="project-root-select" class="search-input" aria-label="Pasta raiz dos projetos"></select><button id="open-project-root-browser" class="secondary-button">Escolher no Explorer</button></div>
+      </section>
+      <section class="settings-card">
+        <h3>2. Criar projeto novo</h3>
+        <p>Cria uma nova pasta dentro da raiz escolhida acima.</p>
+        <div class="project-manager-form"><input id="project-create-name" class="search-input" maxlength="100" placeholder="Nome do novo projeto"><button id="confirm-create-project" class="primary-button">Criar e abrir</button></div>
+      </section>
+      <section class="settings-card">
+        <h3>3. Abrir projeto importado</h3>
+        <p>Navegue pelas subpastas da raiz e use a pasta que já contém o projeto.</p>
+        <div class="project-folder-toolbar"><button id="project-folder-up" class="secondary-button compact-button">← Voltar</button><strong id="project-folder-current">Carregando…</strong></div>
+        <div id="project-folder-list" class="project-folder-list"><div class="panel-empty">Carregando pastas…</div></div>
+        <div class="project-folder-selection"><button id="add-project-folder-selection" class="secondary-button" type="button">＋ Adicionar pasta à seleção</button><div id="project-folder-selection-list" class="reference-chips" aria-live="polite"></div></div>
+        <div class="project-manager-form"><small>A primeira pasta selecionada será a principal do worker; as demais ficarão disponíveis como contexto.</small><input id="project-folder-name" class="search-input" maxlength="100" placeholder="Nome exibido (opcional)"><button id="confirm-select-project" class="primary-button">Usar pastas e abrir</button></div>
+      </section>
+      <section class="settings-card project-running-card">
+        <div class="settings-section-title"><div><h3>Projetos em andamento</h3><p>Retome o projeto e suas conversas salvas.</p></div><button id="refresh-project-manager" class="secondary-button">Atualizar</button></div>
+        <div id="project-manager-list" class="project-manager-list"></div>
+      </section>
+    </div>
+  </dialog>
+
+  <dialog id="project-root-dialog" class="dialog backup-folder-dialog" aria-labelledby="project-root-dialog-title">
+    <div class="dialog-header">
+      <div><strong id="project-root-dialog-title">Escolher pasta local ou OneDrive</strong><small>Selecione um local do mini PC ou abra a opção OneDrive exibida na lista.</small></div>
+      <button id="close-project-root-browser" class="icon-button" aria-label="Fechar">×</button>
+    </div>
+    <div class="backup-folder-toolbar">
+      <button id="project-root-browser-up" class="secondary-button compact-button">← Voltar</button>
+      <strong id="project-root-browser-current">Locais disponíveis</strong>
+      <button id="project-root-browser-refresh" class="ghost-button compact-button">Atualizar</button>
+    </div>
+    <div id="project-root-browser-list" class="backup-folder-list"><div class="panel-empty">Carregando pastas…</div></div>
+    <div class="backup-folder-create">
+      <input id="project-root-browser-new-name" maxlength="100" autocomplete="off" placeholder="Nome da nova pasta">
+      <button id="project-root-browser-create" class="secondary-button">Criar pasta</button>
+    </div>
+    <div class="dialog-actions">
+      <button id="project-root-browser-cancel" class="secondary-button">Cancelar</button>
+      <button id="project-root-browser-select" class="primary-button">Usar esta pasta como raiz</button>
+    </div>
+  </dialog>
+
+  <dialog id="terminal-dialog" class="dialog terminal-dialog" aria-labelledby="terminal-title">
+    <div class="dialog-header">
+      <div><strong id="terminal-title">Terminal do Codex</strong><small id="terminal-scope">Conectando…</small></div>
+      <button id="close-terminal" class="icon-button" aria-label="Fechar terminal">×</button>
+    </div>
+    <div class="terminal-toolbar">
+      <span id="terminal-state" class="status-chip warn">Desconectado</span>
+      <span id="terminal-privilege" class="terminal-privilege"></span>
+      <button id="terminal-reconnect" class="secondary-button compact-button">Reconectar</button>
+      <button id="terminal-clear" class="ghost-button compact-button">Limpar</button>
+    </div>
+    <pre id="terminal-output" class="terminal-output" tabindex="0" aria-live="polite"></pre>
+    <form id="terminal-form" class="terminal-composer">
+      <span id="terminal-prompt" class="terminal-prompt">$</span>
+      <input id="terminal-input" autocomplete="off" autocapitalize="none" spellcheck="false" aria-label="Comando do terminal" placeholder="Digite um comando">
+      <button id="terminal-submit" class="primary-button" type="submit">Executar</button>
+    </form>
+    <div class="terminal-shortcuts">
+      <button type="button" data-terminal-key="\u0003">Ctrl+C</button>
+      <button type="button" data-terminal-key="\u0004">Ctrl+D</button>
+      <button type="button" data-terminal-key="\t">Tab</button>
+      <button type="button" data-terminal-command="clear">clear</button>
+    </div>
+    <p class="terminal-warning">Emergência: Codex Sistema com administração auditável pelo broker. Sistema: shell root autenticado. Projetos: shell isolado como codex-worker.</p>
+  </dialog>
+
+  <dialog id="backup-folder-dialog" class="dialog backup-folder-dialog" aria-labelledby="backup-folder-title">
+    <div class="dialog-header">
+      <div><strong id="backup-folder-title">Escolher pasta de backup no OneDrive</strong><small>Pastas da conta OneDrive conectada — sem digitar o caminho.</small></div>
+      <button id="close-backup-folder" class="icon-button" aria-label="Fechar">×</button>
+    </div>
+    <div class="backup-folder-toolbar">
+      <button id="backup-folder-up" class="secondary-button compact-button">← Voltar</button>
+      <strong id="backup-folder-current">OneDrive /</strong>
+      <button id="backup-folder-refresh" class="ghost-button compact-button">Atualizar</button>
+    </div>
+    <div id="backup-folder-list" class="backup-folder-list"><div class="panel-empty">Carregando pastas…</div></div>
+    <div class="backup-folder-create">
+      <input id="backup-folder-new-name" maxlength="100" autocomplete="off" placeholder="Nome da nova pasta">
+      <button id="backup-folder-create" class="secondary-button">Criar pasta</button>
+    </div>
+    <div class="dialog-actions sticky-actions">
+      <button id="backup-folder-cancel" class="secondary-button">Cancelar</button>
+      <button id="backup-folder-select" class="primary-button">Usar esta pasta</button>
+    </div>
+  </dialog>
+
+  <dialog id="remote-environment-dialog" class="dialog remote-environment-dialog" aria-labelledby="remote-environment-title">
+    <div class="dialog-header">
+      <div><h2 id="remote-environment-title">Escolha o ambiente</h2><small>Abra o Codex em terminal ou com interface gráfica, sem misturar as identidades.</small></div>
+      <button id="remote-environment-close" class="icon-button" type="button" aria-label="Fechar escolha de ambiente">×</button>
+    </div>
+    <div class="remote-environment-grid">
+      <article class="remote-environment-card" data-environment="system">
+        <div class="remote-environment-heading"><span class="remote-environment-icon" aria-hidden="true">◉</span><div><h3>Sistema</h3><p>Control Plane e administração auditável do mini PC.</p></div></div>
+        <div class="remote-entry-actions">
+          <button class="remote-entry-button" type="button" data-remote-entry="system-terminal"><span aria-hidden="true">›_</span><strong>Codex Terminal</strong><small>Converse com o Codex do Sistema</small></button>
+          <button class="remote-entry-button" type="button" data-remote-entry="system-graphical"><span aria-hidden="true">◉</span><strong>Codex Gráfico</strong><small>Aplicativo oficial na sessão Ubuntu</small></button>
+        </div>
+      </article>
+      <article class="remote-environment-card" data-environment="projects">
+        <div class="remote-environment-heading"><span class="remote-environment-icon" aria-hidden="true">◇</span><div><h3>Projetos</h3><p>Workers e arquivos isolados do servidor de projetos.</p></div></div>
+        <label class="remote-project-choice">Projeto para o terminal<select id="remote-project-select" aria-label="Projeto para abrir no Codex Terminal"></select></label>
+        <div class="remote-entry-actions">
+          <button class="remote-entry-button" type="button" data-remote-entry="projects-terminal"><span aria-hidden="true">›_</span><strong>Codex Terminal</strong><small>Shell isolado do projeto escolhido</small></button>
+          <button class="remote-entry-button" type="button" data-remote-entry="projects-graphical"><span aria-hidden="true">◉</span><strong>Codex Gráfico</strong><small>Aplicativo oficial com identidade Projetos</small></button>
+        </div>
+      </article>
+      <article class="remote-environment-card compact" data-environment="android">
+        <div class="remote-environment-heading"><span class="remote-environment-icon" aria-hidden="true">▯</span><div><h3>Android / Waydroid</h3><p>Android 13 persistente para aplicativos e automação.</p></div></div>
+        <button class="remote-entry-button single" type="button" data-remote-entry="android-graphical"><span aria-hidden="true">▯</span><strong>Abrir Android ao vivo</strong><small>Toque, teclado e aplicativos na mesma sessão</small></button>
+      </article>
+      <article class="remote-environment-card compact" data-environment="desktop">
+        <div class="remote-environment-heading"><span class="remote-environment-icon" aria-hidden="true">▣</span><div><h3>Desktop Ubuntu</h3><p>Sessão GNOME padrão do mini PC.</p></div></div>
+        <button class="remote-entry-button single" type="button" data-remote-entry="desktop-graphical"><span aria-hidden="true">▣</span><strong>Abrir interface gráfica</strong><small>Desktop remoto protegido</small></button>
+      </article>
+      <article class="remote-environment-card compact" data-environment="games">
+        <div class="remote-environment-heading"><span class="remote-environment-icon" aria-hidden="true">▰</span><div><h3>Steam Machine / HDMI</h3><p>Controle visual da sessão de jogos.</p></div></div>
+        <button class="remote-entry-button single" type="button" data-remote-entry="games-graphical"><span aria-hidden="true">▰</span><strong>Abrir interface gráfica</strong><small>Não gira a saída HDMI física</small></button>
+      </article>
+    </div>
+    <p class="remote-environment-note">Sistema, Projetos e Android permanecem separados. O acesso gráfico não expõe portas VNC públicas.</p>
+  </dialog>
+
+  <dialog id="remote-dialog" class="remote-dialog" aria-labelledby="remote-dialog-title">
+    <header class="remote-header">
+      <div class="remote-title">
+        <strong id="remote-dialog-title">Área de trabalho Linux</strong>
+        <small id="remote-live-status" role="status">Preparando sessão privada…</small>
+      </div>
+    </header>
+    <div id="remote-stage" class="remote-stage" role="region" aria-label="Transmissão remota interativa" aria-describedby="remote-gesture-help">
+      <iframe id="remote-frame" title="Tela interativa do computador Linux" allow="clipboard-read; clipboard-write; fullscreen" referrerpolicy="no-referrer"></iframe>
+      <div id="remote-toolbar" class="remote-toolbar collapsed" role="toolbar" aria-label="Controles flutuantes da área de trabalho remota">
+        <button id="remote-toolbar-toggle" class="remote-tool remote-toolbar-toggle" type="button" aria-label="Mostrar controles da transmissão" aria-controls="remote-toolbar-menu" aria-expanded="false" title="Mostrar controles"><span aria-hidden="true">•••</span><span>Controles</span></button>
+        <div id="remote-toolbar-menu" class="remote-toolbar-menu" hidden>
+          <button id="remote-toolbar-drag" class="remote-tool remote-tool-drag" type="button" aria-label="Mover controles flutuantes" title="Arraste para mover os controles"><span aria-hidden="true">⠿</span><span>Mover</span></button>
+          <button id="remote-change-environment" class="remote-tool" type="button" aria-label="Escolher outro ambiente remoto" title="Trocar ambiente"><span aria-hidden="true">▦</span><span>Ambiente</span></button>
+          <div class="remote-toolbar-group" role="group" aria-label="Aplicativos do Ubuntu">
+            <button id="remote-launch-browser" class="remote-tool" aria-label="Abrir navegador" title="Abrir navegador"><span aria-hidden="true">◉</span><span>Navegador</span></button>
+            <button id="remote-launch-files" class="remote-tool" aria-label="Abrir arquivos" title="Abrir arquivos"><span aria-hidden="true">▤</span><span>Arquivos</span></button>
+          </div>
+          <button id="remote-mobile-layout" class="remote-tool" type="button" aria-label="Abrir o navegador gerenciado em layout de celular" aria-pressed="false" title="Abrir navegador em layout de celular"><span aria-hidden="true">▯</span><span>Abrir celular</span></button>
+          <button id="remote-return-game" class="remote-tool" type="button" hidden aria-label="Voltar à tela do jogo que já está aberto" title="Voltar ao jogo aberto sem reiniciá-lo"><span aria-hidden="true">▶</span><span>Voltar ao jogo</span></button>
+          <div class="remote-toolbar-group remote-window-controls" role="group" aria-label="Controles da janela ativa do Ubuntu">
+            <button id="remote-window-switch" class="remote-tool" type="button" aria-label="Ver e trocar as janelas abertas" title="Ver e trocar janelas"><span aria-hidden="true">⇄</span><span>Trocar janela</span></button>
+            <button id="remote-window-minimize" class="remote-tool" type="button" aria-label="Minimizar janela ativa do Ubuntu" title="Minimizar janela"><span aria-hidden="true">−</span><span>Minimizar</span></button>
+            <button id="remote-window-maximize" class="remote-tool" type="button" aria-label="Expandir ou restaurar janela ativa do Ubuntu" title="Expandir ou restaurar janela"><span aria-hidden="true">□</span><span>Expandir</span></button>
+            <button id="remote-window-close" class="remote-tool danger-tool" type="button" aria-label="Fechar janela ativa do Ubuntu" title="Fechar janela ativa"><span aria-hidden="true">×</span><span>Fechar janela</span></button>
+          </div>
+          <button id="remote-keyboard" class="remote-tool" type="button" aria-label="Usar teclado do Android para digitar no Ubuntu" aria-pressed="false" title="Teclado do Android opcional"><span aria-hidden="true">⌨</span><span>Teclado Android</span></button>
+          <button id="remote-keyboard-ubuntu" class="remote-tool" type="button" aria-label="Usar o teclado touch nativo do Ubuntu" aria-pressed="false" title="Teclado touch do Ubuntu"><span aria-hidden="true">▤</span><span>Teclado Ubuntu</span></button>
+          <button id="remote-paste-device" class="remote-tool" type="button" aria-label="Colar texto da área de transferência deste aparelho na janela remota" title="Colar do aparelho"><span aria-hidden="true">📋</span><span>Colar do aparelho</span></button>
+          <div class="remote-pointer-choice" role="group" aria-label="Modo do ponteiro por toque">
+            <button id="remote-pointer-direct" class="remote-tool active" type="button" aria-label="Usar toque direto" aria-pressed="true" title="Toque direto"><span aria-hidden="true">◎</span><span>Toque</span></button>
+            <button id="remote-pointer-trackpad" class="remote-tool" type="button" aria-label="Deslizar o mouse como trackpad" aria-pressed="false" title="Deslizar mouse"><span aria-hidden="true">↗</span><span>Trackpad</span></button>
+          </div>
+          <div class="remote-scroll-controls" role="group" aria-label="Rolar o conteúdo da tela remota">
+            <button id="remote-scroll-left" class="remote-tool" type="button" aria-label="Rolar conteúdo para a esquerda" title="Rolar para a esquerda"><span aria-hidden="true">←</span></button>
+            <button id="remote-scroll-up" class="remote-tool" type="button" aria-label="Rolar conteúdo para cima" title="Rolar para cima"><span aria-hidden="true">↑</span></button>
+            <button id="remote-scroll-down" class="remote-tool" type="button" aria-label="Rolar conteúdo para baixo" title="Rolar para baixo"><span aria-hidden="true">↓</span></button>
+            <button id="remote-scroll-right" class="remote-tool" type="button" aria-label="Rolar conteúdo para a direita" title="Rolar para a direita"><span aria-hidden="true">→</span></button>
+          </div>
+          <p id="remote-gesture-help" class="remote-gesture-help">Um dedo toca diretamente na tela. Dois dedos rolam na vertical ou horizontal; afaste ou aproxime os dedos para ampliar.</p>
+          <button id="remote-zoom-reset" class="remote-tool" aria-label="Restaurar ampliação da transmissão" title="Restaurar ampliação"><span aria-hidden="true">1:1</span><span>Zoom</span></button>
+          <button id="remote-fit" class="remote-tool" aria-label="Ajustar a tela ao dispositivo" title="Ajustar tela"><span aria-hidden="true">⛶</span><span>Ajustar</span></button>
+          <button id="remote-fullscreen" class="remote-tool" aria-label="Alternar tela cheia do dispositivo" aria-pressed="false" title="Tela cheia do dispositivo"><span aria-hidden="true">⛶</span><span>Tela cheia</span></button>
+          <button id="remote-close" class="remote-tool danger-tool" aria-label="Fechar tela remota" title="Fechar"><span aria-hidden="true">×</span><span>Fechar</span></button>
+        </div>
+      </div>
+      <div id="remote-game-console-dock" class="remote-game-console-dock" role="toolbar" aria-label="Controles da Steam Machine" hidden>
+        <button id="remote-steam-menu" class="remote-game-console-button steam-menu-button" type="button" aria-label="Abrir o menu STEAM com Início, Biblioteca, Loja, Amigos, Mídias, Downloads, Configurações e Energia" title="Menu STEAM">
+          <strong>STEAM</strong><span>Menu</span>
+        </button>
+        <button id="remote-steam-back" class="remote-game-console-button steam-back-button" type="button" aria-label="Voltar uma tela na interface do Steam" title="Voltar uma tela"><strong>B</strong><span>Voltar</span></button>
+        <button id="remote-return-game-primary" class="remote-game-console-button return-game-button" type="button" aria-label="Voltar imediatamente ao jogo aberto sem reiniciá-lo" title="Voltar ao jogo aberto sem reiniciá-lo">
+          <span class="return-game-icon" aria-hidden="true">▶</span><span><strong>Voltar ao jogo</strong><small>sem reiniciar</small></span>
+        </button>
+        <button id="remote-steam-quick" class="remote-game-console-button steam-quick-button" type="button" aria-label="Abrir o Acesso rápido do Steam Deck com áudio, Bluetooth, controle, desempenho, música e ajuda" title="Acesso rápido do Steam Deck">
+          <strong>•••</strong><span>Acesso rápido</span>
+        </button>
+      </div>
+      <div id="remote-keyboard-panel" class="remote-keyboard-panel" hidden>
+        <input id="remote-keyboard-proxy" class="remote-keyboard-proxy" type="text" aria-label="Digite para enviar à tela remota" placeholder="Digite para enviar à tela…" autocomplete="off" autocapitalize="sentences" spellcheck="true" inputmode="text" enterkeyhint="enter">
+        <button id="remote-keyboard-enter" class="remote-keyboard-action" type="button" aria-label="Enviar Enter">Enter</button>
+        <button id="remote-keyboard-backspace" class="remote-keyboard-action" type="button" aria-label="Enviar Backspace">⌫</button>
+        <button id="remote-keyboard-hide" class="remote-keyboard-action" type="button" aria-label="Ocultar teclado">⌄</button>
+      </div>
+      <div class="remote-immersive-controls" aria-label="Controles da tela inteira">
+        <button id="remote-keyboard-immersive" class="remote-floating-tool" aria-label="Mostrar teclado virtual" title="Teclado virtual">⌨</button>
+        <button id="remote-exit-immersive" class="remote-floating-tool" aria-label="Mostrar os controles do Codex" title="Sair da tela inteira">↙</button>
+        <button id="remote-close-immersive" class="remote-floating-tool danger-tool" aria-label="Fechar tela remota" title="Fechar tela remota">×</button>
+      </div>
+      <div id="remote-placeholder" class="remote-placeholder">
+        <span class="spinner"></span>
+        <strong>Iniciando a sessão gráfica segura</strong>
+        <small>A resolução será escolhida automaticamente para este dispositivo.</small>
+      </div>
+    </div>
+    <footer class="remote-footer">
+      <span class="secure-connection"><span aria-hidden="true">🔒</span> conexão privada e criptografada</span>
+      <label>Sessão
+        <select id="remote-target" aria-label="Sessão Linux a controlar">
+          <option value="codex">Codex • GNOME Ubuntu</option>
+          <option value="projects">Codex Projetos • perfil Ubuntu</option>
+          <option value="desktop">Desktop Ubuntu</option>
+          <option value="jogos">Steam Machine / HDMI</option>
+        </select>
+      </label>
+      <label>Visualização
+        <select id="remote-profile" aria-label="Perfil da tela remota">
+          <option value="auto">Automático</option>
+          <option value="phone">Celular</option>
+          <option value="tablet">Tablet</option>
+          <option value="desktop">Computador</option>
+        </select>
+      </label>
+      <label>Ponteiro
+        <select id="remote-pointer-mode" aria-label="Modo de ponteiro por toque">
+          <option value="direct">Toque direto</option>
+          <option value="trackpad">Arrastar mouse</option>
+        </select>
+      </label>
+      <label>Tamanho
+        <select id="remote-interface-scale" aria-label="Tamanho da interface e dos ícones do Ubuntu">
+          <option value="auto">Automático</option>
+          <option value="1">Normal</option>
+          <option value="1.25">Grande</option>
+          <option value="1.5">Extragrande</option>
+        </select>
+      </label>
+      <button id="remote-stop" class="ghost-button">Encerrar sessão gráfica</button>
+    </footer>
+  </dialog>
+
+  <dialog id="pairing-dialog" class="dialog pairing-dialog" aria-labelledby="pairing-title">
+    <div class="dialog-header"><h2 id="pairing-title">Parear dispositivo remoto</h2><button id="close-pairing" class="icon-button" aria-label="Fechar">×</button></div>
+    <p>Abra o Tailscale no celular ou tablet e leia este QR Code. A autorização é válida uma única vez.</p>
+    <div class="pairing-qr-wrap"><img id="pairing-qr" alt="QR Code de pareamento do dispositivo"></div>
+    <a id="pairing-link" class="login-link" href="#" target="_blank" rel="noopener">Abrir endereço de pareamento</a>
+    <div class="pairing-meta"><span id="pairing-expiry">Expira em 10 minutos</span><span>Chave ECDSA P-256</span></div>
+    <div class="dialog-actions"><button id="copy-pairing-link" class="secondary-button">Copiar endereço</button><button id="pairing-done" class="primary-button">Concluir</button></div>
+  </dialog>
+
+  <dialog id="login-dialog" class="dialog">
+    <div class="dialog-header"><h2>Entrar com ChatGPT</h2><button id="close-login" class="icon-button">×</button></div>
+    <p>Abra o endereço abaixo e informe o código de uso único.</p>
+    <a id="verification-link" class="login-link" href="#" target="_blank" rel="noopener">Abrir página de autenticação</a>
+    <code id="user-code" class="device-code">—</code>
+    <p id="login-status">Aguardando autenticação…</p>
+  </dialog>
+
+  <dialog id="settings-dialog" class="dialog settings-dialog">
+    <div class="dialog-header"><h2>Configurações e manutenção</h2><button id="close-settings" class="icon-button">×</button></div>
+    <div id="settings-content" class="settings-content"></div>
+    <div class="dialog-actions sticky-actions">
+      <button id="refresh-status" class="secondary-button">Atualizar</button>
+      <button id="close-settings-bottom" class="primary-button">Fechar</button>
+    </div>
+  </dialog>
+
+  <dialog id="pc-data-dialog" class="dialog pc-data-dialog" aria-labelledby="pc-data-title">
+    <div class="dialog-header">
+      <div><h2 id="pc-data-title">Dados do PC</h2><small id="pc-data-updated">Consultando o mini PC…</small></div>
+      <button id="close-pc-data" class="icon-button" aria-label="Fechar dados do PC">×</button>
+    </div>
+    <div id="pc-data-content" class="pc-data-content" aria-live="polite">
+      <div class="panel-empty">Carregando CPU, memória e SSD…</div>
+    </div>
+    <div class="dialog-actions">
+      <button id="refresh-pc-data" class="secondary-button">Atualizar agora</button>
+      <button id="pc-data-system-details" class="primary-button">Ver sistema completo</button>
+    </div>
+  </dialog>
+
+  <dialog id="tools-dialog" class="dialog tools-dialog">
+    <div class="dialog-header">
+      <div><h2>Ferramentas da conversa</h2><small>Skills, apps, MCPs, navegador e desktop ficam associados à conversa atual.</small></div>
+      <button id="close-tools" class="icon-button">×</button>
+    </div>
+    <div class="tools-scope">
+      <label><input type="radio" name="tool-scope" value="thread" checked> Somente esta conversa</label>
+      <label><input type="radio" name="tool-scope" value="project"> Padrão para novas conversas do projeto</label>
+      <button id="refresh-tools" class="ghost-button">Atualizar catálogo</button>
+    </div>
+    <div class="tools-tabs">
+      <button class="tools-tab active" data-tools-tab="recommended">Principais</button>
+      <button class="tools-tab" data-tools-tab="skills">Skills</button>
+      <button class="tools-tab" data-tools-tab="apps">Apps</button>
+      <button class="tools-tab" data-tools-tab="plugins">Plugins</button>
+      <button class="tools-tab" data-tools-tab="mcp">MCP</button>
+    </div>
+    <div id="tools-content" class="tools-content"><div class="panel-empty">Carregando extensões…</div></div>
+    <div class="dialog-actions sticky-actions">
+      <span id="tools-summary" class="tools-summary">Nenhuma ferramenta selecionada</span>
+      <button id="save-tools" class="primary-button">Salvar associação</button>
+    </div>
+  </dialog>
+
+  <dialog id="task-dialog" class="dialog task-dialog">
+    <div class="dialog-header"><h2 id="task-title">Operação em andamento</h2><button id="close-task" class="icon-button" disabled>×</button></div>
+    <div class="task-status-row"><span id="task-spinner" class="spinner"></span><strong id="task-message">Preparando…</strong></div>
+    <div id="task-progress" class="task-progress hidden" role="progressbar" aria-label="Progresso do backup" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+      <div class="task-progress-meta"><span id="task-progress-phase">Preparando backup</span><strong id="task-progress-percent">0%</strong></div>
+      <div class="task-progress-track"><span id="task-progress-fill"></span></div>
+      <small id="task-progress-elapsed">Tempo decorrido: 0s</small>
+    </div>
+    <a id="task-action-link" class="login-link hidden" href="#" target="_blank" rel="noopener">Abrir página de autorização</a>
+    <details class="task-details"><summary>Ver detalhes</summary><pre id="task-logs" class="task-logs"></pre></details>
+    <div class="dialog-actions"><button id="task-done" class="primary-button" disabled>Concluir</button></div>
+  </dialog>
+
+  <dialog id="system-update-dialog" class="dialog task-dialog system-update-dialog" aria-labelledby="system-update-progress-title">
+    <div class="dialog-header"><h2 id="system-update-progress-title">Atualização do sistema</h2><button id="system-update-progress-close" class="icon-button" aria-label="Fechar">×</button></div>
+    <div class="task-status-row"><span class="spinner"></span><strong id="system-update-progress-message">Preparando a atualização do sistema…</strong></div>
+    <div id="system-update-progress" class="task-progress" role="progressbar" aria-label="Progresso da atualização do sistema" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+      <div class="task-progress-meta"><span>Implementando release</span><strong id="system-update-progress-percent">0%</strong></div>
+      <div class="task-progress-track"><span id="system-update-progress-fill"></span></div>
+      <small>O Dex pode se reconectar durante a troca do backend. A conversa será preservada.</small>
+    </div>
+  </dialog>
+
+  <dialog id="system-update-blockers-dialog" class="dialog system-update-blockers-dialog" aria-labelledby="system-update-blockers-title">
+    <div class="dialog-header"><h2 id="system-update-blockers-title">Atualização aguardando conversas</h2><button id="system-update-blockers-close" class="icon-button" aria-label="Fechar">×</button></div>
+    <p id="system-update-blockers-summary" class="system-update-blockers-summary"></p>
+    <div id="system-update-blockers-list" class="system-update-blockers-list"></div>
+    <small class="system-update-blockers-note">A release permanece apenas preparada. Nenhuma etapa da atualização será iniciada enquanto esta lista não estiver vazia.</small>
+  </dialog>
+
+  <div id="other-conversation-approval-popups" class="other-conversation-approval-popups" aria-live="assertive" aria-label="Solicitações de outras conversas"></div>
+  <div id="toast-container" class="toast-container" aria-live="assertive"></div>
+  <script src="/app.js?v=automatic-approval-silent-20260822-224-portable" defer></script>
+  <script src="/operations.js?v=project-conversations-fix175" defer></script>
+</body>
+</html>

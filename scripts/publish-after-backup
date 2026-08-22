@@ -1,0 +1,69 @@
+#!/bin/bash
+set -Eeuo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LOCK_FILE="${XDG_RUNTIME_DIR:-/tmp}/dex-remote-installer-publish.lock"
+
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+  echo "A publicação do Dex Remote Installer já está em execução."
+  exit 0
+fi
+
+command -v gh >/dev/null || { echo "Cliente gh não instalado; publicação adiada." >&2; exit 69; }
+gh auth status --hostname github.com >/dev/null 2>&1 || {
+  echo "GitHub não autenticado; publicação adiada sem afetar o backup." >&2
+  exit 77
+}
+[[ -d "$ROOT/.git" ]] || { echo "Repositório Git local ainda não inicializado." >&2; exit 69; }
+
+ORIGIN="$(git -C "$ROOT" remote get-url origin)"
+[[ -n "$ORIGIN" ]] || { echo "Remote origin ausente." >&2; exit 69; }
+REPOSITORY="$(gh repo view "$ORIGIN" --json nameWithOwner --jq .nameWithOwner)"
+WORK_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/dex-publish.XXXXXX")"
+trap 'rm -rf -- "$WORK_ROOT"' EXIT
+
+git clone --quiet "$ORIGIN" "$WORK_ROOT/repo"
+WORK="$WORK_ROOT/repo"
+git -C "$WORK" config user.name "SASOCQ Release Automation"
+git -C "$WORK" config user.email "packages@sasocq.com"
+
+set +e
+MERGE_OUTPUT="$($WORK/scripts/merge-dex-upstream 2>&1)"
+MERGE_STATUS=$?
+set -e
+if [[ $MERGE_STATUS -ne 0 && $MERGE_STATUS -ne 3 ]]; then
+  echo "$MERGE_OUTPUT" >&2
+  exit "$MERGE_STATUS"
+fi
+
+VERSION="$(tr -d '[:space:]' <"$WORK/PACKAGE_VERSION")"
+TAG="v$VERSION"
+if [[ $MERGE_STATUS -eq 3 ]] && gh release view "$TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
+  echo "Dex $TAG já está publicado; verificação pós-backup concluída."
+  exit 0
+fi
+
+"$WORK/build.sh"
+"$WORK/tests/test-package.sh"
+DEB="$WORK/dist/dex-remote-installer_${VERSION}_all.deb"
+SHA="$DEB.sha256"
+
+if [[ $MERGE_STATUS -eq 0 ]]; then
+  git -C "$WORK" add --all
+  git -C "$WORK" commit -m "chore: sincroniza Dex $(tr -d '[:space:]' <"$WORK/.dex-upstream-release")"
+  git -C "$WORK" push origin HEAD:main
+fi
+
+if ! gh release view "$TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
+  RELEASE_ID="$(tr -d '[:space:]' <"$WORK/.dex-upstream-release")"
+  gh release create "$TAG" "$DEB" "$SHA" \
+    --repo "$REPOSITORY" \
+    --title "Dex Remote Installer $VERSION" \
+    --notes "Pacote portátil sincronizado com a release Dex ${RELEASE_ID}. Inclui os perfis Projetos e Sistema + Projetos. O SHA-256 acompanha o download." \
+    --latest
+fi
+
+git -C "$ROOT" pull --ff-only origin main
+echo "Dex Remote Installer $VERSION publicado e verificado após o backup."
+

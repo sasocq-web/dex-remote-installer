@@ -1,0 +1,26 @@
+#!/bin/sh
+set -e
+. /usr/share/debconf/confmodule
+
+MODE="projects"
+db_get dex-remote-installer/mode || true
+case "${RET:-}" in
+  full) MODE="full" ;;
+  projects) MODE="projects" ;;
+esac
+
+CODEX_FLAG="--install-codex"
+if [ "${DEX_REMOTE_SKIP_CODEX_INSTALL:-0}" = "1" ]; then
+  CODEX_FLAG="--skip-codex"
+fi
+
+/usr/sbin/dex-remote-setup --mode "$MODE" "$CODEX_FLAG"
+
+if command -v update-desktop-database >/dev/null 2>&1; then
+  update-desktop-database /usr/share/applications >/dev/null 2>&1 || true
+fi
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+  gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor >/dev/null 2>&1 || true
+fi
+db_stop
+exit 0

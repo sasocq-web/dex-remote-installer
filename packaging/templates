@@ -1,0 +1,10 @@
+Template: dex-remote-installer/mode
+Type: select
+Choices-C: projects, full
+Choices: Somente Projetos, Sistema + Projetos
+Default: projects
+_Description: Qual perfil do Dex Remoto deve ser instalado?
+ Somente Projetos cria uma identidade isolada sem sudo.
+ Sistema + Projetos cria duas identidades e concede ao usuário codex sudo
+ integral sem senha. Essa segunda opção permite que o Codex altere qualquer
+ parte do computador e deve ser usada somente quando esse poder for desejado.

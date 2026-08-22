@@ -1,0 +1,16 @@
+{
+  "name": "Dex Remoto",
+  "short_name": "Codex Remoto",
+  "description": "Central remota para Codex de Projetos e Codex do Sistema em Linux",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#101828",
+  "theme_color": "#101828",
+  "lang": "pt-BR",
+  "icons": [
+    {"src": "/icons/codex-remoto-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+    {"src": "/icons/codex-remoto-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any"},
+    {"src": "/icons/codex-remoto-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"}
+  ]
+}

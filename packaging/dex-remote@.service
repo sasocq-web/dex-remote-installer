@@ -1,0 +1,27 @@
+[Unit]
+Description=Dex Remoto (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+Group=%i
+WorkingDirectory=/opt/dex-remote/app
+Environment=HOME=%h
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/opt/dex-remote/app
+Environment=CLC_PACKAGE_MODE=true
+Environment=CLC_HOST=127.0.0.1
+Environment=CLC_PORT=8787
+Environment=PATH=%h/.local/bin:%h/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 -m clc
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=45
+KillSignal=SIGTERM
+KillMode=mixed
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

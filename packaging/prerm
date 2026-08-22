@@ -1,0 +1,11 @@
+#!/bin/sh
+set -e
+if [ "$1" = "remove" ] || [ "$1" = "deconfigure" ]; then
+  if [ -r /etc/dex-remote/active-user ]; then
+    ACTIVE_USER="$(tr -cd 'A-Za-z0-9._-' </etc/dex-remote/active-user)"
+    if [ -n "$ACTIVE_USER" ]; then
+      systemctl disable --now "dex-remote@$ACTIVE_USER.service" >/dev/null 2>&1 || true
+    fi
+  fi
+fi
+exit 0

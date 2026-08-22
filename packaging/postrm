@@ -1,0 +1,12 @@
+#!/bin/sh
+set -e
+if [ "$1" = "purge" ]; then
+  rm -f /etc/sudoers.d/dex-remote-system
+  rm -f /etc/dex-remote/active-user /etc/dex-remote/install-mode
+  rmdir /etc/dex-remote 2>/dev/null || true
+  echo "As contas codex/codex-worker e seus dados foram preservados. Remova-as manualmente somente após revisar os projetos e conversas."
+fi
+if command -v update-desktop-database >/dev/null 2>&1; then
+  update-desktop-database /usr/share/applications >/dev/null 2>&1 || true
+fi
+exit 0

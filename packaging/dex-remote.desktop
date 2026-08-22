@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Dex Remoto
+GenericName=Interface remota do Codex
+Comment=Codex de Projetos e Codex do Sistema no Linux
+Exec=/usr/bin/dex-remote
+Icon=dex-remote
+Terminal=false
+Categories=Development;Utility;
+StartupNotify=true
+Keywords=Codex;ChatGPT;IA;Projetos;Sistema;

@@ -1,0 +1,36 @@
+#!/bin/sh
+set -eu
+TOOLS_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}/codex-linux-control/tools"
+NODE="$TOOLS_ROOT/node/bin/node"
+CLI="$TOOLS_ROOT/playwright/node_modules/@playwright/mcp/cli.js"
+OUTPUT="${XDG_DATA_HOME:-$HOME/.local/share}/codex-linux-control/browser-output"
+BROWSERS="${XDG_CACHE_HOME:-$HOME/.cache}/codex-linux-control/ms-playwright"
+STORAGE_STATE="${XDG_DATA_HOME:-$HOME/.local/share}/codex-linux-control/browser-storage-state.json"
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+LOCK_FILE="$RUNTIME_DIR/codex-linux-control-playwright.lock"
+[ -x "$NODE" ] || { echo "Node gerenciado pelo Codex Linux Control não foi encontrado" >&2; exit 127; }
+[ -f "$CLI" ] || { echo "Playwright MCP não foi encontrado" >&2; exit 127; }
+mkdir -p "$OUTPUT" "$BROWSERS"
+# A persistent Chromium profile accepts only one owner. Fail immediately when
+# an obsolete per-conversation configuration tries to launch a second server;
+# waiting on Chromium's profile lock used to leave the whole turn unfinished.
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+  echo "O navegador Dex já é administrado pelo serviço Playwright compartilhado; use http://localhost:8766/mcp" >&2
+  exit 75
+fi
+export PLAYWRIGHT_BROWSERS_PATH="$BROWSERS"
+exec "$NODE" "$CLI" \
+  --isolated \
+  --cdp-endpoint http://127.0.0.1:9223 \
+  --storage-state "$STORAGE_STATE" \
+  --output-dir "$OUTPUT" \
+  --save-session \
+  --caps vision,pdf,devtools,storage \
+  --console-level info \
+  --snapshot-mode none \
+  --output-max-size 536870912 \
+  --timeout-action 10000 \
+  --timeout-navigation 20000 \
+  --viewport-size 1440x900 \
+  "$@"

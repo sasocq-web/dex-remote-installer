@@ -1,0 +1,172 @@
+#!/bin/sh
+set -eu
+
+APP_PACKAGE="dex-remote-installer"
+
+fail() {
+  printf 'Erro: %s\n' "$*" >&2
+  exit 1
+}
+
+install_rclone_current() {
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update
+  apt-get install -y curl ca-certificates unzip
+  TMP_RCLONE_INSTALL="$(mktemp /tmp/clc-rclone-install.XXXXXX)"
+  trap 'rm -f "$TMP_RCLONE_INSTALL"' EXIT INT TERM
+  curl --fail --silent --show-error --location \
+    --proto "=https" --proto-redir "=https" --tlsv1.2 \
+    https://rclone.org/install.sh -o "$TMP_RCLONE_INSTALL"
+  chmod 0700 "$TMP_RCLONE_INSTALL"
+  command -v bash >/dev/null 2>&1 || fail "bash não está disponível para o instalador oficial do rclone"
+  bash "$TMP_RCLONE_INSTALL"
+  command -v rclone >/dev/null 2>&1 || fail "a instalação oficial do rclone não produziu um executável"
+  rclone version
+  rm -f "$TMP_RCLONE_INSTALL"
+  trap - EXIT INT TERM
+}
+
+[ "$(id -u)" -eq 0 ] || fail "este componente precisa ser executado pela autorização gráfica do sistema"
+
+ACTION="${1:-}"
+[ -n "$ACTION" ] || fail "ação não informada"
+shift || true
+
+case "$ACTION" in
+  install-tailscale)
+    command -v curl >/dev/null 2>&1 || fail "curl não está instalado"
+    TMP="$(mktemp /tmp/clc-tailscale-install.XXXXXX)"
+    trap 'rm -f "$TMP"' EXIT INT TERM
+    curl --fail --silent --show-error --location --proto "=https" --proto-redir "=https" --tlsv1.2 https://tailscale.com/install.sh -o "$TMP"
+    chmod 700 "$TMP"
+    sh "$TMP"
+    systemctl enable --now tailscaled.service
+    ;;
+
+  tailscale-up)
+    command -v tailscale >/dev/null 2>&1 || fail "Tailscale não está instalado"
+    systemctl enable --now tailscaled.service
+    exec tailscale up
+    ;;
+
+  tailscale-serve)
+    PORT="${1:-}"
+    case "$PORT" in
+      ''|*[!0-9]*) fail "porta inválida" ;;
+    esac
+    [ "$PORT" -ge 1024 ] && [ "$PORT" -le 65535 ] || fail "porta fora da faixa permitida"
+    command -v tailscale >/dev/null 2>&1 || fail "Tailscale não está instalado"
+    exec tailscale serve --bg "http://127.0.0.1:$PORT"
+    ;;
+
+  tailscale-serve-reset)
+    command -v tailscale >/dev/null 2>&1 || fail "Tailscale não está instalado"
+    exec tailscale serve reset
+    ;;
+
+  enable-user-linger)
+    TARGET_USER="${1:-}"
+    case "$TARGET_USER" in
+      ''|*[!A-Za-z0-9._-]*) fail "usuário inválido" ;;
+    esac
+    id "$TARGET_USER" >/dev/null 2>&1 || fail "usuário não encontrado"
+    command -v loginctl >/dev/null 2>&1 || fail "loginctl não está disponível"
+    exec loginctl enable-linger "$TARGET_USER"
+    ;;
+
+  disable-user-linger)
+    TARGET_USER="${1:-}"
+    case "$TARGET_USER" in
+      ''|*[!A-Za-z0-9._-]*) fail "usuário inválido" ;;
+    esac
+    id "$TARGET_USER" >/dev/null 2>&1 || fail "usuário não encontrado"
+    command -v loginctl >/dev/null 2>&1 || fail "loginctl não está disponível"
+    exec loginctl disable-linger "$TARGET_USER"
+    ;;
+
+
+  install-cloud-packages)
+    install_rclone_current
+    ;;
+
+  install-full-packages)
+    TARGET_USER="${1:-}"
+    case "$TARGET_USER" in
+      ''|*[!A-Za-z0-9._-]*) fail "usuário inválido" ;;
+    esac
+    id "$TARGET_USER" >/dev/null 2>&1 || fail "usuário não encontrado"
+    export DEBIAN_FRONTEND=noninteractive
+    export LC_ALL=C
+    apt-get update
+    CANDIDATES="
+      git git-lfs curl ca-certificates wget jq ripgrep fd-find fzf tree unzip p7zip-full rsync
+      openssh-client build-essential cmake ninja-build pkg-config bubblewrap xdg-utils zenity
+      libnotify-bin dbus-x11 xdotool wmctrl scrot imagemagick ydotool wl-clipboard grim slurp xclip
+      novnc tigervnc-standalone-server tigervnc-tools tigervnc-common openbox xterm xauth
+      x11-xserver-utils tint2 pcmanfm python3-cryptography python3-qrcode
+      python3-pyatspi gir1.2-atspi-2.0 at-spi2-core ffmpeg tar xz-utils
+      fonts-liberation fonts-noto-color-emoji
+      libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libdbus-1-3
+      libatspi2.0-0 libx11-6 libxcomposite1 libxdamage1 libxext6 libxfixes3
+      libxkbcommon0 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2
+      libasound2t64 libcups2t64 libatk1.0-0t64
+    "
+    AVAILABLE=""
+    for package in $CANDIDATES; do
+      CANDIDATE_VERSION="$(apt-cache policy "$package" 2>/dev/null | awk '/Candidate:/ {print $2; exit}')"
+      if [ -n "$CANDIDATE_VERSION" ] && [ "$CANDIDATE_VERSION" != "(none)" ]; then
+        case " $AVAILABLE " in *" $package "*) ;; *) AVAILABLE="$AVAILABLE $package" ;; esac
+      fi
+    done
+    CHROMIUM_CANDIDATE="$(apt-cache policy chromium 2>/dev/null | awk '/Candidate:/ {print $2; exit}')"
+    CHROMIUM_BROWSER_CANDIDATE="$(apt-cache policy chromium-browser 2>/dev/null | awk '/Candidate:/ {print $2; exit}')"
+    if [ -n "$CHROMIUM_CANDIDATE" ] && [ "$CHROMIUM_CANDIDATE" != "(none)" ]; then
+      AVAILABLE="$AVAILABLE chromium"
+    elif [ -n "$CHROMIUM_BROWSER_CANDIDATE" ] && [ "$CHROMIUM_BROWSER_CANDIDATE" != "(none)" ]; then
+      AVAILABLE="$AVAILABLE chromium-browser"
+    fi
+    [ -n "$AVAILABLE" ] || fail "nenhum pacote adicional foi localizado"
+    # shellcheck disable=SC2086
+    apt-get install -y $AVAILABLE
+
+    # Ubuntu/Debian repositories can carry rclone versions older than the
+    # guarded bisync workflow used by the application. Install/update it from
+    # the official rclone distribution after the distro packages are ready.
+    install_rclone_current
+
+    if ! getent group clc-uinput >/dev/null 2>&1; then
+      groupadd --system clc-uinput
+    fi
+    usermod -a -G clc-uinput "$TARGET_USER"
+    rm -f /etc/udev/rules.d/80-codex-linux-control-uinput.rules
+    cat > /etc/udev/rules.d/99-codex-linux-control-uinput.rules <<'RULE'
+SUBSYSTEM=="misc", KERNEL=="uinput", GROUP="clc-uinput", MODE="0660", OPTIONS+="static_node=uinput"
+RULE
+    chmod 0644 /etc/udev/rules.d/99-codex-linux-control-uinput.rules
+    modprobe uinput 2>/dev/null || true
+    udevadm control --reload-rules 2>/dev/null || true
+    udevadm trigger --name-match=uinput 2>/dev/null || true
+    ;;
+
+  install-deb)
+    SOURCE="${1:-}"
+    [ -n "$SOURCE" ] || fail "arquivo .deb não informado"
+    REAL="$(readlink -f -- "$SOURCE")"
+    [ -f "$REAL" ] || fail "arquivo .deb não encontrado"
+    case "$REAL" in
+      *.deb) ;;
+      *) fail "o arquivo selecionado não possui extensão .deb" ;;
+    esac
+    TMP="$(mktemp /var/tmp/codex-linux-control-update.XXXXXX.deb)"
+    trap 'rm -f "$TMP"' EXIT INT TERM
+    install -m 0644 -- "$REAL" "$TMP"
+    PACKAGE="$(dpkg-deb -f "$TMP" Package 2>/dev/null || true)"
+    [ "$PACKAGE" = "$APP_PACKAGE" ] || fail "o pacote selecionado não é o Codex Linux Control"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get install -y -- "$TMP"
+    ;;
+
+  *)
+    fail "ação administrativa desconhecida"
+    ;;
+esac

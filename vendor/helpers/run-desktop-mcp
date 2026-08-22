@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+APP_DIR="${CLC_APP_DIR:-/opt/dex-remote/app}"
+export PYTHONPATH="$APP_DIR${PYTHONPATH:+:$PYTHONPATH}"
+if [ -z "${YDOTOOL_SOCKET:-}" ] && [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+  export YDOTOOL_SOCKET="$XDG_RUNTIME_DIR/.ydotool_socket"
+fi
+exec /usr/bin/python3 -m clc.desktop_mcp

@@ -1,0 +1,70 @@
+#!/bin/bash
+set -Eeuo pipefail
+PROJECT_USER="$(id -un)"
+PROJECT_HOME="$(getent passwd "$PROJECT_USER" | cut -d: -f6)"
+[[ -n "$PROJECT_HOME" && -d "$PROJECT_HOME" ]] || { echo 'Home do usuário de projetos não encontrado' >&2; exit 69; }
+export HOME="$PROJECT_HOME"
+export USER="$PROJECT_USER"
+export LOGNAME="$PROJECT_USER"
+export CODEX_HOME="$PROJECT_HOME/.codex"
+export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+export DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus"
+export PATH="${HOME}/.local/bin:${HOME}/bin:/usr/local/bin:/usr/bin:/bin"
+PROJECT_ID="${CLC_PROJECT_ID:-}"
+PROJECT_PATH="${CLC_PROJECT_PATH:-}"
+PROJECT_UNIT="${CLC_PROJECT_UNIT:-}"
+if [[ ! "$PROJECT_ID" =~ ^[A-Za-z0-9_.:-]{1,200}$ ]]; then
+  echo 'CLC_PROJECT_ID inválido ou ausente' >&2
+  exit 64
+fi
+if [[ ! "$PROJECT_UNIT" =~ ^clc-project-[a-z0-9-]+\.service$ ]]; then
+  echo 'CLC_PROJECT_UNIT inválido ou ausente' >&2
+  exit 64
+fi
+if [[ -n "$PROJECT_PATH" && ! -d "$PROJECT_PATH" ]]; then
+  echo 'A pasta do projeto não existe' >&2
+  exit 66
+fi
+CODEX="${HOME}/.local/bin/codex"
+if [[ ! -x "$CODEX" ]]; then
+  CODEX="$(command -v codex || true)"
+fi
+if [[ -z "$CODEX" || ! -x "$CODEX" ]]; then
+  echo "Codex de projetos ainda não está instalado para $PROJECT_USER" >&2
+  exit 69
+fi
+if command -v systemd-run >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
+  # The resource broker may freeze the whole worker slice while no project is
+  # in use. Thaw it before removing a stale transient app-server; otherwise
+  # systemd refuses the stop and the next launch collides with the old unit.
+  systemctl --user thaw codex-workers.slice >/dev/null 2>&1 || true
+  cleanup_project_unit() {
+    systemctl --user stop "$PROJECT_UNIT" >/dev/null 2>&1 || true
+    systemctl --user reset-failed "$PROJECT_UNIT" >/dev/null 2>&1 || true
+  }
+  cleanup_project_unit
+  for _ in {1..50}; do
+    LOAD_STATE="$(systemctl --user show --property=LoadState --value "$PROJECT_UNIT" 2>/dev/null || true)"
+    [[ -z "$LOAD_STATE" || "$LOAD_STATE" == "not-found" ]] && break
+    sleep 0.1
+  done
+  systemctl --user reset-failed "$PROJECT_UNIT" >/dev/null 2>&1 || true
+  trap cleanup_project_unit EXIT INT TERM
+  systemd-run --user --quiet --collect --pipe --wait --service-type=exec \
+    --unit="$PROJECT_UNIT" \
+    --slice=codex-workers.slice \
+    --property=OOMScoreAdjust=400 \
+    --property=KillMode=control-group \
+    --property=OOMPolicy=stop \
+    --property=CPUAccounting=yes \
+    --property=MemoryAccounting=yes \
+    --property=IOAccounting=yes \
+    "$CODEX" app-server 0<&0 1>&1 2>&2 &
+  RUNNER_PID=$!
+  WAIT_STATUS=0
+  wait "$RUNNER_PID" || WAIT_STATUS=$?
+  cleanup_project_unit
+  trap - EXIT INT TERM
+  exit "$WAIT_STATUS"
+fi
+exec "$CODEX" app-server

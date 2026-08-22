@@ -1,0 +1,284 @@
+#!/usr/bin/python3
+"""Merge the newest local Dex release into the portable package source."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from datetime import datetime
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent.parent
+RELEASE_ROOT = Path("/opt/codex-linux-control/releases")
+ROLLOUT_ROOT = Path.home() / ".local/share/codex-linux-control/rollout"
+CURRENT_LINK = Path("/opt/codex-linux-control/current")
+BASE_FILE = ROOT / ".dex-upstream-release"
+VERSION_FILE = ROOT / "PACKAGE_VERSION"
+LOCAL_ROOT = ROOT / "vendor/app"
+SYSTEM_FILES = {
+    "system/browser-editable-at-point.cjs",
+    "system/set-browser-layout.cjs",
+}
+IGNORED_NAMES = (
+    ".bak",
+    ".before-",
+    ".pre-",
+    ".pending-",
+    ".projects",
+)
+
+
+def read_json(path: Path) -> dict:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def latest_release_id() -> str:
+    queue = read_json(ROLLOUT_ROOT / "queue.json").get("releases") or []
+    valid_queue = [item for item in queue if isinstance(item, dict) and item.get("id")]
+    if valid_queue:
+        return str(valid_queue[-1]["id"])
+    pending = read_json(ROLLOUT_ROOT / "pending.json")
+    if pending.get("id"):
+        return str(pending["id"])
+    try:
+        return CURRENT_LINK.resolve(strict=True).parent.name
+    except OSError as exc:
+        raise RuntimeError("não foi possível identificar a release ativa do Dex") from exc
+
+
+def wanted(relative: str) -> bool:
+    path = Path(relative)
+    name = path.name
+    if relative == "VERSION":
+        return True
+    if any(marker in name for marker in IGNORED_NAMES):
+        return False
+    if path.parts and path.parts[0] == "clc":
+        return path.suffix == ".py" and "__pycache__" not in path.parts
+    if path.parts and path.parts[0] == "web":
+        return name not in {"release-progress.json", "release-status.json"}
+    return relative in SYSTEM_FILES
+
+
+def collect(root: Path) -> dict[str, bytes]:
+    if not root.is_dir():
+        raise RuntimeError(f"árvore Dex ausente: {root}")
+    files: dict[str, bytes] = {}
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or path.is_symlink():
+            continue
+        relative = path.relative_to(root).as_posix()
+        if wanted(relative):
+            files[relative] = path.read_bytes()
+    required = {"VERSION", "clc/main.py", "web/index.html", "web/app.js"}
+    missing = required - files.keys()
+    if missing:
+        raise RuntimeError(f"árvore Dex incompleta: {', '.join(sorted(missing))}")
+    return files
+
+
+def merge_text(local: bytes, base: bytes, remote: bytes, relative: str) -> bytes:
+    if b"\0" in local + base + remote:
+        raise RuntimeError(f"conflito binário em {relative}")
+    with tempfile.TemporaryDirectory(prefix="dex-merge-file.") as temp_name:
+        temp = Path(temp_name)
+        paths = []
+        for name, content in (("local", local), ("base", base), ("remote", remote)):
+            path = temp / name
+            path.write_bytes(content)
+            paths.append(path)
+        completed = subprocess.run(
+            ["git", "merge-file", "--stdout", *(str(path) for path in paths)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    if completed.returncode != 0:
+        detail = completed.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"conflito de atualização em {relative}: {detail or 'mesclagem manual necessária'}")
+    return completed.stdout
+
+
+def without_index_cache_versions(content: bytes) -> bytes:
+    text = content.decode("utf-8")
+    text = re.sub(r'(/(?:styles\.css|app\.js)\?v=)[^"\']+', r'\1@CACHE@', text)
+    return text.encode("utf-8")
+
+
+def portable_index(remote: bytes) -> bytes:
+    text = remote.decode("utf-8")
+    text = re.sub(
+        r'(/(?:styles\.css|app\.js)\?v=)([^"\']+)',
+        lambda match: match.group(1) + match.group(2).removesuffix("-portable") + "-portable",
+        text,
+    )
+    return text.encode("utf-8")
+
+
+def canonical_sw(content: bytes) -> bytes:
+    text = content.decode("utf-8")
+    text = re.sub(r'^const CACHE = "[^"]+";', 'const CACHE = "@CACHE@";', text, flags=re.MULTILINE)
+    text = re.sub(r'(/(?:styles\.css|app\.js)\?v=)[^"\']+', r'\1@ASSET@', text)
+    return text.replace("Dex Remoto", "Dex SASOCQ").encode("utf-8")
+
+
+def portable_sw(remote: bytes) -> bytes:
+    text = remote.decode("utf-8")
+    cache_match = re.search(r'^const CACHE = "[^"]*?([A-Za-z0-9_-]+)";', text, flags=re.MULTILINE)
+    cache_suffix = cache_match.group(1) if cache_match else datetime.now().strftime("%Y%m%d%H%M%S")
+    text = re.sub(
+        r'^const CACHE = "[^"]+";',
+        f'const CACHE = "dex-remote-v1.0.0-{cache_suffix}";',
+        text,
+        flags=re.MULTILINE,
+    )
+    text = re.sub(
+        r'(/(?:styles\.css|app\.js)\?v=)([^"\']+)',
+        lambda match: match.group(1) + match.group(2).removesuffix("-portable") + "-portable",
+        text,
+    )
+    return text.replace("Dex SASOCQ", "Dex Remoto").encode("utf-8")
+
+
+def merge_maps(base: dict[str, bytes], local: dict[str, bytes], remote: dict[str, bytes]) -> dict[str, bytes]:
+    merged: dict[str, bytes] = {}
+    for relative in sorted(base.keys() | local.keys() | remote.keys()):
+        b = base.get(relative)
+        l = local.get(relative)
+        r = remote.get(relative)
+        # VERSION is upstream metadata. The portable suffix is reapplied after
+        # the source merge, so concurrent edits here are never a code conflict.
+        if relative == "VERSION":
+            if r is not None:
+                merged[relative] = r
+            continue
+        if (
+            relative == "web/index.html"
+            and b is not None
+            and l is not None
+            and r is not None
+            and without_index_cache_versions(l) == without_index_cache_versions(b)
+        ):
+            merged[relative] = portable_index(r)
+            continue
+        if (
+            relative == "web/sw.js"
+            and b is not None
+            and l is not None
+            and r is not None
+            and canonical_sw(l) == canonical_sw(b)
+        ):
+            merged[relative] = portable_sw(r)
+            continue
+        if l == r:
+            if l is not None:
+                merged[relative] = l
+            continue
+        if l == b:
+            if r is not None:
+                merged[relative] = r
+            continue
+        if r == b:
+            if l is not None:
+                merged[relative] = l
+            continue
+        if b is None:
+            if l is None and r is not None:
+                merged[relative] = r
+                continue
+            if r is None and l is not None:
+                merged[relative] = l
+                continue
+            raise RuntimeError(f"arquivo novo divergiu nos dois lados: {relative}")
+        if l is None or r is None:
+            raise RuntimeError(f"remoção conflitante em {relative}")
+        merged[relative] = merge_text(l, b, r, relative)
+    return merged
+
+
+def package_version(release_id: str, release_dir: Path) -> str:
+    manifest = read_json(release_dir.parent / "manifest.json")
+    created_at = manifest.get("created_at")
+    if isinstance(created_at, (int, float)):
+        stamp = datetime.fromtimestamp(created_at).strftime("%Y%m%d.%H%M%S")
+    else:
+        match = re.match(r"^(\d{8})", release_id)
+        stamp = f"{match.group(1) if match else datetime.now().strftime('%Y%m%d')}.{datetime.now().strftime('%H%M%S')}"
+    return f"1.0.0+{stamp}"
+
+
+def digest(files: dict[str, bytes]) -> str:
+    value = hashlib.sha256()
+    for relative, content in sorted(files.items()):
+        value.update(relative.encode() + b"\0" + content)
+    return value.hexdigest()
+
+
+def write_tree(files: dict[str, bytes], destination: Path) -> None:
+    destination.mkdir(parents=True)
+    for relative, content in files.items():
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+        target.chmod(0o644)
+
+
+def main() -> int:
+    base_id = BASE_FILE.read_text(encoding="utf-8").strip()
+    remote_id = latest_release_id()
+    release_pattern = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}")
+    if not release_pattern.fullmatch(base_id) or not release_pattern.fullmatch(remote_id):
+        raise RuntimeError("identificador de release inválido")
+    if base_id == remote_id:
+        print(json.dumps({"changed": False, "release": remote_id}, ensure_ascii=False))
+        return 3
+
+    base_root = RELEASE_ROOT / base_id / "app"
+    remote_release = RELEASE_ROOT / remote_id
+    remote_root = remote_release / "app"
+    base = collect(base_root)
+    local = collect(LOCAL_ROOT)
+    remote = collect(remote_root)
+    merged = merge_maps(base, local, remote)
+
+    upstream_version = remote.get("VERSION", b"0.0.0").decode("utf-8", errors="replace").strip()
+    merged["VERSION"] = f"{upstream_version}-portable+{remote_id}\n".encode()
+    if digest(merged) == digest(local):
+        BASE_FILE.write_text(remote_id + "\n", encoding="utf-8")
+        print(json.dumps({"changed": True, "release": remote_id, "source_changed": False}, ensure_ascii=False))
+        return 0
+
+    with tempfile.TemporaryDirectory(prefix="dex-merged-tree.", dir=str(ROOT / "vendor")) as temp_name:
+        temporary = Path(temp_name) / "app"
+        write_tree(merged, temporary)
+        previous = ROOT / "vendor/.app-before-sync"
+        if previous.exists():
+            shutil.rmtree(previous)
+        os.replace(LOCAL_ROOT, previous)
+        os.replace(temporary, LOCAL_ROOT)
+        shutil.rmtree(previous)
+
+    version = package_version(remote_id, remote_root)
+    VERSION_FILE.write_text(version + "\n", encoding="utf-8")
+    BASE_FILE.write_text(remote_id + "\n", encoding="utf-8")
+    print(json.dumps({"changed": True, "release": remote_id, "version": version}, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as exc:
+        print(f"Falha ao mesclar atualização do Dex: {exc}", file=sys.stderr)
+        raise SystemExit(1)

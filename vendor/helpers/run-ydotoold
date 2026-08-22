@@ -1,0 +1,25 @@
+#!/bin/sh
+set -eu
+SOCKET="${YDOTOOL_SOCKET:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/.ydotool_socket}"
+mkdir -p "$(dirname "$SOCKET")"
+rm -f "$SOCKET"
+
+if /usr/bin/ydotoold --help 2>&1 | grep -q -- '--socket-path'; then
+  exec /usr/bin/ydotoold --socket-path="$SOCKET" --socket-perm=0600
+fi
+
+# Compatibility with the older ydotoold packaged by some Ubuntu releases.
+OLD_SOCKET="/tmp/.ydotool_socket"
+rm -f "$OLD_SOCKET"
+/usr/bin/ydotoold &
+PID=$!
+trap 'kill "$PID" 2>/dev/null || true; rm -f "$SOCKET"' EXIT INT TERM
+COUNT=0
+while [ ! -S "$OLD_SOCKET" ] && kill -0 "$PID" 2>/dev/null && [ "$COUNT" -lt 100 ]; do
+  sleep 0.1
+  COUNT=$((COUNT + 1))
+done
+if [ -S "$OLD_SOCKET" ]; then
+  ln -s "$OLD_SOCKET" "$SOCKET"
+fi
+wait "$PID"
