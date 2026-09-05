@@ -30,7 +30,9 @@ git -C "$WORK" config user.email "packages@sasocq.com"
 
 refresh_local_bundle() {
   git -C "$ROOT" pull --ff-only origin main
-  "$ROOT/build.sh"
+  gh release download "$TAG" --repo "$REPOSITORY" --dir "$ROOT/dist" --clobber \
+    --pattern "dex-remote-installer_${VERSION}_all.deb" \
+    --pattern "dex-remote-installer_${VERSION}_all.deb.sha256"
   "$ROOT/tests/test-package.sh"
   "$ROOT/scripts/create-recovery-bundle"
 }

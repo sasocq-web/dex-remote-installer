@@ -11,6 +11,10 @@ o backup diário terminar com sucesso. O processo:
 6. permite gerar o mesmo artefato em `recovery/` para o próximo backup
    criptografado, acompanhado de manifesto e reinstalador.
 
+O bundle local é montado a partir dos arquivos baixados novamente da GitHub
+Release, e não de uma segunda compilação. Assim, GitHub e backup preservam
+exatamente os mesmos bytes e o mesmo SHA-256.
+
 Se a mesma release já estiver publicada, a rotina termina sem criar commits
 vazios. Conflitos, ausência de autenticação ou testes com falha impedem a
 publicação, mas não transformam um backup válido em falha.
