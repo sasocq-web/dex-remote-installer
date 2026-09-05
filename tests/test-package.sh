@@ -205,7 +205,10 @@ python3 - "$SASOCQ_ROOT/home/codex/.config/codex-linux-control/config.json" <<'P
 import json, pathlib, sys
 path = pathlib.Path(sys.argv[1])
 config = json.loads(path.read_text(encoding="utf-8"))
-for key in ("desktop_control_enabled", "browser_control_enabled", "remote_desktop_enabled"):
+for key in (
+    "desktop_control_enabled", "browser_control_enabled", "remote_desktop_enabled",
+    "control_plane_enabled",
+):
     config[key] = False
 path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
 PY
