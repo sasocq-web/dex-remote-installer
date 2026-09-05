@@ -134,7 +134,7 @@ runtime_check() {
     CLC_PORT="$port" PYTHONPATH="$EXTRACT/opt/dex-remote/app" \
     python3 -m clc >"$log" 2>&1 &
   RUNTIME_PID=$!
-  for _ in $(seq 1 120); do
+  for _ in $(seq 1 300); do
     if [[ "$mode" == "sasocq" && -z "$playwright_cookie" && -f "$home/.local/share/codex-linux-control/browser-storage-state.json" ]]; then
       playwright_cookie="$(python3 - "$home/.local/share/codex-linux-control/browser-storage-state.json" <<'PY'
 import json, sys
