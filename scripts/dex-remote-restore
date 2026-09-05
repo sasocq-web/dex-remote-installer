@@ -1,0 +1,72 @@
+#!/bin/bash
+set -Eeuo pipefail
+
+SOURCE=""
+CONFIRM="no"
+STATE_ROOT="${DEX_REMOTE_STATE_ROOT:-}"
+
+usage() {
+  cat <<'EOF'
+Uso: dex-remote-restore --from /caminho/do/snapshot --confirm
+
+Importa, de um snapshot Restic previamente restaurado, autenticações,
+conversas, dispositivos pareados, perfis de navegador e workspaces do Dex.
+O snapshot continua privado; nenhum segredo é enviado ao GitHub.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --from) [[ $# -ge 2 ]] || { usage >&2; exit 64; }; SOURCE="$2"; shift 2 ;;
+    --confirm) CONFIRM="yes"; shift ;;
+    --help|-h) usage; exit 0 ;;
+    *) echo "Opção desconhecida: $1" >&2; usage >&2; exit 64 ;;
+  esac
+done
+
+[[ "$CONFIRM" == "yes" ]] || { echo "A importação exige --confirm." >&2; exit 77; }
+[[ "$SOURCE" == /* && "$SOURCE" != "/" && -d "$SOURCE" ]] || { echo "Snapshot inválido ou inseguro." >&2; exit 64; }
+if [[ -z "$STATE_ROOT" && "$(id -u)" -ne 0 ]]; then
+  echo "Execute a restauração com sudo." >&2
+  exit 77
+fi
+if [[ ! -d "$SOURCE/home/codex/.codex" && ! -d "$SOURCE/home/codex/.config/codex-linux-control" ]]; then
+  echo "O caminho informado não contém o estado privado do Dex." >&2
+  exit 66
+fi
+
+target() { printf '%s%s' "$STATE_ROOT" "$1"; }
+copy_tree() {
+  local relative="$1" owner="$2" source destination
+  source="$SOURCE$relative"
+  destination="$(target "$relative")"
+  [[ -d "$source" ]] || return 0
+  install -d -m 0700 "$destination"
+  if [[ -n "$STATE_ROOT" ]]; then
+    rsync -a --exclude='rollout/' --exclude='config.json' "$source/" "$destination/"
+  else
+    rsync -a --chown="$owner:$owner" --exclude='rollout/' --exclude='config.json' "$source/" "$destination/"
+  fi
+}
+
+if [[ -z "$STATE_ROOT" ]]; then
+  systemctl stop dex-remote@codex.service 2>/dev/null || true
+fi
+
+copy_tree /home/codex/.codex codex
+copy_tree /home/codex/.config/codex-linux-control codex
+copy_tree /home/codex/.local/share/codex-linux-control codex
+copy_tree /home/codex/SystemWorkspace codex
+copy_tree /home/codex-worker/.codex codex-worker
+copy_tree /srv/sasocq/projects codex-worker
+
+if [[ -z "$STATE_ROOT" ]]; then
+  for path in /home/codex/.codex /home/codex/.config/codex-linux-control /home/codex/.local/share/codex-linux-control /home/codex/SystemWorkspace; do
+    [[ ! -e "$path" ]] || chown -R codex:codex "$path"
+  done
+  [[ ! -d /home/codex-worker/.codex ]] || chown -R codex-worker:codex-worker /home/codex-worker/.codex
+  [[ ! -d /srv/sasocq/projects ]] || chown -R codex-worker:codex-worker /srv/sasocq/projects
+  systemctl start dex-remote@codex.service
+fi
+
+echo "Estado privado do Dex importado do snapshot informado."

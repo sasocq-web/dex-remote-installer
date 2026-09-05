@@ -39,6 +39,18 @@ class OperationsStore:
         with self._lock:
             return list(self._read().get("queues", {}).get(thread_id, []))
 
+    def all_queues(self) -> dict[str, list[dict[str, Any]]]:
+        """Return a stable snapshot of every conversation queue."""
+        with self._lock:
+            queues = self._read().get("queues", {})
+            if not isinstance(queues, dict):
+                return {}
+            return {
+                str(thread_id): [dict(item) for item in items if isinstance(item, dict)]
+                for thread_id, items in queues.items()
+                if isinstance(items, list) and items
+            }
+
     def enqueue(self, thread_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
             data = self._read()
@@ -169,6 +181,47 @@ class OperationsStore:
             data = self._read()
             item = data.setdefault(kind, {}).setdefault(item_id, {})
             item.update(values)
+            item["updated_at"] = time.time()
+            self._write(data)
+            return dict(item)
+
+    def record_thread_execution(
+        self,
+        thread_id: str,
+        turn_id: str,
+        *,
+        started_at_ms: int = 0,
+        completed_at_ms: int = 0,
+        duration_ms: int | None = None,
+    ) -> dict[str, Any]:
+        """Persist one turn without counting duplicate completion notifications."""
+        with self._lock:
+            data = self._read()
+            item = data.setdefault("threads", {}).setdefault(thread_id, {})
+            timing = dict(item.get("execution_timing") or {})
+            started = max(0, int(started_at_ms or 0))
+            completed = max(0, int(completed_at_ms or 0))
+            first_started = max(0, int(timing.get("first_started_at") or 0))
+            if started and (not first_started or started < first_started):
+                timing["first_started_at"] = started
+
+            if not completed:
+                timing["active_started_at"] = started
+                timing["active_turn_id"] = turn_id
+            else:
+                if str(timing.get("last_completed_turn_id") or "") != turn_id:
+                    measured = duration_ms
+                    if measured is None and started and completed >= started:
+                        measured = completed - started
+                    measured = max(0, int(measured or 0))
+                    timing["completed_ms"] = max(0, int(timing.get("completed_ms") or 0)) + measured
+                    timing["turn_count"] = max(0, int(timing.get("turn_count") or 0)) + 1
+                    timing["last_completed_turn_id"] = turn_id
+                if not timing.get("active_turn_id") or timing.get("active_turn_id") == turn_id:
+                    timing["active_started_at"] = 0
+                    timing.pop("active_turn_id", None)
+
+            item["execution_timing"] = timing
             item["updated_at"] = time.time()
             self._write(data)
             return dict(item)

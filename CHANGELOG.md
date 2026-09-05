@@ -1,5 +1,13 @@
 # Histórico de versões
 
+## 1.0.0+20260905.135803 — 2026-09-05
+
+- Sincroniza integralmente o runtime do Dex ativo de 05/09/2026.
+- Inclui Workbench, Automações, Sites e insights do PC.
+- Fixa o Codex CLI em 0.153.4 para reinstalações reproduzíveis.
+- Adiciona reinstalador de um comando, restauração privada opcional e bundle
+  local preservado pelo backup criptografado.
+
 ## 1.0.0+20260822.193121 — 2026-08-22
 
 - Sincronização com `automatic-approval-silent224`, incluindo as atualizações

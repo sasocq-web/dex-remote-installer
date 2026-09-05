@@ -28,6 +28,13 @@ WORK="$WORK_ROOT/repo"
 git -C "$WORK" config user.name "SASOCQ Release Automation"
 git -C "$WORK" config user.email "packages@sasocq.com"
 
+refresh_local_bundle() {
+  git -C "$ROOT" pull --ff-only origin main
+  "$ROOT/build.sh"
+  "$ROOT/tests/test-package.sh"
+  "$ROOT/scripts/create-recovery-bundle"
+}
+
 set +e
 MERGE_OUTPUT="$($WORK/scripts/merge-dex-upstream 2>&1)"
 MERGE_STATUS=$?
@@ -40,6 +47,7 @@ fi
 VERSION="$(tr -d '[:space:]' <"$WORK/PACKAGE_VERSION")"
 TAG="v$VERSION"
 if [[ $MERGE_STATUS -eq 3 ]] && gh release view "$TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
+  refresh_local_bundle
   echo "Dex $TAG já está publicado; verificação pós-backup concluída."
   exit 0
 fi
@@ -64,6 +72,5 @@ if ! gh release view "$TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
     --latest
 fi
 
-git -C "$ROOT" pull --ff-only origin main
+refresh_local_bundle
 echo "Dex Remote Installer $VERSION publicado e verificado após o backup."
-

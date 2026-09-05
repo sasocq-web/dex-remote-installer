@@ -1,11 +1,15 @@
-const CACHE = "dex-remote-v1.0.0-0-automatic-approval-silent224";
+const CACHE = "dex-remote-v1.0.0-0-modern-workbench0151-execution-progress275-steam-remote-recovery284-secure-payment-card294-gnome-codex3-draft-recovery295";
 const ASSETS = [
   "/",
   "/index.html",
-  "/styles.css?v=approval-card-compact-20260822-223-portable",
-  "/app.js?v=automatic-approval-silent-20260822-224-portable",
+  "/styles.css?v=secure-payment-card-20260902-294-portable",
+  "/workbench.css?v=modern-workbench-20260830-4",
+  "/app.js?v=draft-recovery-20260903-295-portable",
+  "/sites.js?v=dex-fast-open-20260902-290",
+  "/automations.js?v=pc-managers-20260824-229b",
   "/release-status.json",
-  "/operations.js?v=project-conversations-fix175",
+  "/operations.js?v=draft-recovery-20260903-295",
+  "/workbench.js?v=modern-workbench-20260830-4",
   "/manifest.webmanifest",
   "/icons/codex-remoto-192.png",
   "/icons/codex-remoto-512.png",

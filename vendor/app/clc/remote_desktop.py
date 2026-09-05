@@ -462,6 +462,60 @@ class RemoteDesktopManager:
         except (OSError, ValueError):
             return False
 
+    @staticmethod
+    def _process_argv(pid: int) -> tuple[str, ...]:
+        try:
+            raw = Path(f"/proc/{int(pid)}/cmdline").read_bytes()
+        except (OSError, ValueError):
+            return ()
+        argv = tuple(part.decode("utf-8", errors="replace") for part in raw.split(b"\0") if part)
+        # Chrome may rewrite its Linux process title into one space-separated
+        # cmdline field after startup.  Recover the original flags so the
+        # managed profile remains identifiable without trusting process names.
+        if len(argv) == 1 and " " in argv[0]:
+            try:
+                return tuple(shlex.split(argv[0]))
+            except ValueError:
+                return argv
+        return argv
+
+    def _owner_process_matches(self, pid: int, display_number: int) -> bool:
+        argv = self._process_argv(pid)
+        if not argv or Path(argv[0]).name not in {"Xtigervnc", "Xvnc"}:
+            return False
+        return f":{display_number}" in argv and str(self.socket_path) in argv
+
+    def _managed_browser_profile_dir(self, browser: Optional[Path] = None) -> Path:
+        browser = browser or _find_chromium(self.settings)
+        profile_dir = (
+            self.settings.home
+            / ".local"
+            / "share"
+            / "codex-linux-control"
+            / "playwright-live-profile"
+        ).resolve()
+        if browser and (
+            str(browser).startswith("/snap/")
+            or (browser.name in {"chromium", "chromium-browser"} and Path("/snap/chromium/current").exists())
+        ):
+            profile_dir = (
+                self.settings.home / "snap" / "chromium" / "common" / "codex-linux-control-profile"
+            ).resolve()
+        return profile_dir
+
+    def _managed_browser_pid(self) -> Optional[int]:
+        expected_profile = f"--user-data-dir={self._managed_browser_profile_dir()}"
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            argv = self._process_argv(pid)
+            if not argv or any(argument.startswith("--type=") for argument in argv):
+                continue
+            if expected_profile in argv and "--remote-debugging-port=9223" in argv:
+                return pid
+        return None
+
     def _acquire_owner_lock(self) -> bool:
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
         os.chmod(self.runtime_dir, 0o700)
@@ -516,7 +570,12 @@ class RemoteDesktopManager:
                 return False
             if display_number not in DEFAULT_DISPLAY_RANGE:
                 return False
-            if not self._pid_alive(pid) or not self.socket_path.is_socket() or not self.xauthority_path.is_file():
+            if (
+                not self._pid_alive(pid)
+                or not self._owner_process_matches(pid, display_number)
+                or not self.socket_path.is_socket()
+                or not self.xauthority_path.is_file()
+            ):
                 return False
             if geometry:
                 self._geometry = AdaptiveGeometry(
@@ -715,6 +774,52 @@ wait "$wm_pid"
                 return
             await process.wait()
 
+    async def _terminate_pid(self, pid: Optional[int], timeout: float = 5.0) -> None:
+        if not pid or not self._pid_alive(pid):
+            return
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not self._pid_alive(pid):
+                return
+            await asyncio.sleep(0.1)
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        for _attempt in range(20):
+            if not self._pid_alive(pid):
+                return
+            await asyncio.sleep(0.05)
+
+    async def browser_surface_ready(self, timeout: float = 1.5) -> bool:
+        """Confirm that CDP and a visible Chrome window share this VNC display."""
+        if not self.running or not self.display or not await self.browser_cdp_ready():
+            return False
+        wmctrl = shutil.which("wmctrl")
+        if not wmctrl:
+            # CDP remains the best available signal on minimal installations.
+            return True
+        deadline = time.monotonic() + max(0.1, timeout)
+        while time.monotonic() < deadline:
+            process = await asyncio.create_subprocess_exec(
+                wmctrl,
+                "-lx",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                env=self._environment(),
+            )
+            output, _ = await process.communicate()
+            if process.returncode == 0:
+                windows = output.decode("utf-8", errors="replace").casefold()
+                if "google-chrome" in windows or "chromium" in windows:
+                    return True
+            await asyncio.sleep(0.1)
+        return False
+
     async def start(self, geometry: Optional[AdaptiveGeometry] = None) -> Dict[str, Any]:
         async with self._lock:
             if geometry is not None:
@@ -738,6 +843,12 @@ wait "$wm_pid"
                         return self.status()
                     await asyncio.sleep(0.15)
                 raise RuntimeError("Outra instância ainda está preparando a sessão gráfica privada")
+            # A backend replacement releases the advisory lock before its
+            # detached TigerVNC child necessarily exits.  Re-adopt that valid
+            # private endpoint instead of unlinking it and allocating a new X
+            # display behind a still-running supervised browser.
+            if self._adopt_existing_owner():
+                return self.status()
             self._prepare_dirs()
             self._display_number = self._choose_display()
             self._prepare_xauthority(self._display_number)
@@ -826,9 +937,13 @@ wait "$wm_pid"
 
     async def _stop_unlocked(self) -> None:
         owns_runtime = self._owns_runtime
+        external_owner_pid = self._external_owner_pid if owns_runtime and not self._x_process else None
+        external_browser_pid = self._managed_browser_pid() if owns_runtime and self._browser_external else None
         await self._terminate_process(self._browser_process, timeout=3)
+        await self._terminate_pid(external_browser_pid, timeout=3)
         await self._terminate_process(self._desktop_process, timeout=4)
         await self._terminate_process(self._x_process, timeout=5)
+        await self._terminate_pid(external_owner_pid, timeout=5)
         self._browser_process = None
         self._desktop_process = None
         self._x_process = None
@@ -1051,17 +1166,33 @@ wait "$wm_pid"
     async def ensure_browser(self, *, mode: str = "desktop", url: str = "about:blank") -> Dict[str, Any]:
         async with self._browser_lock:
             if await self.browser_cdp_ready():
-                self._browser_external = not bool(self._browser_process and self._browser_process.returncode is None)
-                self._browser_mode = self._browser_mode or mode
-                return {
-                    "ok": True,
-                    "application": "browser",
-                    "mode": self._browser_mode or mode,
-                    "pid": int(self._browser_process.pid) if self._browser_process and self._browser_process.returncode is None else 0,
-                    "geometry": self._geometry.as_dict(),
-                    "reused": True,
-                    "external": self._browser_external,
-                }
+                if await self.browser_surface_ready():
+                    self._browser_external = not bool(self._browser_process and self._browser_process.returncode is None)
+                    self._browser_mode = self._browser_mode or mode
+                    return {
+                        "ok": True,
+                        "application": "browser",
+                        "mode": self._browser_mode or mode,
+                        "pid": int(self._browser_process.pid) if self._browser_process and self._browser_process.returncode is None else int(self._managed_browser_pid() or 0),
+                        "geometry": self._geometry.as_dict(),
+                        "reused": True,
+                        "external": self._browser_external,
+                    }
+                stale_pid = self._managed_browser_pid()
+                if not stale_pid:
+                    raise RuntimeError(
+                        "A porta CDP 9223 pertence a um navegador não gerenciado fora do display remoto atual"
+                    )
+                await self._terminate_pid(stale_pid, timeout=4)
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline and await self.browser_cdp_ready(timeout=0.25):
+                    await asyncio.sleep(0.1)
+                if await self.browser_cdp_ready(timeout=0.25):
+                    raise RuntimeError("O Chromium antigo não liberou a porta CDP 9223")
+                self._browser_external = False
+                self._browser_mode = ""
+                result = await self._launch_browser_unlocked(mode=mode, url=url)
+                return {**result, "reconciled": True, "replaced_pid": stale_pid}
             return await self._launch_browser_unlocked(mode=mode, url=url)
 
     async def browser_layout(self, mode: str = "status") -> Dict[str, Any]:
@@ -1110,21 +1241,9 @@ wait "$wm_pid"
         # pages during startup; a page stalled behind authentication then
         # blocks Playwright's CDP initialization for every conversation.
         # The former profile is intentionally preserved for rollback.
-        profile_dir = (
-            self.settings.home
-            / ".local"
-            / "share"
-            / "codex-linux-control"
-            / "playwright-live-profile"
-        ).resolve()
-        # Chromium on Ubuntu is normally a strictly confined Snap.  Its
-        # sandbox cannot create the ProcessSingleton files below ~/.local,
-        # even when Unix ownership and modes are correct.  Keep the managed
-        # profile inside the Snap writable area in that case.
-        if str(browser).startswith("/snap/") or (
-            browser.name in {"chromium", "chromium-browser"} and Path("/snap/chromium/current").exists()
-        ):
-            profile_dir = (self.settings.home / "snap" / "chromium" / "common" / "codex-linux-control-profile").resolve()
+        # Chromium on Ubuntu may be a strictly confined Snap, in which case
+        # the helper selects its writable profile path.
+        profile_dir = self._managed_browser_profile_dir(browser)
         profile_dir.mkdir(parents=True, exist_ok=True)
         os.chmod(profile_dir, 0o700)
         profile = str(mode or "auto").casefold()

@@ -84,7 +84,7 @@ class CloudConfigSession:
 
 
 class CloudSyncManager:
-    """Graphical rclone configuration and guarded bidirectional project sync."""
+    """Graphical rclone configuration and authoritative local-to-cloud redundancy."""
 
     def __init__(self, settings: Settings, projects: Optional[ProjectStore] = None) -> None:
         self.settings = settings
@@ -220,7 +220,11 @@ class CloudSyncManager:
             return False
         try:
             code, output = self._quick([*self._common_args(), "listremotes"], timeout=15)
-        except RuntimeError:
+        # State collection feeds the whole Dex bootstrap. A stale or
+        # administratively restored credential can be unreadable until its
+        # ownership is repaired; report the remote as unavailable instead of
+        # turning an optional cloud-sync check into a 500 for /api/status.
+        except (OSError, RuntimeError):
             return False
         return code == 0 and f"{remote_name}:" in {line.strip() for line in output.splitlines()}
 
@@ -592,7 +596,7 @@ class CloudSyncManager:
         if self.settings.cloud_filter_profile == "complete":
             content = "+ **\n"
         else:
-            content = """# Perfil seguro para projetos de código\n- **/.git/**\n- **/node_modules/**\n- **/.venv/**\n- **/venv/**\n- **/__pycache__/**\n- **/.pytest_cache/**\n- **/.mypy_cache/**\n- **/.ruff_cache/**\n- **/.cache/**\n- **/dist/**\n- **/build/**\n- **/*.pyc\n- **/.env\n- **/.env.*\n- **/*.pem\n- **/*.key\n- **/id_rsa\n- **/id_rsa.*\n- **/*.sqlite-journal\n- **/*.sqlite-wal\n+ **\n"""
+            content = """# Perfil seguro para projetos de código\n- **/.git/**\n- **/node_modules/**\n- **/.next/**\n- **/.turbo/**\n- **/.venv/**\n- **/venv/**\n- **/__pycache__/**\n- **/.pytest_cache/**\n- **/.mypy_cache/**\n- **/.ruff_cache/**\n- **/.cache/**\n- **/dist/**\n- **/build/**\n- **/out/**\n- **/coverage/**\n- **/Backup Conversas Codex/**\n- **/*.pyc\n- **/*.log\n- **/.env\n- **/.env.*\n- **/*.pem\n- **/*.key\n- **/id_rsa\n- **/id_rsa.*\n- **/*.sqlite-journal\n- **/*.sqlite-wal\n+ **\n"""
         path.write_text(content, encoding="utf-8")
         os.chmod(path, 0o600)
         return path
@@ -625,7 +629,7 @@ class CloudSyncManager:
         )
         if code != 0:
             raise RuntimeError(output[-1000:] or "Não foi possível validar a gravação na nuvem")
-        result = await self._run_bisync(record, resync_mode=strategy)
+        result = await self._run_copy(record)
         persist_settings(self.settings, cloud_sync_enabled=True, cloud_sync_initialized=True)
         self.set_timer(True, self.settings.cloud_sync_interval_minutes)
         result.update({"local_path": str(local), "remote_path": remote, "initialized": True})
@@ -635,56 +639,41 @@ class CloudSyncManager:
     async def sync_now(self, record: SetupTask) -> Dict[str, Any]:
         if not self.settings.cloud_sync_initialized:
             raise RuntimeError("Execute a primeira sincronização antes")
-        return await self._run_bisync(record, resync_mode=None)
+        return await self._run_copy(record)
 
-    async def _run_bisync(self, record: SetupTask, resync_mode: Optional[str]) -> Dict[str, Any]:
+    async def _run_copy(self, record: SetupTask) -> Dict[str, Any]:
+        """Copy the authoritative local tree to the cloud without remote-to-local mutations."""
         local, remote = self._sync_paths()
         filters = self._write_filters()
-        workdir = self.settings.resolved_cloud_work_dir
-        workdir.mkdir(parents=True, exist_ok=True)
         lock_path = self.settings.resolved_cloud_lock_file
         lock_path.parent.mkdir(parents=True, exist_ok=True)
-        timestamp = time.strftime("%Y%m%d-%H%M%S")
-        local_backup = self.settings.resolved_cloud_backup_dir / timestamp
-        local_backup.mkdir(parents=True, exist_ok=True)
-        remote_path_only = _normalize_remote_path(self.settings.cloud_remote_path)
-        remote_parent = remote_path_only.rsplit("/", 1)[0] if "/" in remote_path_only else "Codex Linux Control"
-        remote_backup = f"{self.settings.cloud_remote_name}:{remote_parent}/.clc-backups/{timestamp}"
         args = [
             *self._common_args(),
-            "bisync",
+            "copy",
             str(local),
             remote,
-            "--workdir",
-            str(workdir),
-            "--filters-file",
+            "--filter-from",
             str(filters),
-            "--check-access",
-            "--check-filename",
-            ".clc-sync-access",
-            "--max-delete",
-            "10",
-            "--max-lock",
-            "2m",
-            "--resilient",
-            "--recover",
-            "--conflict-resolve",
-            "none",
-            "--conflict-loser",
-            "num",
             "--create-empty-src-dirs",
             "--links",
-            "--backup-dir1",
-            str(local_backup),
-            "--backup-dir2",
-            remote_backup,
+            "--fast-list",
+            "--transfers",
+            "8",
+            "--checkers",
+            "16",
+            "--retries",
+            "5",
+            "--low-level-retries",
+            "10",
+            "--contimeout",
+            "30s",
+            "--timeout",
+            "5m",
             "--stats",
             "2s",
             "--stats-one-line",
             "-v",
         ]
-        if resync_mode:
-            args.extend(["--resync", "--resync-mode", resync_mode])
         started = time.time()
         self._write_status(
             running=True,
@@ -694,6 +683,8 @@ class CloudSyncManager:
             error="",
             local_path=str(local),
             remote_path=remote,
+            sync_mode="authoritative-local-copy",
+            creates_conflict_suffixes=False,
         )
         with lock_path.open("a+", encoding="utf-8") as lock:
             try:
@@ -702,8 +693,8 @@ class CloudSyncManager:
                 self._write_status(running=False, error="Outra sincronização já está em andamento", finished_at=time.time())
                 raise RuntimeError("Outra sincronização já está em andamento") from exc
             try:
-                record.set_message("Sincronizando projetos com proteção contra conflitos e exclusões em massa…")
-                code, output = await run_streaming_command(record, args, timeout=7200)
+                record.set_message("Atualizando a cópia redundante dos projetos no OneDrive…")
+                code, output = await run_streaming_command(record, args, timeout=28_800)
                 finished = time.time()
                 if code != 0:
                     self._write_status(
@@ -712,7 +703,7 @@ class CloudSyncManager:
                         ok=False,
                         error=output[-4000:] or f"rclone encerrou com código {code}",
                     )
-                    raise RuntimeError(output[-1500:] or "A sincronização não foi concluída")
+                    raise RuntimeError(output[-1500:] or "A cópia redundante não foi concluída")
                 status = self._write_status(
                     running=False,
                     finished_at=finished,
@@ -720,8 +711,10 @@ class CloudSyncManager:
                     error="",
                     duration_seconds=round(finished - started, 2),
                     output_tail=output[-4000:],
+                    sync_mode="authoritative-local-copy",
+                    creates_conflict_suffixes=False,
                 )
-                record.set_message("Projetos sincronizados.")
+                record.set_message("Cópia redundante dos projetos atualizada.")
                 return status
             finally:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)

@@ -7,6 +7,13 @@ START_SERVICE="yes"
 ENABLE_TAILSCALE="no"
 PACKAGE_ROOT="${DEX_REMOTE_PACKAGE_ROOT:-}"
 STATE_ROOT="${DEX_REMOTE_STATE_ROOT:-}"
+CODEX_VERSION_FILE="${PACKAGE_ROOT}/opt/dex-remote/CODEX_CLI_VERSION"
+[[ -f "$CODEX_VERSION_FILE" ]] || CODEX_VERSION_FILE="/opt/dex-remote/CODEX_CLI_VERSION"
+CODEX_CLI_VERSION="$(tr -d '[:space:]' <"$CODEX_VERSION_FILE")"
+[[ "$CODEX_CLI_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]] || {
+  echo "Versão fixada do Codex CLI inválida." >&2
+  exit 65
+}
 
 usage() {
   cat <<'EOF'
@@ -160,6 +167,7 @@ write_file "$CONFIG_FILE" 0600 <<EOF
   "full_experience_installed": false,
   "desktop_control_enabled": false,
   "browser_control_enabled": false,
+  "playwright_internal_access_enabled": false,
   "remote_desktop_enabled": false,
   "device_auth_required": true,
   "control_plane_enabled": false,
@@ -213,7 +221,7 @@ install_codex_for() {
   fi
   chmod 0755 "$installer"
   if ! runuser -u "$account" -- env HOME="$home" USER="$account" LOGNAME="$account" \
-      CODEX_NON_INTERACTIVE=true CODEX_INSTALL_DIR="$home/.local/bin" sh "$installer"; then
+      CODEX_NON_INTERACTIVE=true CODEX_INSTALL_DIR="$home/.local/bin" sh "$installer" --release "$CODEX_CLI_VERSION"; then
     rm -f "$installer"
     return 1
   fi
@@ -275,7 +283,7 @@ if [[ "$ENABLE_TAILSCALE" == "yes" ]]; then
   tailscale serve --bg http://127.0.0.1:8787
 fi
 
-echo "Dex Remoto configurado no perfil $MODE."
+echo "Dex Remoto configurado no perfil $MODE com Codex CLI $CODEX_CLI_VERSION."
 echo "Abra http://127.0.0.1:8787 neste computador para autenticar as contas OpenAI."
 if [[ "$MODE" == "full" ]]; then
   echo "Atenção: o usuário $CONTROLLER_USER possui sudo integral sem senha."

@@ -23,11 +23,13 @@ install -d "$STAGE/DEBIAN" \
   "$STAGE/usr/share/icons/hicolor/scalable/apps"
 
 cp -a "$ROOT/vendor/app" "$STAGE/opt/dex-remote/app"
+install -m 0644 "$ROOT/CODEX_CLI_VERSION" "$STAGE/opt/dex-remote/CODEX_CLI_VERSION"
 find "$STAGE/opt/dex-remote/app" -type f -name '*.pyc' -delete
 find "$STAGE/opt/dex-remote/app" -type d -name '__pycache__' -empty -delete
 cp -a "$ROOT/vendor/helpers/." "$STAGE/usr/lib/dex-remote/"
 install -m 0755 "$ROOT/scripts/dex-remote-launcher" "$STAGE/usr/bin/dex-remote"
 install -m 0755 "$ROOT/scripts/dex-remote-configure" "$STAGE/usr/sbin/dex-remote-setup"
+install -m 0755 "$ROOT/scripts/dex-remote-restore" "$STAGE/usr/sbin/dex-remote-restore"
 install -m 0644 "$ROOT/packaging/dex-remote@.service" "$STAGE/usr/lib/systemd/system/dex-remote@.service"
 install -m 0644 "$ROOT/packaging/dex-remote.desktop" "$STAGE/usr/share/applications/dex-remote.desktop"
 install -m 0644 "$ROOT/vendor/app/web/icons/icon.svg" "$STAGE/usr/share/icons/hicolor/scalable/apps/dex-remote.svg"
@@ -47,7 +49,7 @@ Section: devel
 Priority: optional
 Architecture: all
 Maintainer: SASOCQ <packages@sasocq.com>
-Depends: debconf (>= 1.5.0), python3 (>= 3.10), python3-fastapi, python3-uvicorn, python3-wsproto, python3-cryptography, python3-qrcode, curl, ca-certificates, sudo, systemd, xdg-utils
+Depends: debconf (>= 1.5.0), python3 (>= 3.10), python3-fastapi, python3-uvicorn, python3-wsproto, python3-cryptography, python3-qrcode, curl, ca-certificates, sudo, systemd, xdg-utils, rsync
 Conflicts: codex-linux-control
 Recommends: zenity, policykit-1, novnc, tigervnc-standalone-server, openbox, xterm, xauth, x11-xserver-utils, dbus-x11
 Description: Dex remoto para Codex de Projetos e Codex do Sistema

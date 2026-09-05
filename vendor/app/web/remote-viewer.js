@@ -3,6 +3,7 @@
   const status = document.getElementById("status");
   const target = new URLSearchParams(location.search).get("target") || "codex";
   const threadId = new URLSearchParams(location.search).get("thread_id") || "";
+  const viewOnly = new URLSearchParams(location.search).get("view_only") === "1";
   const allowed = new Set(["codex", "projects", "desktop", "playwright", "jogos", "android"]);
   let rfb = null;
   let retry = null;
@@ -11,6 +12,8 @@
   const trackpadPointer = {x:null, y:null};
   const processedKeyboardMessages = new Set();
   let customTouchBridge = false;
+  let keyboardFocusTimer = null;
+  let hardwareKeyboardForwarded = false;
 
   function report(stage, detail = "") {
     const safeStage = String(stage || "unknown").replace(/[^a-z0-9_-]/gi, "-").slice(0, 48);
@@ -63,6 +66,7 @@
     const params = new URLSearchParams();
     if (target !== "codex") params.set("target", target);
     if (target === "playwright" && threadId) params.set("thread_id", threadId);
+    if (viewOnly) params.set("view_only", "1");
     const query = params.size ? `?${params.toString()}` : "";
     return `${scheme}//${location.host}/api/remote-desktop/ws${query}`;
   }
@@ -76,6 +80,7 @@
     const url = websocketUrl();
     report("websocket-create", url.replace(location.host, "host"));
     rfb = new RFB(screen, url, {shared: true});
+    rfb.viewOnly = viewOnly;
     trackpadPointer.x = null;
     trackpadPointer.y = null;
     rfb.scaleViewport = true;
@@ -84,16 +89,19 @@
     rfb.addEventListener("connect", () => {
       clearTimeout(connectDeadline);
       report("connected");
-      setStatus("Conectado", "connected");
-      publishKeyboardState(true);
+      setStatus(viewOnly ? "Ao vivo • somente consulta" : "Conectado", "connected");
+      publishKeyboardState(!viewOnly);
       scheduleRemoteViewportFit(true);
-      window.parent.postMessage({
-        type:"sasocq-remote-pointer-capabilities",
-        relative:true,
-        scrollX:true,
-        scrollY:true,
-        gestures:"one-finger-pointer,two-finger-scroll,pinch-zoom",
-      }, location.origin);
+      scheduleHardwareKeyboardFocus("connected");
+      if (!viewOnly) {
+        window.parent.postMessage({
+          type:"sasocq-remote-pointer-capabilities",
+          relative:true,
+          scrollX:true,
+          scrollY:true,
+          gestures:"one-finger-pointer,two-finger-scroll,pinch-zoom",
+        }, location.origin);
+      }
     });
     rfb.addEventListener("disconnect", event => {
       clearTimeout(connectDeadline);
@@ -116,6 +124,15 @@
 
   function publishKeyboardState(ready = keyboardReady()) {
     window.parent.postMessage({type:"sasocq-remote-keyboard-state", ready:Boolean(ready)}, location.origin);
+  }
+
+  function publishInputModality(modality) {
+    if (viewOnly) return;
+    window.parent.postMessage({
+      type:"sasocq-remote-input-modality",
+      modality:String(modality || ""),
+      target,
+    }, location.origin);
   }
 
   function acknowledgeKeyboard(id, sent) {
@@ -167,6 +184,50 @@
 
   function trackpadCanvas() {
     return rfb?._canvas || screen.querySelector("canvas");
+  }
+
+  function focusHardwareKeyboard(reason = "") {
+    if (!keyboardReady()) return false;
+    const canvas = trackpadCanvas();
+    if (!canvas) return false;
+    rfb.focus({preventScroll:true});
+    if (document.activeElement !== canvas) canvas.focus({preventScroll:true});
+    const focused = document.activeElement === canvas;
+    if (focused && reason) report("keyboard-focus", reason);
+    return focused;
+  }
+
+  function scheduleHardwareKeyboardFocus(reason = "") {
+    clearTimeout(keyboardFocusTimer);
+    keyboardFocusTimer = setTimeout(() => focusHardwareKeyboard(reason), 0);
+  }
+
+  function forwardHardwareKeyboardEvent(event) {
+    if (!keyboardReady()) return;
+    if (event.type === "keydown" && event.isTrusted) publishInputModality("physical-keyboard");
+    const canvas = trackpadCanvas();
+    if (!canvas || event.target === canvas) return;
+    const forwarded = new KeyboardEvent(event.type, {
+      key:event.key,
+      code:event.code,
+      location:event.location,
+      repeat:event.repeat,
+      isComposing:event.isComposing,
+      ctrlKey:event.ctrlKey,
+      shiftKey:event.shiftKey,
+      altKey:event.altKey,
+      metaKey:event.metaKey,
+      bubbles:true,
+      cancelable:true,
+    });
+    rfb.focus({preventScroll:true});
+    canvas.dispatchEvent(forwarded);
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    if (!hardwareKeyboardForwarded) {
+      hardwareKeyboardForwarded = true;
+      report("hardware-keyboard-forwarded");
+    }
   }
 
   function trackpadPosition() {
@@ -296,8 +357,30 @@
     screen.addEventListener(name, suppressNativeTouchGesture, {capture:true, passive:false});
   }
 
+  // The mobile keyboard has an explicit message transport, while a physical
+  // keyboard depends on browser focus remaining on noVNC's canvas. Restore
+  // that focus for desktop mouse/pen use and forward keys that arrive on the
+  // viewer document before the canvas becomes active.
+  screen.addEventListener("pointerdown", event => {
+    if (event.pointerType === "touch") publishInputModality("touch");
+    else scheduleHardwareKeyboardFocus("pointer");
+  }, true);
+  screen.addEventListener("focus", () => scheduleHardwareKeyboardFocus("screen"));
+  window.addEventListener("focus", () => scheduleHardwareKeyboardFocus("window"));
+  window.addEventListener("keydown", forwardHardwareKeyboardEvent, true);
+  window.addEventListener("keyup", forwardHardwareKeyboardEvent, true);
+
   window.addEventListener("message", event => {
     if (event.origin !== location.origin || event.source !== window.parent) return;
+    if (viewOnly && [
+      "sasocq-remote-pointer",
+      "sasocq-remote-pointer-mode",
+      "sasocq-remote-keyboard",
+      "sasocq-remote-window",
+    ].includes(String(event.data?.type || ""))) {
+      report("view-only-input-blocked", String(event.data?.type || ""));
+      return;
+    }
     if (event.data?.type === "sasocq-remote-pointer") {
       const action = String(event.data.action || "");
       const handled = action.startsWith("direct-")
@@ -313,17 +396,6 @@
     if (event.data?.type === "sasocq-remote-pointer-mode") {
       customTouchBridge = true;
       report("pointer-mode", String(event.data.mode || "direct"));
-      return;
-    }
-    if (event.data?.type === "sasocq-remote-native-keyboard") {
-      if (target !== "codex" || !sendChord([0xffe9, 0xffbf])) { // Alt+F2
-        report("native-keyboard-ignored", target);
-        return;
-      }
-      const command = "gdbus call --session --dest org.onboard.Onboard --object-path /org/onboard/Onboard/Keyboard --method org.onboard.Onboard.Keyboard.ToggleVisible";
-      window.setTimeout(() => sendText(command), 220);
-      window.setTimeout(() => sendNamedKey("Enter", "Enter"), 360);
-      report("native-keyboard-toggled");
       return;
     }
     if (event.data?.type === "sasocq-remote-keyboard") {
@@ -375,6 +447,7 @@
   }
 
   setStatus("Carregando cliente de transmissão…");
+  if (viewOnly) screen.setAttribute("aria-label", "Tela remota somente leitura");
   publishKeyboardState(false);
   report("script-start");
   import("/novnc/sasocq-20260817-2250/core/rfb.js")

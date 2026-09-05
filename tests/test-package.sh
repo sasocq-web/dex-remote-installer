@@ -20,7 +20,9 @@ node --check "$ROOT/vendor/app/web/app.js"
 node --check "$ROOT/vendor/app/web/operations.js"
 node --check "$ROOT/vendor/app/web/remote-viewer.js"
 node --check "$ROOT/vendor/app/web/sw.js"
-bash -n "$ROOT/build.sh" "$ROOT/scripts/dex-remote-configure" \
+bash -n "$ROOT/build.sh" "$ROOT/install.sh" "$ROOT/scripts/dex-remote-configure" \
+  "$ROOT/scripts/dex-remote-restore" "$ROOT/scripts/create-recovery-bundle" \
+  "$ROOT/scripts/reinstall-from-bundle" \
   "$ROOT/scripts/publish-after-backup"
 for script in "$ROOT/scripts/dex-remote-launcher" "$ROOT/packaging/config" \
   "$ROOT/packaging/postinst" "$ROOT/packaging/prerm" "$ROOT/packaging/postrm"; do
@@ -36,7 +38,13 @@ EXTRACT="$TEST_ROOT/extract"
 mkdir -p "$EXTRACT"
 dpkg-deb -x "$DEB" "$EXTRACT"
 [[ -f "$EXTRACT/opt/dex-remote/app/clc/main.py" ]]
+[[ -f "$EXTRACT/opt/dex-remote/app/clc/automations.py" ]]
+[[ -f "$EXTRACT/opt/dex-remote/app/clc/workbench.py" ]]
+[[ -f "$EXTRACT/opt/dex-remote/app/web/automations.js" ]]
+[[ -f "$EXTRACT/opt/dex-remote/app/web/workbench.js" ]]
+[[ "$(cat "$EXTRACT/opt/dex-remote/CODEX_CLI_VERSION")" == "$(cat "$ROOT/CODEX_CLI_VERSION")" ]]
 [[ -x "$EXTRACT/usr/sbin/dex-remote-setup" ]]
+[[ -x "$EXTRACT/usr/sbin/dex-remote-restore" ]]
 
 DPKG_ROOT="$TEST_ROOT/dpkg-root"
 mkdir -p "$DPKG_ROOT/var/lib/dpkg/updates" "$DPKG_ROOT/var/log"
@@ -74,6 +82,27 @@ sudoers = (root / "etc/sudoers.d/dex-remote-system").read_text()
 assert "codex ALL=(ALL:ALL) NOPASSWD: ALL" in sudoers
 assert (root / "home/codex/SystemWorkspace/AGENTS.md").is_file()
 assert (root / "home/codex-worker/CodexProjects/AGENTS.md").is_file()
+PY
+
+RESTORE_SOURCE="$TEST_ROOT/restore-source"
+mkdir -p "$RESTORE_SOURCE/home/codex/.codex" \
+  "$RESTORE_SOURCE/home/codex/.config/codex-linux-control" \
+  "$RESTORE_SOURCE/home/codex/SystemWorkspace" \
+  "$RESTORE_SOURCE/home/codex-worker/.codex" \
+  "$RESTORE_SOURCE/srv/sasocq/projects/example"
+printf 'private-auth-fixture\n' >"$RESTORE_SOURCE/home/codex/.codex/auth.json"
+printf 'preserve-package-config\n' >"$RESTORE_SOURCE/home/codex/.config/codex-linux-control/config.json"
+printf 'conversation-fixture\n' >"$RESTORE_SOURCE/home/codex/.config/codex-linux-control/conversations.json"
+printf 'project-fixture\n' >"$RESTORE_SOURCE/srv/sasocq/projects/example/README.md"
+DEX_REMOTE_STATE_ROOT="$FULL_ROOT" "$EXTRACT/usr/sbin/dex-remote-restore" \
+  --from "$RESTORE_SOURCE" --confirm
+[[ "$(cat "$FULL_ROOT/home/codex/.codex/auth.json")" == "private-auth-fixture" ]]
+[[ "$(cat "$FULL_ROOT/home/codex/.config/codex-linux-control/conversations.json")" == "conversation-fixture" ]]
+[[ "$(cat "$FULL_ROOT/srv/sasocq/projects/example/README.md")" == "project-fixture" ]]
+python3 - "$FULL_ROOT/home/codex/.config/codex-linux-control/config.json" <<'PY'
+import json, sys
+config = json.load(open(sys.argv[1]))
+assert config["install_mode"] == "full"
 PY
 
 runtime_check() {

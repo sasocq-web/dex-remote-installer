@@ -5,7 +5,7 @@ import json
 import logging
 import os
 from asyncio.subprocess import Process
-from typing import Any, Dict, Hashable, Optional
+from typing import Any, Awaitable, Callable, Dict, Hashable, Optional
 
 from .config import Settings
 from .events import EventHub
@@ -36,25 +36,30 @@ class CodexBridge:
         label: str = "system",
         command: list[str] | None = None,
         environment: dict[str, str] | None = None,
+        server_request_handler: Callable[[str, dict[str, Any]], Awaitable[dict[str, Any] | None]] | None = None,
     ) -> None:
         self.settings = settings
         self.events = events
         self.label = label
         self.command = list(command) if command else None
         self.environment = dict(environment or {})
+        self.server_request_handler = server_request_handler
         self.process: Optional[Process] = None
         self._reader_task: Optional[asyncio.Task[None]] = None
         self._stderr_task: Optional[asyncio.Task[None]] = None
         self._wait_task: Optional[asyncio.Task[None]] = None
         self._start_lock = asyncio.Lock()
+        self.recovery_lock = asyncio.Lock()
         self._write_lock = asyncio.Lock()
         self._id_lock = asyncio.Lock()
         self._resume_lock = asyncio.Lock()
         self._next_id = 1
         self._pending: Dict[Hashable, asyncio.Future[Any]] = {}
+        self._server_request_tasks: set[asyncio.Task[None]] = set()
         self._loaded_threads: set[str] = set()
         self.last_error: Optional[str] = None
         self.initialized = False
+        self.generation = 0
 
     @property
     def running(self) -> bool:
@@ -96,12 +101,17 @@ class CodexBridge:
                             "title": self.settings.app_name,
                             "version": self.settings.app_version,
                         },
-                        "capabilities": {"experimentalApi": self.settings.experimental_api},
+                        # Dex always supplies dynamicTools (including its
+                        # automation bridge) on thread/start. Codex 0.149+
+                        # rejects that field unless the client advertises the
+                        # experimental API capability during initialization.
+                        "capabilities": {"experimentalApi": True},
                     },
                     timeout=30,
                 )
                 await self.notify("initialized", {})
                 self.initialized = True
+                self.generation += 1
                 self.last_error = None
                 await self.events.publish({"kind": "bridge_status", "workspace": self.label, "status": "ready"})
             except Exception:
@@ -124,6 +134,9 @@ class CodexBridge:
             if task and not task.done():
                 task.cancel()
         self._reader_task = self._stderr_task = self._wait_task = None
+        for task in self._server_request_tasks:
+            task.cancel()
+        self._server_request_tasks.clear()
         self._fail_pending(RuntimeError("Codex app-server foi encerrado"))
 
     async def request(self, method: str, params: Optional[Dict[str, Any]] = None, timeout: float = 120) -> Any:
@@ -200,9 +213,10 @@ class CodexBridge:
 
     async def _read_stdout(self) -> None:
         assert self.process and self.process.stdout
+        stream = self.process.stdout
         try:
             while True:
-                line = await self.process.stdout.readline()
+                line = await stream.readline()
                 if not line:
                     break
                 try:
@@ -219,6 +233,14 @@ class CodexBridge:
                     continue
 
                 if request_id is not None and message.get("method"):
+                    if self.server_request_handler:
+                        task = asyncio.create_task(
+                            self._handle_server_request(message),
+                            name=f"codex-app-server-request-{self.label}",
+                        )
+                        self._server_request_tasks.add(task)
+                        task.add_done_callback(self._server_request_tasks.discard)
+                        continue
                     await self.events.publish({"kind": "server_request", "workspace": self.label, "request": message})
                     continue
 
@@ -244,10 +266,26 @@ class CodexBridge:
             if process and process.returncode is None:
                 process.terminate()
 
+    async def _handle_server_request(self, message: dict[str, Any]) -> None:
+        request_id = message.get("id")
+        try:
+            result = await self.server_request_handler(self.label, message) if self.server_request_handler else None
+            if result is None:
+                await self.events.publish({"kind": "server_request", "workspace": self.label, "request": message})
+                return
+            await self._send({"id": request_id, "result": result})
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            LOGGER.exception("Falha ao atender solicitação interna do app-server (%s)", self.label)
+            if request_id is not None and self.running:
+                await self._send({"id": request_id, "error": {"code": -32603, "message": str(exc)}})
+
     async def _read_stderr(self) -> None:
         assert self.process and self.process.stderr
+        stream = self.process.stderr
         while True:
-            line = await self.process.stderr.readline()
+            line = await stream.readline()
             if not line:
                 break
             text = line.decode("utf-8", errors="replace").rstrip()
@@ -256,7 +294,8 @@ class CodexBridge:
 
     async def _wait_process(self) -> None:
         assert self.process
-        code = await self.process.wait()
+        process = self.process
+        code = await process.wait()
         self.initialized = False
         self.last_error = f"Codex app-server encerrou com código {code}"
         self._fail_pending(RuntimeError(self.last_error))

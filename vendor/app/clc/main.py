@@ -4,14 +4,18 @@ import asyncio
 import base64
 import contextlib
 from dataclasses import replace
+from datetime import datetime
 import hmac
 import ipaddress
 import json
 import logging
 import mimetypes
 import os
+import pwd
 import re
 import shutil
+import socket
+import struct
 import urllib.parse
 import urllib.error
 import urllib.request
@@ -25,6 +29,7 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Red
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from .automations import AUTOMATION_TOOL_SPEC, AutomationManager, migrate_thread_dynamic_tools
 from .codex_bridge import CodexBridge, CodexRPCError
 from .conversation_search import (
     broken_generated_title,
@@ -56,13 +61,26 @@ from .desktop_mcp import (
 from .extensions import app_slug, config_identifier, profile_input, skill_path
 from .projects import Project, ProjectStore, SYSTEM_PROJECT_ID
 from .operations_store import OperationsStore
-from .project_bridges import ProjectBridgePool
+from .pc_insights import PROCESS_SCAN_ARGV, STORAGE_SCAN_ARGV, process_snapshot, storage_snapshot
+from .project_bridges import ProjectBridgePool, safe_project_unit
 from .remote_desktop import RemoteDesktopManager, adaptive_geometry, find_novnc_web_root, novnc_inline_script_csp_hashes
 from .tool_profiles import ToolProfile, ToolProfileStore
 from .upstream import UPSTREAM_CHECK_INTERVAL_SECONDS, UpstreamRegistry
-from .security import SessionStore, network_identity, require_http_session, websocket_session
+from .security import (
+    PLAYWRIGHT_AUTOMATION_DEVICE_ID,
+    PLAYWRIGHT_AUTOMATION_IDENTITY,
+    SessionStore,
+    cloudflare_access_token_issued_at,
+    is_playwright_automation_request,
+    network_identity,
+    provision_playwright_internal_access,
+    require_http_session,
+    websocket_session,
+)
+from .site_access import SiteAccessStore
 from .web_terminal import TerminalSpec, serve_terminal
 from .web_push import WebPushStore
+from .workbench import install_workbench
 from .setup_ops import (
     SetupTask,
     SetupTaskManager,
@@ -90,6 +108,11 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 LOGGER = logging.getLogger(__name__)
+try:
+    PLAYWRIGHT_INTERNAL_ACCESS_READY = provision_playwright_internal_access(settings)
+except (OSError, RuntimeError, ValueError) as exc:
+    PLAYWRIGHT_INTERNAL_ACCESS_READY = False
+    LOGGER.error("Identidade interna Playwright indisponível: %s", exc)
 
 events = EventHub()
 sessions = SessionStore(settings.session_ttl_seconds)
@@ -118,8 +141,18 @@ backup_settings = replace(
 )
 backup_cloud = CloudSyncManager(backup_settings)
 tool_profiles = ToolProfileStore(settings.resolved_tool_profiles_file)
-system_bridge = CodexBridge(settings, events, label="system")
-project_bridges = ProjectBridgePool(settings, events)
+automations = AutomationManager(settings.resolved_config_dir / "automations.sqlite3")
+system_bridge = CodexBridge(
+    settings,
+    events,
+    label="system",
+    server_request_handler=automations.handle_server_request,
+)
+project_bridges = ProjectBridgePool(
+    settings,
+    events,
+    server_request_handler=automations.handle_server_request,
+)
 # Compatibility alias for the permanent system/control workspace.
 bridge = system_bridge
 setup_tasks = SetupTaskManager()
@@ -127,11 +160,24 @@ device_auth = DeviceAuthStore(settings.resolved_devices_file)
 entra_auth = EntraAuthManager(settings, sessions)
 remote_desktop = RemoteDesktopManager(settings)
 operations = OperationsStore(settings.resolved_config_dir / "operations.json")
+site_access = SiteAccessStore(settings.resolved_config_dir / "site-access.json")
 upstream_registry = UpstreamRegistry(settings)
 queue_worker_task: asyncio.Task | None = None
 push_worker_task: asyncio.Task | None = None
 upstream_worker_task: asyncio.Task | None = None
 playwright_conversation_task: asyncio.Task | None = None
+browser_credential_server: asyncio.AbstractServer | None = None
+site_access_worker_task: asyncio.Task | None = None
+site_access_refresh_task: asyncio.Task | None = None
+automation_worker_task: asyncio.Task | None = None
+site_access_refresh_state: Dict[str, Any] = {
+    "running": False,
+    "completed": False,
+    "projects_scanned": 0,
+    "threads_scanned": 0,
+    "accesses_imported": 0,
+    "error": "",
+}
 web_push = WebPushStore(settings.resolved_config_dir / "push-subscriptions.json")
 _LOCAL_EGRESS_CACHE: tuple[float, set[str]] = (0.0, set())
 MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024
@@ -150,16 +196,31 @@ PLAYWRIGHT_VIEWER_IDLE_SECONDS = max(
 PLAYWRIGHT_SWEEP_INTERVAL_SECONDS = 15
 _playwright_conversations: Dict[tuple[str, str], Dict[str, Any]] = {}
 _playwright_live_viewers: Dict[tuple[str, str], set[WebSocket]] = {}
+_playwright_read_only_viewers: Dict[tuple[str, str], set[WebSocket]] = {}
 _playwright_front_key: tuple[str, str] | None = None
+_playwright_observed_front_key: tuple[str, str] | None = None
 _playwright_viewport_markers: Dict[tuple[str, str], tuple[int, int]] = {}
 _playwright_release_locks: Dict[tuple[str, str], asyncio.Lock] = {}
 _playwright_preview_locks: Dict[tuple[str, str], asyncio.Lock] = {}
 _playwright_remote_owner_lock = asyncio.Lock()
 _playwright_focus_lock = asyncio.Lock()
+_browser_credential_routes: Dict[str, Dict[str, Any]] = {}
+_browser_credential_requests: Dict[str, Dict[str, Any]] = {}
 _active_turns: Dict[tuple[str, str], Dict[str, Any]] = {}
 _rollout_gate_lock = asyncio.Lock()
 _rollout_quiescing_until = 0.0
 ROLLOUT_QUIESCE_SECONDS = 45
+BROWSER_CREDENTIAL_TIMEOUT_SECONDS = 300
+BROWSER_CREDENTIAL_REPUBLISH_SECONDS = 5
+BROWSER_CREDENTIAL_TOKEN_RE = re.compile(r"^[0-9a-fA-F-]{32,64}$")
+BROWSER_CREDENTIAL_SOCKET_PATH = Path(f"/tmp/sasocq-browser-credentials-{os.getpid()}.sock")
+_startup_canary_error = "canário funcional ainda não executado"
+_startup_canary_checked_at = 0.0
+
+
+def _system_codex_state_database() -> Path:
+    codex_home = Path(os.environ.get("CODEX_HOME", str(settings.home / ".codex"))).expanduser()
+    return codex_home / "state_5.sqlite"
 
 
 class ProjectCreate(BaseModel):
@@ -353,6 +414,28 @@ class ApprovalResponse(BaseModel):
     result: Optional[Dict[str, Any]] = None
 
 
+class BrowserCredentialBridgeRequest(BaseModel):
+    request_token: str = Field(pattern=r"^[0-9a-fA-F-]{32,64}$", max_length=64)
+    site: str = Field(min_length=1, max_length=200)
+    purpose: str = Field(min_length=1, max_length=300)
+    fields: list[str] = Field(min_length=1, max_length=7)
+    kind: str = Field(default="credentials", pattern=r"^(credentials|payment_card)$")
+
+
+class BrowserCredentialUserResponse(BaseModel):
+    request_id: str = Field(pattern=r"^[0-9a-fA-F-]{32,64}$", max_length=64)
+    workspace: str = Field(default="system", max_length=MAX_WORKSPACE_SELECTOR_LENGTH)
+    result: Dict[str, Any]
+
+
+class SiteAccessPolicyUpdate(BaseModel):
+    mode: str = Field(pattern="^(auto|ask|block)$")
+
+
+class ApprovalAutonomyUpdate(BaseModel):
+    level: int = Field(ge=1, le=15)
+
+
 class RenameThread(BaseModel):
     name: str = Field(min_length=1, max_length=200)
 
@@ -424,6 +507,10 @@ class DeviceAuthenticateRequest(BaseModel):
     device_id: str = Field(min_length=10, max_length=200)
     challenge_id: str = Field(min_length=10, max_length=200)
     signature: str = Field(min_length=20, max_length=1000)
+
+
+class DeviceReauthenticationRequest(BaseModel):
+    interval_seconds: int
 
 
 class EntraConfigurationRequest(BaseModel):
@@ -549,6 +636,18 @@ def _system_project() -> Project:
     return Project(SYSTEM_PROJECT_ID, SYSTEM_WORKSPACE_NAME, str(path), "system")
 
 
+def _thread_approval_policy(_project: Project) -> str:
+    """Run in-scope work without redundant app-server command prompts.
+
+    This does not widen host authority: privileged operations still cross the
+    audited Control Plane broker, destructive host operations keep their strong
+    operator confirmation, and external MCP/app actions retain their own
+    approval policies.
+    """
+
+    return "never"
+
+
 def _all_projects() -> list[Project]:
     """Return exactly one permanent System workspace followed by normal projects."""
 
@@ -569,6 +668,29 @@ def _project_or_404(project_id: str) -> Project:
 
 def _first_normal_project() -> Project | None:
     return next((item for item in projects.list() if item.kind != "system" and item.id != SYSTEM_PROJECT_ID), None)
+
+
+def _project_workspace_paths(project: Project) -> list[str]:
+    """Return the validated primary and related folders selected by the operator."""
+
+    metadata = operations.metadata().get("projects", {}).get(project.id, {})
+    configured = metadata.get("paths") if isinstance(metadata, dict) else []
+    candidates = [project.path, *(configured if isinstance(configured, list) else [])]
+    allowed = [root.resolve() for root in settings.project_roots]
+    result: list[str] = []
+    for raw in candidates[:50]:
+        try:
+            resolved = Path(str(raw)).expanduser().resolve()
+        except (OSError, RuntimeError):
+            continue
+        if not resolved.is_dir():
+            continue
+        if project.kind != "system" and not any(resolved == root or root in resolved.parents for root in allowed):
+            continue
+        value = str(resolved)
+        if value not in result:
+            result.append(value)
+    return result or [project.path]
 
 
 async def _privileged_account_file(*command: str, allow_missing: bool = False) -> None:
@@ -707,9 +829,15 @@ def _enforce_completed_session(session) -> None:
     from the home network; remote requests wait for local approval. Four
     device keys may remain active without weakening subsequent sessions.
     """
+    if session.identity == PLAYWRIGHT_AUTOMATION_IDENTITY:
+        if session.device_id != PLAYWRIGHT_AUTOMATION_DEVICE_ID:
+            raise HTTPException(status_code=403, detail="Identidade interna Playwright inconsistente")
+        return
     if not settings.setup_completed:
         return
-    if not session.device_id and not (session.identity == "localhost" and not settings.require_paired_local):
+    if not session.device_id:
+        if session.identity == "localhost" and not settings.require_paired_local:
+            return
         raise HTTPException(
             status_code=403,
             detail={
@@ -718,6 +846,32 @@ def _enforce_completed_session(session) -> None:
                     "Depois da ativação, o Codex Linux Control só pode ser aberto "
                     "por um celular, tablet ou navegador previamente pareado."
                 ),
+            },
+        )
+    record = device_auth.get(session.device_id)
+    if not record:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "paired_device_required",
+                "message": "A autorização deste navegador foi revogada.",
+            },
+        )
+    if device_auth.reauthentication_required(session.device_id, mark=True):
+        cloudflare = record.identity.casefold().startswith("cloudflare:")
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "code": "cloudflare_reauth_required" if cloudflare else "device_reauth_required",
+                "message": (
+                    "Este navegador atingiu o prazo configurado. Confirme novamente sua identidade "
+                    "no Cloudflare Access para continuar."
+                    if cloudflare else
+                    "Este navegador atingiu o prazo configurado. Valide novamente sua chave para continuar."
+                ),
+                "device_id": record.id,
+                "device_name": record.name,
+                "interval_seconds": record.reauthentication_interval_seconds,
             },
         )
     if settings.entra_configured and not session.entra_verified:
@@ -732,6 +886,8 @@ def _enforce_completed_session(session) -> None:
 
 def _session(request: Request, mutate: bool = False):
     session = require_http_session(request, settings, sessions, require_csrf=mutate)
+    if mutate and session.identity == PLAYWRIGHT_AUTOMATION_IDENTITY:
+        raise HTTPException(status_code=403, detail="A identidade interna Playwright é somente leitura")
     _enforce_completed_session(session)
     return session
 
@@ -797,21 +953,23 @@ def _set_session_cookie(request: Request, response: Response, session) -> None:
 
 
 def _session_payload(session, identity: str) -> Dict[str, Any]:
+    playwright_read_only = identity == PLAYWRIGHT_AUTOMATION_IDENTITY
     return {
         "csrf": session.csrf_token,
         "identity": identity,
         "device_id": session.device_id,
         "remote_enabled": settings.remote_enabled,
         "setup_completed": settings.setup_completed,
-        "is_local": identity == "localhost",
+        "is_local": identity == "localhost" or playwright_read_only,
+        "read_only_automation": playwright_read_only,
         "external_url": settings.external_url,
         "app_version": settings.app_version,
         "device_auth_required": bool(
-            settings.device_auth_required and (identity != "localhost" or settings.setup_completed)
+            not playwright_read_only and settings.device_auth_required and (identity != "localhost" or settings.setup_completed)
         ),
         "entra": {
             "configured": settings.entra_configured,
-            "required": bool(settings.setup_completed and settings.entra_configured),
+            "required": bool(not playwright_read_only and settings.setup_completed and settings.entra_configured),
             "verified": session.entra_verified,
             "email": session.entra_email,
             "auth_method": session.auth_method,
@@ -951,18 +1109,428 @@ async def _rpc(
                 setattr(selected, "_clc_mcp_configured", True)
         return await selected.request(method, params, timeout=timeout)
     except CodexRPCError as exc:
+        LOGGER.warning("Falha RPC em %s no workspace %s: %s", method, selected.label, exc.error)
         raise HTTPException(status_code=502, detail={"workspace": selected.label, "method": exc.method, "error": exc.error}) from exc
     except Exception as exc:
         LOGGER.exception("Falha ao chamar %s no workspace %s", method, selected.label)
         raise HTTPException(status_code=503, detail={"workspace": selected.label, "error": str(exc)}) from exc
 
 
+def _rpc_error_text(value: Any) -> str:
+    """Flatten an RPC error without exposing a full HTML gateway response."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        preferred = [value.get(key) for key in ("message", "error", "detail")]
+        parts = [_rpc_error_text(item) for item in preferred if item not in (None, "")]
+        if parts:
+            return " ".join(parts)
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _is_transient_gateway_error(value: Any) -> bool:
+    text = _rpc_error_text(value).lower()
+    html_gateway = "<!doctype html" in text or "<html" in text
+    return html_gateway or ("502" in text and ("bad gateway" in text or "cloudflare" in text))
+
+
+def _rpc_error_code(value: Any) -> Optional[int]:
+    if isinstance(value, dict):
+        code = value.get("code")
+        if isinstance(code, int):
+            return code
+        for key in ("error", "detail"):
+            nested = _rpc_error_code(value.get(key))
+            if nested is not None:
+                return nested
+    return None
+
+
+def _retryable_start_error(exc: HTTPException) -> bool:
+    """Accept unknown 502s but reject explicit JSON-RPC request errors."""
+    if exc.status_code != 502:
+        return False
+    return _rpc_error_code(exc.detail) not in {-32600, -32601, -32602}
+
+
+async def _start_thread_with_gateway_retry(
+    params: Dict[str, Any], *, target: CodexBridge
+) -> Any:
+    return await _start_rpc_with_gateway_retry("thread/start", params, target=target, timeout=None)
+
+
+async def _start_turn_with_gateway_retry(
+    params: Dict[str, Any],
+    *,
+    target: CodexBridge,
+) -> Any:
+    return await _start_rpc_with_gateway_retry(
+        "turn/start",
+        params,
+        target=target,
+        timeout=60,
+        recycle_bridge=False,
+    )
+
+
+async def _start_rpc_with_gateway_retry(
+    method: str,
+    params: Dict[str, Any],
+    *,
+    target: CodexBridge,
+    timeout: Optional[float] = 120,
+    recycle_bridge: bool = True,
+) -> Any:
+    """Recover a degraded bridge and retry a failed thread/turn start.
+
+    For thread/start, a bridge is recycled only when its workspace has no active
+    turn. For turn/start, retries stay in the same app-server because a thread
+    without its first turn is not persisted yet. Explicit JSON-RPC request errors
+    are returned immediately.
+    """
+    delays = (0.5, 1.5)
+    bridge_recycled = False
+    for attempt in range(len(delays) + 1):
+        # Test doubles and older bridge-compatible adapters may not expose a
+        # generation yet. Production CodexBridge instances always do.
+        generation = getattr(target, "generation", 0)
+        try:
+            if timeout is None:
+                result = await _rpc(method, params, target=target)
+            else:
+                result = await _rpc(method, params, timeout=timeout, target=target)
+            if method == "thread/start":
+                thread = result.get("thread") if isinstance(result, dict) else None
+                if not isinstance(thread, dict) or not str(thread.get("id") or ""):
+                    raise HTTPException(
+                        status_code=502,
+                        detail={
+                            "workspace": target.label,
+                            "method": method,
+                            "error": "O Codex retornou uma resposta incompleta ao iniciar a conversa",
+                        },
+                    )
+            return result
+        except HTTPException as exc:
+            if not _retryable_start_error(exc) or attempt >= len(delays):
+                raise
+            error_kind = "gateway" if _is_transient_gateway_error(exc.detail) else "rpc-502"
+            LOGGER.warning(
+                "%s (%s) ao executar %s em %s; tentativa %d de %d",
+                error_kind,
+                _rpc_error_code(exc.detail) or "sem-código",
+                method,
+                target.label,
+                attempt + 2,
+                len(delays) + 1,
+            )
+            recovered = False
+            if recycle_bridge and not bridge_recycled:
+                recovered = await _recover_start_bridge(target, generation)
+                bridge_recycled = recovered
+            if not recovered:
+                await asyncio.sleep(delays[attempt])
+    raise RuntimeError("estado de repetição de conversa inválido")
+
+
+async def _recover_start_bridge(
+    target: CodexBridge,
+    generation: int,
+) -> bool:
+    """Recycle one failed app-server without interrupting an active turn."""
+    async with target.recovery_lock:
+        if target.generation != generation:
+            return True
+        if any(workspace == target.label for workspace, _thread_id in _active_turns):
+            return False
+        LOGGER.warning(
+            "Renovando app-server %s após erro 502 em início de conversa (geração %d)",
+            target.label,
+            generation,
+        )
+        await target.stop()
+        setattr(target, "_clc_mcp_configured", False)
+        await target.start()
+        if settings.full_experience_installed and isinstance(target, CodexBridge):
+            await _configure_bundled_mcp(target, include_desktop=target is system_bridge)
+            setattr(target, "_clc_mcp_configured", True)
+        return True
+
+
 def _bundled_wrapper(name: str) -> str:
+    # The credential-aware Playwright adapter ships with the immutable Dex
+    # release so activation and rollback always select a matching backend/UI.
+    packaged = Path(__file__).resolve().parent.parent / "scripts" / name
+    if name == "run-playwright-mcp" and packaged.is_file():
+        return str(packaged)
     installed = Path("/usr/lib/dex-remote") / name
     if installed.is_file():
         return str(installed)
     development = Path(__file__).resolve().parent.parent / "scripts" / name
     return str(development)
+
+
+APPROVAL_AUTONOMY_LEVELS: tuple[Dict[str, Any], ...] = (
+    {
+        "level": 1,
+        "name": "Supervisão total",
+        "risk": "Mínimo",
+        "summary": "O navegador só age depois de cada aprovação.",
+        "automatic": "Nenhuma ferramenta Playwright.",
+        "still_prompts": "Capturas, leitura, navegação, interação e qualquer alteração.",
+    },
+    {
+        "level": 2,
+        "name": "Leitura visual",
+        "risk": "Muito baixo",
+        "summary": "Permite enxergar e localizar conteúdo sem navegar nem alterar a página.",
+        "automatic": "Capturas, árvore acessível, busca na página e leitura do console.",
+        "still_prompts": "Rede, cookies, navegação, movimentos, sessões e interações.",
+    },
+    {
+        "level": 3,
+        "name": "Diagnóstico",
+        "risk": "Baixo",
+        "summary": "Acrescenta diagnóstico técnico e leitura do estado local do navegador.",
+        "automatic": "Rede e leitura de cookies, localStorage e sessionStorage.",
+        "still_prompts": "Abrir páginas, mover a interface, registrar sessões e interagir.",
+    },
+    {
+        "level": 4,
+        "name": "Navegação",
+        "risk": "Baixo",
+        "summary": "Permite percorrer sites e aguardar conteúdo sem clicar em controles.",
+        "automatic": "Abrir URL, voltar, avançar e aguardar conteúdo.",
+        "still_prompts": "Rolagem, hover, abas, registros, JavaScript, estado e interação.",
+    },
+    {
+        "level": 5,
+        "name": "Interface passiva",
+        "risk": "Baixo a moderado",
+        "summary": "Acrescenta exploração visual sem ativar botões ou campos.",
+        "automatic": "Rolagem, hover, realces, movimento do ponteiro e redimensionamento.",
+        "still_prompts": "Abas e registros, JavaScript, estado persistente e interação.",
+    },
+    {
+        "level": 6,
+        "name": "Sessão e registros",
+        "risk": "Moderado",
+        "summary": "Permite administrar abas e produzir artefatos locais de diagnóstico.",
+        "automatic": "Abas, fechar página, PDF, anotação, trace, vídeo e exportação do estado.",
+        "still_prompts": "JavaScript na página, teclas, mudanças persistentes e interação.",
+    },
+    {
+        "level": 7,
+        "name": "Equilibrado",
+        "risk": "Moderado",
+        "summary": "Libera automação dentro da página, sem clicar ou preencher formulários.",
+        "automatic": "browser_evaluate, teclas e definição de cookies.",
+        "still_prompts": "Limpar/restaurar estado, clicar, digitar, preencher, arrastar e enviar arquivos.",
+    },
+    {
+        "level": 8,
+        "name": "Estado do navegador",
+        "risk": "Elevado",
+        "summary": "Permite alterar dados persistentes da sessão do navegador.",
+        "automatic": "Definir, excluir, limpar ou restaurar cookies e armazenamentos locais.",
+        "still_prompts": "Cliques, digitação, formulários, arraste, diálogos e uploads.",
+    },
+    {
+        "level": 9,
+        "name": "Clique e digitação",
+        "risk": "Alto",
+        "summary": "Resolve interações diretas comuns, inclusive o caso browser_type mostrado na conversa.",
+        "automatic": "browser_click e browser_type.",
+        "still_prompts": "Formulários estruturados, seleção, diálogos, coordenadas, arraste e arquivos.",
+    },
+    {
+        "level": 10,
+        "name": "Formulários estruturados",
+        "risk": "Alto",
+        "summary": "Permite preencher vários campos e escolher opções, ainda sem aceitar diálogos.",
+        "automatic": "browser_fill_form, browser_select_option e browser_press_key.",
+        "still_prompts": "Diálogos, coordenadas, arraste, dados externos e arquivos.",
+    },
+    {
+        "level": 11,
+        "name": "Diálogos do site",
+        "risk": "Alto",
+        "summary": "Permite aceitar ou recusar alertas, confirmações e prompts exibidos pela página.",
+        "automatic": "browser_handle_dialog.",
+        "still_prompts": "Interação por coordenadas, arraste, dados externos e arquivos.",
+    },
+    {
+        "level": 12,
+        "name": "Controle por coordenadas",
+        "risk": "Muito alto",
+        "summary": "Libera cliques físicos em posições da tela, com menor contexto semântico.",
+        "automatic": "browser_mouse_click_xy, browser_mouse_down e browser_mouse_up.",
+        "still_prompts": "Arraste por elemento/coordenadas, dados externos e arquivos.",
+    },
+    {
+        "level": 13,
+        "name": "Arraste avançado",
+        "risk": "Muito alto",
+        "summary": "Permite mover elementos e executar gestos de arraste na página.",
+        "automatic": "browser_drag e browser_mouse_drag_xy.",
+        "still_prompts": "Dados arrastados de fora da página e uploads de arquivos.",
+    },
+    {
+        "level": 14,
+        "name": "Dados externos",
+        "risk": "Crítico",
+        "summary": "Permite soltar dados ou caminhos externos sobre a página.",
+        "automatic": "browser_drop.",
+        "still_prompts": "Seleção e upload explícito de arquivos locais.",
+    },
+    {
+        "level": 15,
+        "name": "Autonomia máxima",
+        "risk": "Crítico",
+        "summary": "Libera todas as ferramentas normais do navegador, inclusive arquivos locais.",
+        "automatic": "browser_file_upload, além de tudo dos níveis anteriores.",
+        "still_prompts": "browser_run_code_unsafe e confirmações críticas externas protegidas por política.",
+    },
+)
+
+
+PLAYWRIGHT_TOOL_MIN_LEVEL: Dict[str, int] = {
+    # Passive page inspection.
+    "browser_snapshot": 2,
+    "browser_take_screenshot": 2,
+    "browser_find": 2,
+    "browser_console_messages": 2,
+    # Diagnostics and read-only browser state.
+    "browser_network_requests": 3,
+    "browser_network_request": 3,
+    "browser_cookie_get": 3,
+    "browser_cookie_list": 3,
+    "browser_localstorage_get": 3,
+    "browser_localstorage_list": 3,
+    "browser_sessionstorage_get": 3,
+    "browser_sessionstorage_list": 3,
+    # Reversible navigation.
+    "browser_navigate": 4,
+    "browser_navigate_back": 4,
+    "browser_navigate_forward": 4,
+    "browser_wait_for": 4,
+    # Passive presentation and pointer movement.
+    "browser_hover": 5,
+    "browser_highlight": 5,
+    "browser_hide_highlight": 5,
+    "browser_mouse_move_xy": 5,
+    "browser_mouse_wheel": 5,
+    "browser_resize": 5,
+    # Browser session and local diagnostic artifacts.
+    "browser_annotate": 6,
+    "browser_close": 6,
+    "browser_pdf_save": 6,
+    "browser_resume": 6,
+    "browser_start_tracing": 6,
+    "browser_stop_tracing": 6,
+    "browser_start_video": 6,
+    "browser_stop_video": 6,
+    "browser_storage_state": 6,
+    "browser_tabs": 6,
+    "browser_video_chapter": 6,
+    "browser_video_hide_actions": 6,
+    "browser_video_show_actions": 6,
+    # Explicit operator-approved balanced automation.
+    "browser_evaluate": 7,
+    "browser_cookie_set": 7,
+    # Persistent browser-state mutation.
+    "browser_cookie_clear": 8,
+    "browser_cookie_delete": 8,
+    "browser_localstorage_clear": 8,
+    "browser_localstorage_delete": 8,
+    "browser_localstorage_set": 8,
+    "browser_sessionstorage_clear": 8,
+    "browser_sessionstorage_delete": 8,
+    "browser_sessionstorage_set": 8,
+    "browser_set_storage_state": 8,
+    # Direct interaction can submit or alter external state.
+    "browser_click": 9,
+    "browser_type": 9,
+    # Higher-risk actions are deliberately spread across separate levels.
+    "browser_fill_form": 10,
+    "browser_select_option": 10,
+    "browser_press_key": 10,
+    "browser_handle_dialog": 11,
+    "browser_mouse_click_xy": 12,
+    "browser_mouse_down": 12,
+    "browser_mouse_up": 12,
+    "browser_drag": 13,
+    "browser_mouse_drag_xy": 13,
+    # Dropped data and uploads can disclose local content.
+    "browser_drop": 14,
+    "browser_file_upload": 15,
+}
+
+PLAYWRIGHT_ALWAYS_PROMPT = ("browser_run_code_unsafe",)
+
+# Settings can be changed from more than one open Dex tab.  Keep persistence
+# and live bridge updates ordered so an older request cannot finish after and
+# overwrite a newer choice.
+APPROVAL_AUTONOMY_UPDATE_LOCK = asyncio.Lock()
+
+
+def _approval_autonomy_level(value: Any = None) -> int:
+    selected = settings.approval_autonomy_level if value is None else value
+    maximum = int(APPROVAL_AUTONOMY_LEVELS[-1]["level"])
+    return max(1, min(maximum, int(selected)))
+
+
+def _approval_autonomy_payload(value: Any = None) -> Dict[str, Any]:
+    level = _approval_autonomy_level(value)
+    selected = next(item for item in APPROVAL_AUTONOMY_LEVELS if item["level"] == level)
+    return {
+        **selected,
+        "levels": [dict(item) for item in APPROVAL_AUTONOMY_LEVELS],
+        "scope": "playwright",
+        "always_requires_approval": [
+            "Código arbitrário no processo do servidor Playwright",
+            "Operações destrutivas ou privilegiadas do host",
+            "Confirmações fortes exigidas pelo Control Plane",
+            "Compras, pagamentos, mensagens, publicações, permissões e ações irreversíveis",
+            "Login, MFA ou reautenticação exigidos pelo próprio serviço",
+        ],
+    }
+
+
+def _playwright_approval_edits(level: Any = None) -> list[Dict[str, Any]]:
+    selected = _approval_autonomy_level(level)
+    edits = [
+        {
+            "keyPath": f"mcp_servers.playwright.tools.{tool}.approval_mode",
+            # ``auto`` still routes non-read-only MCP calls through the
+            # approval reviewer.  A level advertised as automatic must use
+            # ``approve`` so unlocked tools execute without an operator
+            # prompt; tools above the selected level remain explicit prompts.
+            "value": "approve" if selected >= minimum else "prompt",
+            "mergeStrategy": "upsert",
+        }
+        for tool, minimum in PLAYWRIGHT_TOOL_MIN_LEVEL.items()
+    ]
+    edits.extend(
+        {
+            "keyPath": f"mcp_servers.playwright.tools.{tool}.approval_mode",
+            "value": "prompt",
+            "mergeStrategy": "upsert",
+        }
+        for tool in PLAYWRIGHT_ALWAYS_PROMPT
+    )
+    # These tools perform their own mandatory, one-shot protected form.
+    # Avoid a redundant generic tool approval before the protected form.
+    for tool in ("browser_fill_credentials", "browser_fill_payment_card"):
+        edits.append({
+            "keyPath": f"mcp_servers.playwright.tools.{tool}.approval_mode",
+            "value": "approve",
+            "mergeStrategy": "upsert",
+        })
+    return edits
 
 
 def _bundled_mcp_edits(*, include_desktop: bool) -> list[Dict[str, Any]]:
@@ -972,10 +1540,11 @@ def _bundled_mcp_edits(*, include_desktop: bool) -> list[Dict[str, Any]]:
         {"keyPath": "apps._default.default_tools_approval_mode", "value": "prompt", "mergeStrategy": "upsert"},
         {"keyPath": "mcp_servers.playwright.command", "value": _bundled_wrapper("run-playwright-mcp"), "mergeStrategy": "replace"},
         {"keyPath": "mcp_servers.playwright.args", "value": [], "mergeStrategy": "replace"},
+        {"keyPath": "mcp_servers.playwright.env.SASOCQ_BROWSER_CREDENTIAL_SOCKET", "value": str(BROWSER_CREDENTIAL_SOCKET_PATH), "mergeStrategy": "replace"},
         {"keyPath": "mcp_servers.playwright.enabled", "value": settings.browser_control_enabled, "mergeStrategy": "upsert"},
         {"keyPath": "mcp_servers.playwright.required", "value": False, "mergeStrategy": "upsert"},
         {"keyPath": "mcp_servers.playwright.startup_timeout_sec", "value": 45, "mergeStrategy": "upsert"},
-        {"keyPath": "mcp_servers.playwright.tool_timeout_sec", "value": 180, "mergeStrategy": "upsert"},
+        {"keyPath": "mcp_servers.playwright.tool_timeout_sec", "value": 360, "mergeStrategy": "upsert"},
         {"keyPath": "mcp_servers.playwright.default_tools_approval_mode", "value": "prompt", "mergeStrategy": "upsert"},
         {"keyPath": "mcp_servers.sasocq_server.command", "value": _bundled_wrapper("run-server-mcp"), "mergeStrategy": "replace"},
         {"keyPath": "mcp_servers.sasocq_server.args", "value": [], "mergeStrategy": "replace"},
@@ -985,8 +1554,7 @@ def _bundled_mcp_edits(*, include_desktop: bool) -> list[Dict[str, Any]]:
         {"keyPath": "mcp_servers.sasocq_server.tool_timeout_sec", "value": 7200, "mergeStrategy": "upsert"},
         {"keyPath": "mcp_servers.sasocq_server.default_tools_approval_mode", "value": "auto", "mergeStrategy": "upsert"},
     ]
-    for tool in ("browser_snapshot", "browser_take_screenshot", "browser_console_messages", "browser_network_requests", "browser_tabs", "browser_press_key"):
-        edits.append({"keyPath": f"mcp_servers.playwright.tools.{tool}.approval_mode", "value": "auto", "mergeStrategy": "upsert"})
+    edits.extend(_playwright_approval_edits())
     for tool in ("server_status", "server_exec", "server_read_file", "server_write_file", "server_service", "server_deploy"):
         edits.append({"keyPath": f"mcp_servers.sasocq_server.tools.{tool}.approval_mode", "value": "auto", "mergeStrategy": "upsert"})
     if include_desktop:
@@ -1018,6 +1586,20 @@ async def _configure_bundled_mcp(target: CodexBridge, *, include_desktop: bool) 
     await target.request("config/mcpServer/reload", {}, timeout=60)
 
 
+async def _apply_approval_autonomy_to_live_bridges(level: int) -> list[str]:
+    """Update tool review policy without restarting any app-server or MCP."""
+
+    edits = _playwright_approval_edits(level)
+    targets = [system_bridge, *(bridge for bridge in project_bridges.bridges() if bridge.running and bridge.initialized)]
+    applied: list[str] = []
+    for target in targets:
+        if not target.running or not target.initialized:
+            continue
+        await target.request("config/batchWrite", {"edits": edits}, timeout=60)
+        applied.append(target.label)
+    return applied
+
+
 async def _optional_rpc(method: str, params: Optional[Dict[str, Any]] = None, timeout: float = 60, *, target: Optional[CodexBridge] = None) -> Dict[str, Any]:
     selected = target or system_bridge
     try:
@@ -1029,6 +1611,12 @@ async def _optional_rpc(method: str, params: Optional[Dict[str, Any]] = None, ti
 
 
 app = FastAPI(title=settings.app_name, version=settings.app_version)
+workbench = install_workbench(
+    app,
+    session_guard=_session,
+    project_lookup=_project_or_404,
+    config_dir=settings.resolved_config_dir,
+)
 
 
 async def _upstream_event_worker() -> None:
@@ -1058,6 +1646,76 @@ def _turn_event_identity(event: Dict[str, Any]) -> tuple[str, str, str]:
     return workspace, thread_id, turn_id
 
 
+def _epoch_milliseconds(value: Any) -> int:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        numeric = float(value)
+        return max(0, round(numeric * 1000 if numeric < 1_000_000_000_000 else numeric))
+    if not value:
+        return 0
+    try:
+        return max(0, round(datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp() * 1000))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _turn_duration_milliseconds(turn: Dict[str, Any], started_at: int, completed_at: int) -> int | None:
+    raw = turn.get("durationMs", turn.get("duration_ms"))
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw >= 0:
+        return round(raw)
+    if started_at and completed_at >= started_at:
+        return completed_at - started_at
+    return None
+
+
+def _rollout_execution_timing(path_value: Any) -> Dict[str, Any] | None:
+    """Backfill readable system histories without trusting arbitrary thread paths."""
+    try:
+        path = Path(str(path_value or "")).resolve()
+        sessions_root = (settings.home / ".codex/sessions").resolve()
+        path.relative_to(sessions_root)
+    except (OSError, ValueError):
+        return None
+    if path.suffix != ".jsonl" or not path.is_file():
+        return None
+    completed_ms = 0
+    turn_count = 0
+    first_started_at = 0
+    last_completed_turn_id = ""
+    try:
+        with path.open("r", encoding="utf-8") as stream:
+            for line in stream:
+                try:
+                    event = json.loads(line)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if event.get("type") != "event_msg":
+                    continue
+                payload = event.get("payload") or {}
+                if payload.get("type") != "task_complete":
+                    continue
+                started = _epoch_milliseconds(payload.get("started_at"))
+                completed = _epoch_milliseconds(payload.get("completed_at"))
+                duration = _turn_duration_milliseconds(payload, started, completed)
+                if duration is None:
+                    continue
+                completed_ms += duration
+                turn_count += 1
+                if started and (not first_started_at or started < first_started_at):
+                    first_started_at = started
+                last_completed_turn_id = str(payload.get("turn_id") or last_completed_turn_id)
+    except OSError:
+        return None
+    if not turn_count:
+        return None
+    return {
+        "completed_ms": completed_ms,
+        "active_started_at": 0,
+        "first_started_at": first_started_at,
+        "turn_count": turn_count,
+        "last_completed_turn_id": last_completed_turn_id,
+    }
+
+
 def _observe_turn_activity(event: Dict[str, Any]) -> None:
     """Maintain the release blocker from Codex lifecycle notifications."""
     if event.get("kind") != "notification":
@@ -1069,9 +1727,27 @@ def _observe_turn_activity(event: Dict[str, Any]) -> None:
         return
     key = (workspace, thread_id)
     if method == "turn/started":
+        turn = (event.get("notification") or {}).get("params", {}).get("turn") or {}
+        started_at = _epoch_milliseconds(turn.get("startedAt", turn.get("started_at"))) or round(time.time() * 1000)
+        operations.record_thread_execution(
+            thread_id,
+            turn_id or f"started:{started_at}",
+            started_at_ms=started_at,
+        )
         state = _active_turns.setdefault(key, {})
         state.update({"turn_id": turn_id, "starting": False, "last_activity": time.monotonic()})
     elif method == "turn/completed":
+        turn = (event.get("notification") or {}).get("params", {}).get("turn") or {}
+        existing = operations.metadata().get("threads", {}).get(thread_id, {}).get("execution_timing") or {}
+        started_at = _epoch_milliseconds(turn.get("startedAt", turn.get("started_at"))) or int(existing.get("active_started_at") or 0)
+        completed_at = _epoch_milliseconds(turn.get("completedAt", turn.get("completed_at"))) or round(time.time() * 1000)
+        operations.record_thread_execution(
+            thread_id,
+            turn_id or f"{started_at}:{completed_at}",
+            started_at_ms=started_at,
+            completed_at_ms=completed_at,
+            duration_ms=_turn_duration_milliseconds(turn, started_at, completed_at),
+        )
         _active_turns.pop(key, None)
     elif key in _active_turns:
         _active_turns[key]["last_activity"] = time.monotonic()
@@ -1177,7 +1853,7 @@ async def _playwright_preview_png(workspace: str, thread_id: str) -> bytes:
     state = _playwright_conversations.get(key)
     if not state or not state.get("context_open"):
         raise HTTPException(status_code=404, detail="A página desta conversa não está mais aberta")
-    if state.get("browser_call_started"):
+    if state.get("browser_call_started") and not state.get("credential_waiting"):
         raise HTTPException(status_code=409, detail="A página ainda está sendo atualizada")
     cached = state.get("preview_png")
     captured_at = float(state.get("preview_at") or 0.0)
@@ -1189,7 +1865,7 @@ async def _playwright_preview_png(workspace: str, thread_id: str) -> bytes:
         state = _playwright_conversations.get(key)
         if not state or not state.get("context_open"):
             raise HTTPException(status_code=404, detail="A página desta conversa não está mais aberta")
-        if state.get("browser_call_started"):
+        if state.get("browser_call_started") and not state.get("credential_waiting"):
             raise HTTPException(status_code=409, detail="A página ainda está sendo atualizada")
         cached = state.get("preview_png")
         captured_at = float(state.get("preview_at") or 0.0)
@@ -1286,6 +1962,7 @@ async def _focus_playwright_conversation(workspace: str, thread_id: str) -> None
                     timeout=30,
                 )
                 _playwright_front_key = key
+                _observe_playwright_front(key)
                 LOGGER.info("Janela Playwright exclusiva em primeiro plano: workspace=%s thread=%s", workspace, thread_id)
         except Exception as exc:
             LOGGER.debug("Não foi possível focar a janela Playwright de %s/%s: %s", workspace, thread_id, exc)
@@ -1316,6 +1993,7 @@ async def _claim_playwright_remote(key: tuple[str, str], websocket: WebSocket) -
                 _playwright_viewport_markers.pop(owner, None)
         _playwright_live_viewers.setdefault(key, set()).add(websocket)
         _playwright_front_key = None
+        _observe_playwright_front(None)
         state = _touch_playwright_conversation(key)
         # Opening the live viewer is itself an explicit request for this
         # conversation's isolated browser window. ``browser_tabs`` below will
@@ -1326,6 +2004,59 @@ async def _claim_playwright_remote(key: tuple[str, str], websocket: WebSocket) -
             *(viewer.close(code=4409, reason="O visor foi transferido para outra conversa") for viewer in displaced),
             return_exceptions=True,
         )
+
+
+async def _close_displaced_read_only_viewers(viewers: list[WebSocket]) -> None:
+    if viewers:
+        await asyncio.gather(
+            *(viewer.close(code=4409, reason="Outra conversa assumiu a navegação visível") for viewer in viewers),
+            return_exceptions=True,
+        )
+
+
+def _observe_playwright_front(key: tuple[str, str] | None) -> None:
+    """Track which conversation the shared display may safely expose.
+
+    This only follows normal Playwright activity. It never selects a tab or
+    raises a window for the internal read-only identity.
+    """
+
+    global _playwright_observed_front_key
+    _playwright_observed_front_key = key
+    displaced = [
+        viewer
+        for owner, viewers in list(_playwright_read_only_viewers.items())
+        if owner != key
+        for viewer in viewers
+    ]
+    for owner in list(_playwright_read_only_viewers):
+        if owner != key:
+            _playwright_read_only_viewers.pop(owner, None)
+    if displaced:
+        asyncio.create_task(
+            _close_displaced_read_only_viewers(displaced),
+            name="clc-playwright-read-only-displace",
+        )
+
+
+async def _claim_playwright_read_only(key: tuple[str, str], websocket: WebSocket) -> None:
+    async with _playwright_remote_owner_lock:
+        if _playwright_observed_front_key != key:
+            raise ValueError("esta conversa não é a navegação atualmente visível")
+        _playwright_read_only_viewers.setdefault(key, set()).add(websocket)
+        _touch_playwright_conversation(key)
+
+
+async def _release_playwright_read_only(key: tuple[str, str], websocket: WebSocket) -> None:
+    async with _playwright_remote_owner_lock:
+        viewers = _playwright_read_only_viewers.get(key)
+        if viewers is not None:
+            viewers.discard(websocket)
+            if not viewers:
+                _playwright_read_only_viewers.pop(key, None)
+        state = _playwright_conversations.get(key)
+        if state:
+            state["last_activity"] = time.monotonic()
 
 
 async def _release_playwright_remote(key: tuple[str, str], websocket: WebSocket) -> None:
@@ -1352,7 +2083,7 @@ async def _close_playwright_context(key: tuple[str, str], *, reason: str) -> boo
         state = _playwright_conversations.get(key)
         if not state or not state.get("context_open"):
             return True
-        if state.get("turn_active") or state.get("browser_call_started") or state.get("preview_call_started") or _playwright_live_viewers.get(key):
+        if state.get("turn_active") or state.get("browser_call_started") or state.get("preview_call_started") or _playwright_live_viewers.get(key) or _playwright_read_only_viewers.get(key):
             return False
         target = _playwright_bridge(workspace)
         if not target:
@@ -1373,13 +2104,129 @@ async def _close_playwright_context(key: tuple[str, str], *, reason: str) -> boo
             LOGGER.warning("Falha ao liberar a janela Playwright %s/%s (%s): %s", workspace, thread_id, reason, exc)
             return False
         state["context_open"] = False
+        if _playwright_observed_front_key == key:
+            _observe_playwright_front(None)
         _playwright_viewport_markers.pop(key, None)
-        if not state.get("turn_active") and not _playwright_live_viewers.get(key):
+        if not state.get("turn_active") and not _playwright_live_viewers.get(key) and not _playwright_read_only_viewers.get(key):
             _playwright_conversations.pop(key, None)
             _playwright_release_locks.pop(key, None)
             _playwright_preview_locks.pop(key, None)
         LOGGER.info("Janela Playwright liberada por inatividade: workspace=%s thread=%s reason=%s", workspace, thread_id, reason)
         return True
+
+
+def _browser_credential_field_names(arguments: Dict[str, Any], tool: str = "browser_fill_credentials") -> list[str]:
+    pairs = (
+        (
+            ("cardholder_name", "cardholder_name_target"),
+            ("card_number", "card_number_target"),
+            ("expiration", "expiration_target"),
+            ("expiration_month", "expiration_month_target"),
+            ("expiration_year", "expiration_year_target"),
+            ("security_code", "security_code_target"),
+            ("postal_code", "postal_code_target"),
+        )
+        if tool == "browser_fill_payment_card"
+        else (
+            ("login", "login_target"),
+            ("password", "password_target"),
+            ("one_time_code", "one_time_code_target"),
+        )
+    )
+    return [name for name, target in pairs if str(arguments.get(target) or "").strip()]
+
+
+def _browser_credential_schema(fields: list[str]) -> Dict[str, Any]:
+    definitions = {
+        "login": ("Login", 8192),
+        "password": ("Senha", 8192),
+        "one_time_code": ("Código temporário", 8192),
+        "cardholder_name": ("Nome no cartão", 200),
+        "card_number": ("Número do cartão", 32),
+        "expiration": ("Validade", 9),
+        "expiration_month": ("Mês", 2),
+        "expiration_year": ("Ano", 4),
+        "security_code": ("CVV/CVC", 8),
+        "postal_code": ("CEP", 32),
+    }
+    unknown = set(fields) - set(definitions)
+    if unknown:
+        raise ValueError("campos protegidos desconhecidos")
+    properties = {
+        name: {
+            "type": "string",
+            "title": definitions[name][0],
+            "maxLength": definitions[name][1],
+            "description": "Dado protegido enviado diretamente ao navegador; o Codex não recebe este valor.",
+        }
+        for name in fields
+    }
+    return {"type": "object", "properties": properties, "required": list(fields)}
+
+
+async def _publish_browser_credential_resolution(record: Dict[str, Any]) -> None:
+    await events.publish({
+        "kind": "browser_credentials_resolved",
+        "workspace": record["workspace"],
+        "thread_id": record["thread_id"],
+        "request_id": record["request_token"],
+    })
+
+
+def _browser_credential_request_event(record: Dict[str, Any]) -> Dict[str, Any]:
+    payment_card = record.get("kind") == "payment_card"
+    return {
+        "kind": "server_request",
+        "workspace": record["workspace"],
+        "request": {
+            "id": record["request_token"],
+            "method": "browser/payment-card/request" if payment_card else "browser/credentials/request",
+            "params": {
+                "threadId": record["thread_id"],
+                "message": (
+                    f"SASOCQ_PAYMENT_CARD\n{record['site']}\n{record['purpose']}"
+                    if payment_card
+                    else f"SASOCQ_CREDENTIALS\n{record['site']}\n{record['purpose']}"
+                ),
+                "requestedSchema": record["schema"],
+                "previewUrl": (
+                    "/api/remote-desktop/browser-preview?thread_id="
+                    f"{urllib.parse.quote(record['thread_id'], safe='')}"
+                ),
+            },
+        },
+    }
+
+
+def _pending_browser_credential_events() -> list[Dict[str, Any]]:
+    now = time.monotonic()
+    return [
+        _browser_credential_request_event(record)
+        for record in _browser_credential_requests.values()
+        if record.get("status") == "waiting" and now < float(record.get("expires_at") or 0)
+    ]
+
+
+async def _expire_browser_credential_requests() -> None:
+    now = time.monotonic()
+    for token, record in list(_browser_credential_requests.items()):
+        deadline = record.get("expires_at") if record.get("status") == "waiting" else record.get("consume_by")
+        if now < float(deadline or 0):
+            if (
+                record.get("status") == "waiting"
+                and now - float(record.get("last_published") or 0) >= BROWSER_CREDENTIAL_REPUBLISH_SECONDS
+            ):
+                record["last_published"] = now
+                await events.publish(_browser_credential_request_event(record))
+            continue
+        if record.get("status") == "waiting":
+            record["status"] = "cancel"
+            record["response"] = {"action": "cancel", "content": None}
+            record["consume_by"] = now + 30
+            await _publish_browser_credential_resolution(record)
+        elif now >= float(record.get("consume_by") or record.get("expires_at") or 0):
+            _browser_credential_requests.pop(token, None)
+            _browser_credential_routes.pop(token, None)
 
 
 def _observe_playwright_conversation(event: Dict[str, Any]) -> None:
@@ -1404,7 +2251,7 @@ def _observe_playwright_conversation(event: Dict[str, Any]) -> None:
             state["turn_active"] = False
             state["browser_call_started"] = 0.0
             state["last_activity"] = time.monotonic()
-            if not state.get("context_open") and not _playwright_live_viewers.get(key):
+            if not state.get("context_open") and not _playwright_live_viewers.get(key) and not _playwright_read_only_viewers.get(key):
                 _playwright_conversations.pop(key, None)
         return
     item = params.get("item") or {}
@@ -1419,14 +2266,43 @@ def _observe_playwright_conversation(event: Dict[str, Any]) -> None:
     completed = method == "item/completed" and status in {"", "completed"}
     if method == "item/started" or status in {"inprogress", "running"}:
         state["browser_call_started"] = time.monotonic()
+        if tool in {"browser_fill_credentials", "browser_fill_payment_card"}:
+            arguments = item.get("arguments") or {}
+            token = str(arguments.get("request_token") or "").strip()
+            fields = _browser_credential_field_names(arguments, tool) if isinstance(arguments, dict) else []
+            if BROWSER_CREDENTIAL_TOKEN_RE.fullmatch(token) and fields:
+                _browser_credential_routes[token] = {
+                    "request_token": token,
+                    "workspace": workspace,
+                    "thread_id": thread_id,
+                    "item_id": str(item.get("id") or ""),
+                    "fields": fields,
+                    "kind": "payment_card" if tool == "browser_fill_payment_card" else "credentials",
+                    "expires_at": time.monotonic() + BROWSER_CREDENTIAL_TIMEOUT_SECONDS + 30,
+                }
         if tool != "browser_close":
             state["context_open"] = True
+            _observe_playwright_front(key)
     elif method == "item/completed" or status in {"completed", "failed", "error", "cancelled"}:
+        if tool in {"browser_fill_credentials", "browser_fill_payment_card"}:
+            arguments = item.get("arguments") or {}
+            token = str(arguments.get("request_token") or "").strip() if isinstance(arguments, dict) else ""
+            record = _browser_credential_requests.get(token)
+            if record and record.get("status") == "waiting":
+                record["status"] = "cancel"
+                record["response"] = {"action": "cancel", "content": None}
+                record["consume_by"] = time.monotonic() + 30
+                asyncio.create_task(_publish_browser_credential_resolution(record))
+            _browser_credential_routes.pop(token, None)
+            state["credential_waiting"] = False
         state["browser_call_started"] = 0.0
         if completed and tool == "browser_close":
             state["context_open"] = False
+            if _playwright_observed_front_key == key:
+                _observe_playwright_front(None)
         elif completed:
             state["context_open"] = True
+            _observe_playwright_front(key)
             state.pop("preview_png", None)
             state["preview_at"] = 0.0
             if tool != "browser_tabs":
@@ -1459,7 +2335,7 @@ async def _ensure_playwright_runtime() -> None:
     """Recover Chromium/CDP without touching the Dex service or other sessions."""
     if not remote_desktop.running:
         await remote_desktop.start(adaptive_geometry(1440, 900, device_type="desktop"))
-    if await remote_desktop.browser_cdp_ready():
+    if await remote_desktop.browser_surface_ready():
         return
     result = await remote_desktop.ensure_browser(mode="desktop", url="about:blank")
     LOGGER.warning("Chromium Playwright recuperado automaticamente: pid=%s", result.get("pid"))
@@ -1487,14 +2363,18 @@ async def _playwright_conversation_worker() -> None:
                     LOGGER.error("Falha ao recuperar o Chromium Playwright: %s", exc)
             for key, state in list(_playwright_conversations.items()):
                 idle_for = now - float(state.get("last_activity") or now)
-                viewers = list(_playwright_live_viewers.get(key) or ())
+                interactive_viewers = list(_playwright_live_viewers.get(key) or ())
+                read_only_viewers = list(_playwright_read_only_viewers.get(key) or ())
+                viewers = [*interactive_viewers, *read_only_viewers]
                 if viewers and idle_for >= PLAYWRIGHT_VIEWER_IDLE_SECONDS and not state.get("turn_active"):
                     await asyncio.gather(
                         *(viewer.close(code=4408, reason="Visor encerrado por inatividade") for viewer in viewers),
                         return_exceptions=True,
                     )
-                    for viewer in viewers:
+                    for viewer in interactive_viewers:
                         await _release_playwright_remote(key, viewer)
+                    for viewer in read_only_viewers:
+                        await _release_playwright_read_only(key, viewer)
                     viewers = []
                 if (
                     state.get("context_open")
@@ -1504,16 +2384,96 @@ async def _playwright_conversation_worker() -> None:
                     and idle_for >= PLAYWRIGHT_CONTEXT_IDLE_SECONDS
                 ):
                     await _close_playwright_context(key, reason=f"idle-{int(idle_for)}s")
+            await _expire_browser_credential_requests()
     finally:
         await events.unsubscribe(subscription)
 
 
+def _site_access_project(workspace: str) -> Project | None:
+    if workspace == "system":
+        return _system_project()
+    if workspace.startswith("project:"):
+        return projects.get(workspace.split(":", 1)[1])
+    return None
+
+
+def _observe_site_access(event: Dict[str, Any]) -> None:
+    if event.get("kind") != "notification":
+        return
+    notification = event.get("notification") or {}
+    if notification.get("method") != "item/completed":
+        return
+    params = notification.get("params") or {}
+    item = params.get("item") or {}
+    if not isinstance(item, dict):
+        return
+    turn = params.get("turn") or {}
+    thread_id = str(params.get("threadId") or turn.get("threadId") or "")
+    workspace = str(event.get("workspace") or "system")
+    project = _site_access_project(workspace)
+    site_access.record_item(
+        item,
+        workspace=workspace,
+        thread_id=thread_id,
+        project_id=project.id if project else "",
+        project_name=project.name if project else "",
+    )
+
+
+async def _site_access_event_worker() -> None:
+    subscription = await events.subscribe()
+    try:
+        while True:
+            event = await subscription.get()
+            try:
+                await asyncio.to_thread(_observe_site_access, event)
+            except Exception as exc:
+                LOGGER.warning("Falha ao registrar acesso a site: %s", exc)
+    finally:
+        await events.unsubscribe(subscription)
+
+
+async def _thread_start_canary() -> str:
+    """Exercise the real new-conversation contract without starting a turn.
+
+    A thread without a turn has no rollout to persist, so this catches app-server
+    protocol/capability drift without creating a visible chat or consuming model
+    tokens. Keep these parameters aligned with ``create_thread``.
+    """
+    project = _system_project()
+    result = await _start_thread_with_gateway_retry(
+        {
+            "cwd": project.path,
+            "approvalPolicy": _thread_approval_policy(project),
+            "sandbox": "danger-full-access",
+            "serviceName": "codex_linux_control_system_canary",
+            "dynamicTools": [AUTOMATION_TOOL_SPEC],
+        },
+        target=system_bridge,
+    )
+    thread = result.get("thread") if isinstance(result, dict) else None
+    thread_id = str((thread or {}).get("id") or "")
+    if not thread_id:
+        raise RuntimeError("canário não recebeu identificador de conversa")
+    return thread_id
+
+
 @app.on_event("startup")
 async def startup_event() -> None:
-    global queue_worker_task, push_worker_task, upstream_worker_task, playwright_conversation_task
+    global queue_worker_task, push_worker_task, upstream_worker_task, playwright_conversation_task, site_access_worker_task, automation_worker_task
+    global _startup_canary_error, _startup_canary_checked_at
     projects.ensure_default()
     if not settings.projects_only:
         _system_project()
+        await _start_browser_credential_server()
+        try:
+            migrated = await asyncio.to_thread(
+                migrate_thread_dynamic_tools, _system_codex_state_database()
+            )
+            if migrated:
+                LOGGER.info("Ferramenta de agendamento vinculada a %s conversas do Sistema", migrated)
+        except Exception as exc:
+            LOGGER.warning("Não foi possível migrar conversas do Sistema para o agendamento: %s", exc)
     # The Playwright MCP is a CDP proxy and cannot become ready until its
     # managed browser exists.  Start the private browser independently of the
     # Codex app-server so systemd never forms a backend <-> MCP startup cycle.
@@ -1530,7 +2490,13 @@ async def startup_event() -> None:
             await system_bridge.start()
             if settings.full_experience_installed:
                 await _configure_bundled_mcp(system_bridge, include_desktop=True)
+            canary_thread_id = await _thread_start_canary()
+            _startup_canary_error = ""
+            _startup_canary_checked_at = time.time()
+            LOGGER.info("Canário funcional de nova conversa aprovado: %s", canary_thread_id)
         except Exception as exc:
+            _startup_canary_error = str(exc)
+            _startup_canary_checked_at = time.time()
             LOGGER.warning("Workspace Codex %s iniciou degradado: %s", system_bridge.label, exc)
     normal = [item for item in projects.list() if item.kind != "system"]
     for project in normal:
@@ -1548,11 +2514,32 @@ async def startup_event() -> None:
     playwright_conversation_task = asyncio.create_task(
         _playwright_conversation_worker(), name="clc-playwright-conversation-lifecycle"
     )
+    site_access_worker_task = asyncio.create_task(
+        _site_access_event_worker(), name="clc-site-access-history"
+    )
+    automation_worker_task = asyncio.create_task(
+        automations.scheduler(_run_automation), name="clc-automation-scheduler"
+    )
 
 
 @app.on_event("shutdown")
 async def shutdown_event() -> None:
-    global queue_worker_task, push_worker_task, upstream_worker_task, playwright_conversation_task
+    global queue_worker_task, push_worker_task, upstream_worker_task, playwright_conversation_task, site_access_worker_task, site_access_refresh_task, automation_worker_task
+    if automation_worker_task:
+        automation_worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await automation_worker_task
+        automation_worker_task = None
+    if site_access_refresh_task:
+        site_access_refresh_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await site_access_refresh_task
+        site_access_refresh_task = None
+    if site_access_worker_task:
+        site_access_worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await site_access_worker_task
+        site_access_worker_task = None
     if playwright_conversation_task:
         playwright_conversation_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -1576,12 +2563,17 @@ async def shutdown_event() -> None:
     await remote_desktop.stop()
     await system_bridge.stop()
     await project_bridges.stop()
+    await _stop_browser_credential_server()
 
 
 @app.middleware("http")
 async def protect_remote_surface(request: Request, call_next):
     """Validate the private proxy identity and add strict browser security headers."""
 
+    if request.method.upper() not in {"GET", "HEAD", "OPTIONS"} and is_playwright_automation_request(
+        request.headers, request.client.host if request.client else None, settings
+    ):
+        return JSONResponse(status_code=403, content={"detail": "A identidade interna Playwright é somente leitura"})
     if request.headers.get("tailscale-user-login"):
         try:
             network_identity(request.headers, request.client.host if request.client else None, settings)
@@ -1623,18 +2615,271 @@ async def value_error_handler(_: Request, exc: ValueError) -> JSONResponse:
 async def health() -> Dict[str, Any]:
     blocking_conversations = _active_conversation_summaries()
     return {
-        "ok": True,
+        "ok": not bool(_startup_canary_error) or not settings.full_experience_installed,
         "app": settings.app_name,
         "version": settings.app_version,
         "setup_completed": settings.setup_completed,
         "install_mode": settings.install_mode,
+        "playwright_internal_access": {
+            "ready": PLAYWRIGHT_INTERNAL_ACCESS_READY,
+            "read_only": True,
+            "loopback_only": True,
+        },
         "codex": _bridge_state(system_bridge),
         "bridges": {"system": _bridge_state(system_bridge), "projects": project_bridges.state()},
         "project_bridges": project_bridges.state().get("projects", {}),
         "active_turns": len(blocking_conversations),
         "blocking_conversations": blocking_conversations,
         "accepting_turns": not _rollout_gate_closed(),
+        "functional_canary": {
+            "ok": not bool(_startup_canary_error),
+            "checked_at": _startup_canary_checked_at,
+            "error": _startup_canary_error or None,
+        },
     }
+
+
+def _fallback_browser_credential_route(
+    payload: BrowserCredentialBridgeRequest,
+    peer_workspace: str,
+) -> Dict[str, Any] | None:
+    """Resolve nested MCP calls that Codex reports only after completion.
+
+    The structured tool executor does not emit ``item/started`` for nested MCP
+    calls.  Bind only when the authenticated app-server workspace has exactly
+    one active Playwright conversation, so concurrent threads can never receive
+    each other's credential prompt.
+    """
+    if not peer_workspace:
+        return None
+    now = time.monotonic()
+    candidates = []
+    for key, state in _playwright_conversations.items():
+        if key[0] != peer_workspace or key not in _active_turns:
+            continue
+        if not state.get("context_open") or now - float(state.get("last_activity") or 0) > 180:
+            continue
+        candidates.append(key)
+    if len(candidates) != 1:
+        LOGGER.warning(
+            "Formulário protegido recusado por associação ambígua: workspace=%s candidates=%d",
+            peer_workspace,
+            len(candidates),
+        )
+        return None
+    workspace, thread_id = candidates[0]
+    route = {
+        "request_token": payload.request_token,
+        "workspace": workspace,
+        "thread_id": thread_id,
+        "item_id": "nested-mcp-call",
+        "fields": list(payload.fields),
+        "kind": payload.kind,
+        "expires_at": now + BROWSER_CREDENTIAL_TIMEOUT_SECONDS + 30,
+    }
+    _browser_credential_routes[payload.request_token] = route
+    LOGGER.info(
+        "Formulário protegido associado a chamada MCP aninhada: workspace=%s thread=%s",
+        workspace,
+        thread_id,
+    )
+    return route
+
+
+async def _register_browser_credential_request(
+    payload: BrowserCredentialBridgeRequest,
+    *,
+    peer_workspace: str = "",
+) -> Dict[str, Any]:
+    """Publish a Work-style login request without routing secrets through Codex."""
+    route = _browser_credential_routes.get(payload.request_token)
+    if not route:
+        route = _fallback_browser_credential_route(payload, peer_workspace)
+    if not route or time.monotonic() >= float(route.get("expires_at") or 0):
+        raise HTTPException(status_code=409, detail="a chamada do navegador ainda não foi vinculada à conversa")
+    if peer_workspace and route.get("workspace") != peer_workspace:
+        raise HTTPException(status_code=403, detail="a chamada não pertence ao workspace desta ponte")
+    if payload.fields != route["fields"]:
+        raise HTTPException(status_code=400, detail="os campos não correspondem à chamada vinculada")
+    if payload.kind != route.get("kind", "credentials"):
+        raise HTTPException(status_code=400, detail="o tipo de formulário não corresponde à chamada vinculada")
+    existing = _browser_credential_requests.get(payload.request_token)
+    if existing:
+        return {"ok": True, "status": existing["status"]}
+
+    site = " ".join(payload.site.split())[:200]
+    purpose = " ".join(payload.purpose.split())[:300]
+    workspace = route["workspace"]
+    thread_id = route["thread_id"]
+    record = {
+        **route,
+        "kind": payload.kind,
+        "site": site,
+        "purpose": purpose,
+        "schema": _browser_credential_schema(payload.fields),
+        "status": "waiting",
+        "response": None,
+        "last_published": time.monotonic(),
+        "expires_at": time.monotonic() + BROWSER_CREDENTIAL_TIMEOUT_SECONDS,
+    }
+    _browser_credential_requests[payload.request_token] = record
+    state = _touch_playwright_conversation((workspace, thread_id))
+    state["credential_waiting"] = True
+    state["last_activity"] = time.monotonic()
+    await events.publish(_browser_credential_request_event(record))
+    return {"ok": True, "status": "waiting"}
+
+
+def _consume_browser_credential_response(request_token: str) -> Dict[str, Any]:
+    if not BROWSER_CREDENTIAL_TOKEN_RE.fullmatch(request_token):
+        raise HTTPException(status_code=400, detail="solicitação de credenciais inválida")
+    record = _browser_credential_requests.get(request_token)
+    if not record:
+        raise HTTPException(status_code=404, detail="solicitação de credenciais não encontrada")
+    if record.get("status") == "waiting":
+        return {"status": "waiting"}
+    response = record.get("response") or {"action": "cancel", "content": None}
+    result = {
+        "action": str(response.get("action") or "cancel"),
+        "content": dict(response.get("content")) if isinstance(response.get("content"), dict) else None,
+    }
+    secret_content = response.get("content") if isinstance(response, dict) else None
+    if isinstance(secret_content, dict):
+        for key in list(secret_content):
+            secret_content[key] = ""
+    _browser_credential_requests.pop(request_token, None)
+    _browser_credential_routes.pop(request_token, None)
+    return result
+
+
+def _browser_credential_peer_workspace(writer: asyncio.StreamWriter) -> str:
+    """Return the verified workspace of a credential adapter, or an empty string."""
+    transport_socket = writer.get_extra_info("socket")
+    if transport_socket is None or not hasattr(socket, "SO_PEERCRED"):
+        return ""
+    try:
+        pid, uid, _gid = struct.unpack("3i", transport_socket.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+        worker_uid = pwd.getpwnam("codex-worker").pw_uid
+        if uid not in {os.getuid(), worker_uid}:
+            return ""
+        command = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        status = Path(f"/proc/{pid}/status").read_text(encoding="utf-8")
+        parent_match = re.search(r"^PPid:\s+(\d+)$", status, re.MULTILINE)
+        if not parent_match or not any(part.endswith(b"/playwright_mcp_proxy.py") for part in command):
+            return ""
+        parent_command = Path(f"/proc/{parent_match.group(1)}/cmdline").read_bytes().split(b"\0")
+        if not (any(part == b"app-server" for part in parent_command) and any(
+            Path(os.fsdecode(part)).name == "codex" for part in parent_command if part
+        )):
+            return ""
+        parent_pid = int(parent_match.group(1))
+        if system_bridge.process and parent_pid == system_bridge.process.pid:
+            return "system"
+        cgroup = Path(f"/proc/{pid}/cgroup").read_text(encoding="utf-8")
+        for bridge in project_bridges.bridges():
+            project_id = bridge.label.split(":", 1)[1] if bridge.label.startswith("project:") else ""
+            if project_id and f"/{safe_project_unit(project_id)}" in cgroup:
+                return bridge.label
+        return ""
+    except (KeyError, OSError, ValueError, struct.error):
+        return ""
+
+
+def _browser_credential_peer_allowed(writer: asyncio.StreamWriter) -> bool:
+    """Accept only the credential adapter spawned by a known Codex workspace."""
+    return bool(_browser_credential_peer_workspace(writer))
+
+
+async def _browser_credential_socket_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    result: Dict[str, Any]
+    try:
+        peer_workspace = _browser_credential_peer_workspace(writer)
+        if not peer_workspace:
+            raise HTTPException(status_code=403, detail="processo não autorizado para a ponte de credenciais")
+        raw = await asyncio.wait_for(reader.readline(), timeout=5)
+        if not raw or len(raw) > 65536:
+            raise HTTPException(status_code=400, detail="requisição inválida para a ponte de credenciais")
+        message = json.loads(raw)
+        if not isinstance(message, dict):
+            raise ValueError("requisição inválida para a ponte de credenciais")
+        operation = message.pop("op", None)
+        if operation == "request":
+            result = await _register_browser_credential_request(
+                BrowserCredentialBridgeRequest(**message),
+                peer_workspace=peer_workspace,
+            )
+        elif operation == "poll":
+            result = _consume_browser_credential_response(str(message.get("request_token") or ""))
+        else:
+            raise HTTPException(status_code=400, detail="operação inválida para a ponte de credenciais")
+    except HTTPException as exc:
+        result = {"error": str(exc.detail), "status_code": exc.status_code}
+    except Exception:
+        result = {"error": "falha interna na ponte protegida", "status_code": 500}
+    writer.write(json.dumps(result, separators=(",", ":")).encode() + b"\n")
+    with contextlib.suppress(ConnectionError):
+        await writer.drain()
+    writer.close()
+    with contextlib.suppress(ConnectionError):
+        await writer.wait_closed()
+
+
+async def _start_browser_credential_server() -> None:
+    global browser_credential_server
+    with contextlib.suppress(FileNotFoundError):
+        BROWSER_CREDENTIAL_SOCKET_PATH.unlink()
+    browser_credential_server = await asyncio.start_unix_server(
+        _browser_credential_socket_client,
+        path=str(BROWSER_CREDENTIAL_SOCKET_PATH),
+    )
+    BROWSER_CREDENTIAL_SOCKET_PATH.chmod(0o666)
+
+
+async def _stop_browser_credential_server() -> None:
+    global browser_credential_server
+    if browser_credential_server:
+        browser_credential_server.close()
+        await browser_credential_server.wait_closed()
+        browser_credential_server = None
+    with contextlib.suppress(FileNotFoundError):
+        BROWSER_CREDENTIAL_SOCKET_PATH.unlink()
+
+
+@app.post("/api/browser-credentials/respond")
+async def browser_credentials_user_response(
+    request: Request,
+    payload: BrowserCredentialUserResponse,
+) -> Dict[str, Any]:
+    _session(request, mutate=True)
+    record = _browser_credential_requests.get(payload.request_id)
+    if not record or record.get("status") != "waiting":
+        raise HTTPException(status_code=409, detail="este formulário protegido não está mais aguardando resposta")
+    if payload.workspace != record["workspace"]:
+        raise HTTPException(status_code=403, detail="o formulário não pertence a este workspace")
+    action = str(payload.result.get("action") or "")
+    if action not in {"accept", "cancel"}:
+        raise HTTPException(status_code=400, detail="resposta inválida para o formulário protegido")
+    content: Dict[str, str] | None = None
+    if action == "accept":
+        supplied = payload.result.get("content")
+        if not isinstance(supplied, dict) or set(supplied) != set(record["fields"]):
+            raise HTTPException(status_code=400, detail="campos protegidos incompletos ou inesperados")
+        content = {}
+        for field in record["fields"]:
+            value = supplied.get(field)
+            max_length = int(record.get("schema", {}).get("properties", {}).get(field, {}).get("maxLength") or 8192)
+            if not isinstance(value, str) or not value or len(value) > max_length:
+                raise HTTPException(status_code=400, detail=f"o campo protegido {field} está vazio ou é inválido")
+            content[field] = value
+    record["status"] = action
+    record["response"] = {"action": action, "content": content}
+    record["consume_by"] = time.monotonic() + 30
+    state = _playwright_conversations.get((record["workspace"], record["thread_id"]))
+    if state:
+        state["credential_waiting"] = False
+        state["last_activity"] = time.monotonic()
+    await _publish_browser_credential_resolution(record)
+    return {"ok": True}
 
 
 @app.post("/api/internal/rollout/quiesce")
@@ -1765,6 +3010,14 @@ async def update_automatic(request: Request, payload: UpdateAutomaticRequest) ->
 @app.get("/api/session")
 async def create_session(request: Request, response: Response) -> Dict[str, Any]:
     identity = network_identity(request.headers, request.client.host if request.client else None, settings)
+    if identity == PLAYWRIGHT_AUTOMATION_IDENTITY:
+        current = sessions.get(request.cookies.get("clc_session"))
+        if current and hmac.compare_digest(current.identity, identity) and current.device_id == PLAYWRIGHT_AUTOMATION_DEVICE_ID:
+            sessions.touch(current)
+            return _session_payload(current, identity)
+        session = sessions.create(identity, device_id=PLAYWRIGHT_AUTOMATION_DEVICE_ID)
+        _set_session_cookie(request, response, session)
+        return _session_payload(session, identity)
     if settings.setup_completed and identity == "localhost" and settings.require_paired_local:
         raise HTTPException(
             status_code=401,
@@ -1778,6 +3031,7 @@ async def create_session(request: Request, response: Response) -> Dict[str, Any]
         )
     current = sessions.get(request.cookies.get("clc_session"))
     if current and hmac.compare_digest(current.identity, identity):
+        _enforce_completed_session(current)
         sessions.touch(current)
         return _session_payload(current, identity)
 
@@ -1999,7 +3253,29 @@ async def list_paired_devices(request: Request) -> Dict[str, Any]:
         "device_admin": True,
         "device_limit": MAX_DEVICES,
         "required": settings.device_auth_required,
+        "reauthentication_options": [
+            {"seconds": 86_400, "label": "Diariamente"},
+            {"seconds": 604_800, "label": "A cada 7 dias"},
+            {"seconds": 2_592_000, "label": "A cada 30 dias"},
+        ],
     }
+
+
+@app.patch("/api/security/devices/{device_id}/reauthentication")
+async def update_device_reauthentication(
+    request: Request,
+    device_id: str,
+    payload: DeviceReauthenticationRequest,
+) -> Dict[str, Any]:
+    if settings.setup_completed:
+        _operator_session(request, mutate=True)
+    else:
+        _local_setup_only(request)
+    try:
+        record = device_auth.set_reauthentication_interval(device_id, payload.interval_seconds)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"ok": True, "device": record.public_dict()}
 
 
 @app.delete("/api/security/devices/{device_id}")
@@ -2091,13 +3367,30 @@ async def authenticate_remote_device(
         user_agent=request.headers.get("user-agent", ""),
         client_ip=request.client.host if request.client else "",
     )
+    reauthentication_due = device_auth.reauthentication_required(record.id)
+    token_issued_at = (
+        cloudflare_access_token_issued_at(request.headers, settings)
+        if reauthentication_due and identity.casefold().startswith("cloudflare:")
+        else 0.0
+    )
+    if not device_auth.complete_reauthentication(record.id, token_issued_at):
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "code": "cloudflare_reauth_required",
+                "message": "A sessão de identidade ainda é anterior à exigência deste navegador.",
+                "device_id": record.id,
+                "device_name": record.name,
+                "interval_seconds": record.reauthentication_interval_seconds,
+            },
+        )
     session = sessions.create(identity, device_id=record.id)
     _set_session_cookie(request, response, session)
     return {"session": _session_payload(session, identity), "device": record.public_dict()}
 
 
 @app.get("/api/status")
-async def status_api(request: Request) -> Dict[str, Any]:
+async def status_api(request: Request, light: bool = False) -> Dict[str, Any]:
     _session(request)
     state = system_state(settings)
     state["bridge"] = _bridge_state(system_bridge)
@@ -2111,14 +3404,52 @@ async def status_api(request: Request) -> Dict[str, Any]:
         "external_url": settings.external_url,
         "device_auth_required": settings.device_auth_required,
         "paired_devices": device_auth.active_count(settings.remote_operator_identity),
+        "approval_autonomy": _approval_autonomy_payload(),
     }
     state["remote_desktop"] = remote_desktop.status()
     state["cloud_sync"] = cloud_sync.state()
     state["backup_cloud"] = backup_cloud.state()
-    state["control"] = await _control_snapshot()
+    # The full control-plane snapshot fans out to sixteen audited broker
+    # operations. It belongs on the administration screens, but made every
+    # Dex navigation wait several seconds before conversations became usable.
+    # Keep the existing full response as the default for API compatibility;
+    # the initial web bootstrap explicitly requests this lightweight summary.
+    state["control"] = (
+        control_plane_status(settings.control_broker_socket)
+        if light
+        else await _control_snapshot()
+    )
     state["upstream"] = upstream_registry.read()
     state["project_roots"] = [str(item) for item in settings.project_roots]
     return state
+
+
+@app.patch("/api/security/approval-autonomy")
+async def update_approval_autonomy(request: Request, payload: ApprovalAutonomyUpdate) -> Dict[str, Any]:
+    _session(request, mutate=True)
+    selected = _approval_autonomy_level(payload.level)
+    async with APPROVAL_AUTONOMY_UPDATE_LOCK:
+        previous = _approval_autonomy_level()
+        if selected == previous:
+            return {"ok": True, "approval_autonomy": _approval_autonomy_payload(selected), "applied_workspaces": []}
+
+        persist_settings(settings, approval_autonomy_level=selected)
+        try:
+            applied = await _apply_approval_autonomy_to_live_bridges(selected)
+        except Exception as exc:
+            persist_settings(settings, approval_autonomy_level=previous)
+            try:
+                await _apply_approval_autonomy_to_live_bridges(previous)
+            except Exception:
+                LOGGER.exception("Falha ao restaurar a autonomia de aprovação anterior")
+            raise HTTPException(status_code=503, detail=f"Não foi possível aplicar o nível de autonomia: {exc}") from exc
+        LOGGER.info(
+            "Autonomia de aprovação alterada de %s para %s em %s",
+            previous,
+            selected,
+            ", ".join(applied) or "configuração persistente",
+        )
+        return {"ok": True, "approval_autonomy": _approval_autonomy_payload(selected), "applied_workspaces": applied}
 
 
 @app.get("/api/push/public-key")
@@ -2156,6 +3487,108 @@ async def unsubscribe_push(request: Request, payload: PushUnsubscribeRequest) ->
 async def control_status_api(request: Request) -> Dict[str, Any]:
     _session(request)
     return await _control_snapshot()
+
+
+async def _fresh_machine_overview() -> Dict[str, Any]:
+    response = await asyncio.to_thread(
+        control_request,
+        "system",
+        {"operation": "overview"},
+        socket_path=settings.control_broker_socket,
+        timeout=20,
+    )
+    machine = _unpack_control(response) or {}
+    if not isinstance(machine, dict):
+        raise ControlPlaneError("O broker retornou dados inválidos do mini PC")
+    return machine
+
+
+async def _host_insight_command(argv: list[str], *, timeout: int) -> str:
+    """Run one fixed, read-only host inspection through the audited broker."""
+    response = await asyncio.to_thread(
+        control_request,
+        "host-admin",
+        {"operation": "exec", "argv": argv, "timeout": timeout},
+        socket_path=settings.control_broker_socket,
+        timeout=timeout + 10,
+    )
+    result = _unpack_control(response) or {}
+    if not isinstance(result, dict) or int(result.get("returncode", 1)) != 0:
+        detail = str(result.get("output") or "Leitura administrativa do host falhou") if isinstance(result, dict) else "Leitura administrativa do host falhou"
+        raise ControlPlaneError(detail[-500:])
+    return str(result.get("output") or "")
+
+
+@app.get("/api/control/pc-resources")
+async def control_pc_resources_api(request: Request) -> Dict[str, Any]:
+    """Return fresh lightweight metrics for the PC data overview."""
+    _session(request)
+    try:
+        machine = await _fresh_machine_overview()
+    except ControlPlaneError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {
+        "checked_at": time.time(),
+        "hostname": machine.get("hostname", ""),
+        "platform": machine.get("platform", ""),
+        "kernel": machine.get("kernel", ""),
+        "uptime_seconds": machine.get("uptime_seconds", 0),
+        "cpu": machine.get("cpu", {}),
+        "memory": machine.get("memory", {}),
+        "filesystems": machine.get("filesystems", []),
+        "temperatures": machine.get("temperatures", []),
+        "hardware": machine.get("hardware", {}),
+    }
+
+
+_pc_storage_cache: Dict[str, Any] = {"checked_at": 0.0, "value": None}
+_pc_storage_lock = asyncio.Lock()
+
+
+@app.get("/api/control/pc-storage")
+async def control_pc_storage_api(request: Request, refresh: bool = False) -> Dict[str, Any]:
+    """Return a bounded storage tree; scans are cached to avoid repeated disk walks."""
+    _session(request)
+    now = time.time()
+    cached = _pc_storage_cache.get("value")
+    if not refresh and isinstance(cached, dict) and now - float(_pc_storage_cache.get("checked_at") or 0) < 90:
+        return cached
+    async with _pc_storage_lock:
+        now = time.time()
+        cached = _pc_storage_cache.get("value")
+        if not refresh and isinstance(cached, dict) and now - float(_pc_storage_cache.get("checked_at") or 0) < 90:
+            return cached
+        try:
+            machine, raw = await asyncio.gather(
+                _fresh_machine_overview(),
+                _host_insight_command(STORAGE_SCAN_ARGV, timeout=180),
+            )
+        except ControlPlaneError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        root = next((item for item in machine.get("filesystems", []) if item.get("path") == "/"), {})
+        value = {"checked_at": time.time(), **storage_snapshot(raw, root)}
+        _pc_storage_cache.update({"checked_at": value["checked_at"], "value": value})
+        return value
+
+
+@app.get("/api/control/pc-activities")
+async def control_pc_activities_api(request: Request) -> Dict[str, Any]:
+    """Return current process activity without exposing command lines or secrets."""
+    _session(request)
+    try:
+        machine, raw = await asyncio.gather(
+            _fresh_machine_overview(),
+            _host_insight_command(PROCESS_SCAN_ARGV, timeout=30),
+        )
+    except ControlPlaneError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    snapshot = process_snapshot(raw)
+    return {
+        "checked_at": time.time(),
+        "cpu": machine.get("cpu", {}),
+        "memory": machine.get("memory", {}),
+        **snapshot,
+    }
 
 
 @app.get("/api/backup/status")
@@ -2285,6 +3718,7 @@ async def setup_state(request: Request) -> Dict[str, Any]:
     local_session = sessions.get(request.cookies.get("clc_session"))
     state["security"] = {
         "device_auth_required": settings.device_auth_required,
+        "approval_autonomy": _approval_autonomy_payload(),
         "paired_devices": device_auth.list_devices(settings.remote_operator_identity),
         "entra": {
             "configured": settings.entra_configured,
@@ -3819,6 +5253,115 @@ async def _physical_session(operation: str, user: str, **params: Any) -> Dict[st
     return value if isinstance(value, dict) else {"result": value}
 
 
+async def _gaming_session(operation: str) -> Dict[str, Any]:
+    response = await asyncio.to_thread(
+        control_request,
+        "gaming",
+        {"operation": operation},
+        socket_path=settings.control_broker_socket,
+        timeout=180,
+    )
+    value = _unpack_control(response)
+    return value if isinstance(value, dict) else {"result": value}
+
+
+async def _prepare_games_remote() -> Dict[str, Any]:
+    """Keep the Steam UI alive before exposing its physical display."""
+    await _gaming_session("request")
+    return await _physical_session("start", "jogos")
+
+
+def _physical_ubuntu_keyboard_argv(method: str, *arguments: str) -> list[str]:
+    """Build the fixed, audited D-Bus command for the headless GNOME profile."""
+    entry = pwd.getpwnam("desktop")
+    return [
+        "/usr/sbin/runuser", "-u", "desktop", "--", "env",
+        f"HOME={entry.pw_dir}",
+        f"XDG_RUNTIME_DIR=/run/user/{entry.pw_uid}",
+        f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{entry.pw_uid}/bus",
+        "/usr/bin/gdbus", "call", "--session",
+        "--dest", "org.onboard.Onboard",
+        "--object-path", "/org/onboard/Onboard/Keyboard",
+        "--method", method,
+        *arguments,
+    ]
+
+
+async def _physical_ubuntu_keyboard_exec(argv: list[str], timeout: int = 15) -> Dict[str, Any]:
+    response = await asyncio.to_thread(
+        control_request,
+        "host-admin",
+        {"operation": "exec", "argv": argv, "timeout": timeout},
+        socket_path=settings.control_broker_socket,
+        timeout=max(20, timeout + 5),
+    )
+    result = response.get("result") if isinstance(response, dict) else None
+    execution = result.get("output") if isinstance(result, dict) else None
+    if not isinstance(execution, dict):
+        raise ControlPlaneError(str(response.get("error") if isinstance(response, dict) else "") or "O broker não retornou o resultado do teclado")
+    return execution
+
+
+async def _physical_ubuntu_keyboard_status() -> Dict[str, Any]:
+    execution = await _physical_ubuntu_keyboard_exec(_physical_ubuntu_keyboard_argv(
+        "org.freedesktop.DBus.Properties.Get",
+        "org.onboard.Onboard.Keyboard",
+        "Visible",
+    ))
+    detail = str(execution.get("output") or "")
+    running = int(execution.get("returncode", 1)) == 0
+    return {
+        "ok": True,
+        "visible": running and bool(re.search(r"\btrue\b", detail, flags=re.IGNORECASE)),
+        "keyboard": "onboard",
+        "session": "desktop",
+        "running": running,
+    }
+
+
+async def _physical_ubuntu_keyboard_launch() -> None:
+    entry = pwd.getpwnam("desktop")
+    argv = [
+        "/usr/sbin/runuser", "-u", "desktop", "--", "env",
+        f"HOME={entry.pw_dir}",
+        f"XDG_RUNTIME_DIR=/run/user/{entry.pw_uid}",
+        f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{entry.pw_uid}/bus",
+        "/usr/bin/systemd-run", "--user", "--collect",
+        "--unit=sasocq-onboard-hybrid-input",
+        "/usr/bin/onboard", "--layout=Compact", "--quirks=metacity",
+    ]
+    execution = await _physical_ubuntu_keyboard_exec(argv, timeout=20)
+    # An already-running transient unit is harmless: the following D-Bus poll
+    # remains the authority for whether Onboard is actually available.
+    if int(execution.get("returncode", 1)) != 0:
+        LOGGER.debug("Inicialização idempotente do Onboard: %s", str(execution.get("output") or "")[-500:])
+
+
+async def _set_physical_ubuntu_keyboard_visible(visible: bool) -> Dict[str, Any]:
+    method = "org.onboard.Onboard.Keyboard.Show" if visible else "org.onboard.Onboard.Keyboard.Hide"
+    execution = await _physical_ubuntu_keyboard_exec(_physical_ubuntu_keyboard_argv(method))
+    if int(execution.get("returncode", 1)) != 0 and visible:
+        if not Path("/usr/bin/onboard").is_file():
+            raise RuntimeError("O teclado virtual Onboard não está instalado")
+        await _physical_ubuntu_keyboard_launch()
+        for _attempt in range(20):
+            await asyncio.sleep(0.15)
+            execution = await _physical_ubuntu_keyboard_exec(_physical_ubuntu_keyboard_argv(method))
+            if int(execution.get("returncode", 1)) == 0:
+                break
+    if int(execution.get("returncode", 1)) != 0:
+        if not visible:
+            return {"ok": True, "visible": False, "keyboard": "onboard", "session": "desktop", "running": False}
+        raise RuntimeError(str(execution.get("output") or "O teclado virtual do Ubuntu não respondeu")[-800:])
+    status = await _physical_ubuntu_keyboard_status()
+    for _attempt in range(12):
+        if bool(status.get("visible")) == bool(visible):
+            break
+        await asyncio.sleep(0.05)
+        status = await _physical_ubuntu_keyboard_status()
+    return {**status, "visible": bool(status.get("visible", visible))}
+
+
 @app.get("/api/remote-desktop/status")
 async def remote_desktop_status_api(request: Request, target: str = "codex") -> Dict[str, Any]:
     _session(request)
@@ -3885,11 +5428,18 @@ async def remote_desktop_start_api(request: Request, payload: RemoteDesktopReque
         if payload.target in {"desktop", "jogos"}:
             _operator_session(request, mutate=True)
         try:
-            result = await _physical_session("start", payload.target)
+            result = (
+                await _prepare_games_remote()
+                if payload.target == "jogos"
+                else await _physical_session("start", payload.target)
+            )
         except (ControlPlaneError, RuntimeError, ValueError) as exc:
             LOGGER.warning("Falha ao preparar a sessão física %s: %s", payload.target, exc)
             raise HTTPException(status_code=503, detail=str(exc)) from exc
-        viewer_url = str(result.get("viewer_url") or "")
+        viewer_url = str(
+            result.get("viewer_url")
+            or (_remote_viewer_url("jogos") if payload.target == "jogos" else "")
+        )
         return {**result, "target": payload.target, "physical": payload.target == "jogos", "virtual": payload.target in {"codex", "desktop"}, "viewer_url": viewer_url}
     raise HTTPException(status_code=400, detail="Alvo de tela remota inválido")
 
@@ -3938,24 +5488,32 @@ async def remote_desktop_keyboard_api(
     toggle: bool = False,
 ) -> Dict[str, Any]:
     _session(request, mutate=True)
-    if target != "playwright":
-        raise HTTPException(status_code=400, detail="O teclado gerenciado pertence ao visor Playwright")
     try:
-        if toggle:
-            return await remote_desktop.toggle_virtual_keyboard()
-        return await remote_desktop.set_virtual_keyboard_visible(visible)
-    except RuntimeError as exc:
+        if target == "playwright":
+            if toggle:
+                return await remote_desktop.toggle_virtual_keyboard()
+            return await remote_desktop.set_virtual_keyboard_visible(visible)
+        if target in {"codex", "desktop"}:
+            desired = visible
+            if toggle:
+                status = await _physical_ubuntu_keyboard_status()
+                desired = not bool(status.get("visible"))
+            return await _set_physical_ubuntu_keyboard_visible(desired)
+        raise HTTPException(status_code=400, detail="O teclado do Ubuntu não está disponível nesta sessão")
+    except (ControlPlaneError, RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @app.get("/api/remote-desktop/keyboard")
 async def remote_desktop_keyboard_status_api(request: Request, target: str = "playwright") -> Dict[str, Any]:
     _session(request)
-    if target != "playwright":
-        raise HTTPException(status_code=400, detail="O teclado gerenciado pertence ao visor Playwright")
     try:
-        return await remote_desktop.virtual_keyboard_status()
-    except RuntimeError as exc:
+        if target == "playwright":
+            return await remote_desktop.virtual_keyboard_status()
+        if target in {"codex", "desktop"}:
+            return await _physical_ubuntu_keyboard_status()
+        raise HTTPException(status_code=400, detail="O teclado do Ubuntu não está disponível nesta sessão")
+    except (ControlPlaneError, RuntimeError, ValueError) as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
@@ -4036,7 +5594,19 @@ async def terminal_socket(websocket: WebSocket) -> None:
     try:
         session = websocket_session(websocket, settings, sessions)
         _enforce_completed_session(session)
-        if workspace == "system":
+        if session.identity == PLAYWRIGHT_AUTOMATION_IDENTITY:
+            raise HTTPException(status_code=403, detail="Terminal bloqueado para a identidade interna Playwright")
+        if workspace == "codex-emergency" and not settings.projects_only:
+            spec = TerminalSpec(
+                command=(
+                    "/usr/bin/sudo", "-n", "-H", "-u", "codex", "--",
+                    "/home/codex/.local/bin/codex-sistema", "novo",
+                ),
+                cwd=Path("/home/codex/SystemWorkspace"),
+                label="Codex Sistema • emergência",
+                privileged=True,
+            )
+        elif workspace == "system":
             if settings.projects_only:
                 raise ValueError("o perfil instalado oferece somente terminais de projetos")
             spec = TerminalSpec(
@@ -4071,14 +5641,113 @@ async def terminal_socket(websocket: WebSocket) -> None:
     await serve_terminal(websocket, spec)
 
 
+class _ReadOnlyRfbClientFilter:
+    """Allow VNC display negotiation while rejecting every input mutation.
+
+    TigerVNC is private and uses RFB 3.8 with ``SecurityTypes=None``.  The
+    browser still has to send protocol negotiation, pixel-format and frame
+    update requests to receive the display.  Keyboard, pointer, clipboard
+    content, desktop resize and power messages are never forwarded.
+    """
+
+    def __init__(self) -> None:
+        self._handshake_step = 0
+
+    def validate(self, data: bytes) -> None:
+        payload = bytes(data)
+        if self._handshake_step == 0:
+            if payload != b"RFB 003.008\n":
+                raise ValueError("versão RFB inválida no visor somente leitura")
+            self._handshake_step = 1
+            return
+        if self._handshake_step == 1:
+            if payload != b"\x01":
+                raise ValueError("segurança RFB inválida no visor somente leitura")
+            self._handshake_step = 2
+            return
+        if self._handshake_step == 2:
+            if payload not in {b"\x00", b"\x01"}:
+                raise ValueError("inicialização RFB inválida no visor somente leitura")
+            self._handshake_step = 3
+            return
+        self._validate_display_messages(payload)
+
+    @staticmethod
+    def _validate_display_messages(data: bytes) -> None:
+        if not data:
+            raise ValueError("mensagem RFB vazia")
+        offset = 0
+        total = len(data)
+        while offset < total:
+            message_type = data[offset]
+            if message_type == 0:  # SetPixelFormat
+                length = 20
+                if offset + length > total or data[offset + 1:offset + 4] != b"\x00\x00\x00":
+                    raise ValueError("formato de pixel RFB inválido")
+            elif message_type == 2:  # SetEncodings
+                if offset + 4 > total or data[offset + 1] != 0:
+                    raise ValueError("lista de encodings RFB inválida")
+                count = int.from_bytes(data[offset + 2:offset + 4], "big")
+                if count > 4096:
+                    raise ValueError("lista de encodings RFB excessiva")
+                length = 4 + (count * 4)
+            elif message_type == 3:  # FramebufferUpdateRequest
+                length = 10
+                if offset + length > total or data[offset + 1] not in {0, 1}:
+                    raise ValueError("pedido de quadro RFB inválido")
+            elif message_type == 6:  # ExtendedClipboardCaps only
+                if offset + 12 > total or data[offset + 1:offset + 4] != b"\x00\x00\x00":
+                    raise ValueError("negociação de clipboard RFB inválida")
+                signed_length = int.from_bytes(data[offset + 4:offset + 8], "big", signed=True)
+                if signed_length >= -4:
+                    raise ValueError("clipboard bloqueado no visor somente leitura")
+                payload_length = -signed_length
+                if offset + 8 + payload_length > total:
+                    raise ValueError("negociação de clipboard RFB truncada")
+                flags = int.from_bytes(data[offset + 8:offset + 12], "big")
+                actions = flags & 0xFF000000
+                formats = flags & 0x0000FFFF
+                if not actions & 0x01000000 or actions & ~0x1F000000:
+                    raise ValueError("ação de clipboard bloqueada no visor somente leitura")
+                if payload_length != 4 + (formats.bit_count() * 4):
+                    raise ValueError("capacidades de clipboard RFB inválidas")
+                length = 8 + payload_length
+            elif message_type == 150:  # EnableContinuousUpdates
+                length = 10
+                if offset + length > total or data[offset + 1] not in {0, 1}:
+                    raise ValueError("atualização contínua RFB inválida")
+            elif message_type == 248:  # ClientFence
+                if offset + 9 > total or data[offset + 1:offset + 4] != b"\x00\x00\x00":
+                    raise ValueError("fence RFB inválido")
+                payload_length = data[offset + 8]
+                if payload_length > 64:
+                    raise ValueError("fence RFB excessivo")
+                length = 9 + payload_length
+            else:
+                raise ValueError(f"mensagem RFB de entrada bloqueada: {message_type}")
+            if offset + length > total:
+                raise ValueError("mensagem RFB truncada")
+            offset += length
+
+
 @app.websocket("/api/remote-desktop/ws")
 async def remote_desktop_socket(websocket: WebSocket) -> None:
     target = websocket.query_params.get("target", "codex")
     thread_id = websocket.query_params.get("thread_id", "")
+    requested_view_only = websocket.query_params.get("view_only", "") == "1"
     playwright_key: tuple[str, str] | None = None
+    read_only_transport = False
     try:
         session = websocket_session(websocket, settings, sessions)
         _enforce_completed_session(session)
+        if session.identity == PLAYWRIGHT_AUTOMATION_IDENTITY:
+            read_only_transport = requested_view_only and target == "playwright"
+            if not read_only_transport:
+                raise HTTPException(status_code=403, detail="Controle remoto bloqueado para a identidade interna Playwright")
+        elif requested_view_only:
+            read_only_transport = target == "playwright"
+            if not read_only_transport:
+                raise HTTPException(status_code=403, detail="Visualização somente leitura disponível apenas para Playwright")
         if not settings.remote_desktop_enabled:
             raise HTTPException(status_code=403, detail="Área de trabalho remota desativada")
         if target not in {"codex", "desktop", "jogos", "playwright", "android"}:
@@ -4087,12 +5756,20 @@ async def remote_desktop_socket(websocket: WebSocket) -> None:
             if not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", thread_id):
                 raise ValueError("conversa Playwright inválida")
             playwright_key = (_playwright_workspace_for_thread(thread_id), thread_id)
-        if target in {"codex", "playwright"} and not remote_desktop.running:
+            if read_only_transport:
+                state = _playwright_conversations.get(playwright_key)
+                if not state or not state.get("context_open"):
+                    raise ValueError("a navegação desta conversa não está ativa")
+                if _playwright_observed_front_key != playwright_key:
+                    raise ValueError("esta conversa não é a navegação atualmente visível")
+        if target in {"codex", "playwright"} and not remote_desktop.running and not read_only_transport:
             await remote_desktop.start()
+        if read_only_transport and not remote_desktop.running:
+            raise ValueError("a transmissão Playwright ainda não está ativa")
         if target == "desktop":
             raise ValueError("o Desktop Ubuntu usa a ponte GNOME RDP/Guacamole")
         if target == "jogos":
-            await _physical_session("start", target)
+            await _prepare_games_remote()
     except (HTTPException, RuntimeError, ValueError, ControlPlaneError) as exc:
         LOGGER.warning("Conexão remota recusada: %s", exc)
         await websocket.close(code=4403 if isinstance(exc, HTTPException) else 1011)
@@ -4113,12 +5790,25 @@ async def remote_desktop_socket(websocket: WebSocket) -> None:
         await websocket.close(code=1011)
         return
 
-    if playwright_key:
+    interactive_playwright = bool(playwright_key and not read_only_transport)
+    if interactive_playwright and playwright_key:
         await _claim_playwright_remote(playwright_key, websocket)
+    if read_only_transport and playwright_key:
+        try:
+            await _claim_playwright_read_only(playwright_key, websocket)
+        except ValueError as exc:
+            LOGGER.warning("Visor Playwright somente leitura recusado: %s", exc)
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+            await websocket.close(code=4409, reason="Navegação não visível")
+            return
     if target in {"codex", "playwright"}:
         remote_desktop.client_connected()
-    if playwright_key:
+    if interactive_playwright and playwright_key:
         _schedule_playwright_focus(*playwright_key)
+
+    read_only_filter = _ReadOnlyRfbClientFilter() if read_only_transport else None
 
     async def browser_to_vnc() -> None:
         while True:
@@ -4131,12 +5821,22 @@ async def remote_desktop_socket(websocket: WebSocket) -> None:
                 data = message["text"].encode("latin-1", errors="ignore")
             if data is None:
                 continue
-            if playwright_key:
+            if interactive_playwright and playwright_key:
                 if websocket not in _playwright_live_viewers.get(playwright_key, set()):
                     return
                 _touch_playwright_conversation(playwright_key)
+            if read_only_transport and playwright_key:
+                if websocket not in _playwright_read_only_viewers.get(playwright_key, set()):
+                    return
             if len(data) > 8 * 1024 * 1024:
                 raise ValueError("Quadro WebSocket acima do limite permitido")
+            if read_only_filter is not None:
+                try:
+                    read_only_filter.validate(data)
+                except ValueError as exc:
+                    LOGGER.warning("Entrada recusada no visor Playwright somente leitura: %s", exc)
+                    await websocket.close(code=4403, reason="Visor somente leitura")
+                    return
             writer.write(data)
             await writer.drain()
 
@@ -4145,7 +5845,9 @@ async def remote_desktop_socket(websocket: WebSocket) -> None:
             data = await reader.read(128 * 1024)
             if not data:
                 return
-            if playwright_key and websocket not in _playwright_live_viewers.get(playwright_key, set()):
+            if interactive_playwright and playwright_key and websocket not in _playwright_live_viewers.get(playwright_key, set()):
+                return
+            if read_only_transport and playwright_key and websocket not in _playwright_read_only_viewers.get(playwright_key, set()):
                 return
             await websocket.send_bytes(data)
 
@@ -4168,8 +5870,10 @@ async def remote_desktop_socket(websocket: WebSocket) -> None:
             await writer.wait_closed()
         if target in {"codex", "playwright"}:
             remote_desktop.client_disconnected()
-        if playwright_key:
+        if interactive_playwright and playwright_key:
             await _release_playwright_remote(playwright_key, websocket)
+        if read_only_transport and playwright_key:
+            await _release_playwright_read_only(playwright_key, websocket)
 
 
 @app.get("/api/desktop/screenshot")
@@ -4305,7 +6009,13 @@ async def list_threads(request: Request, project_id: str, archived: bool = False
             thread_id = str(thread.get("id") or "") if isinstance(thread, dict) else ""
             if thread_id:
                 tool_profiles.remember_thread_project(thread_id, project_id)
-                thread["clc"] = metadata.get(thread_id, {})
+                thread_metadata = metadata.get(thread_id, {})
+                if not (thread_metadata.get("execution_timing") or {}).get("turn_count"):
+                    timing = _rollout_execution_timing(thread.get("path"))
+                    if timing:
+                        thread_metadata = operations.set_metadata("threads", thread_id, {"execution_timing": timing})
+                        metadata[thread_id] = thread_metadata
+                thread["clc"] = thread_metadata
         result["data"] = sorted(
             result.get("data") or [],
             key=lambda item: (not bool((item.get("clc") or {}).get("pinned")), -(item.get("updatedAt") or item.get("createdAt") or 0)),
@@ -4321,7 +6031,12 @@ _thread_search_document_cache: Dict[tuple[str, str], Dict[str, Any]] = {}
 _thread_search_cache_locks: Dict[str, asyncio.Lock] = {}
 
 
-async def _paginated_thread_summaries(project: Project, target: CodexBridge) -> list[Dict[str, Any]]:
+async def _paginated_thread_summaries(
+    project: Project,
+    target: CodexBridge,
+    *,
+    archived: bool = False,
+) -> list[Dict[str, Any]]:
     values: list[Dict[str, Any]] = []
     cursor: str | None = None
     while len(values) < THREAD_SEARCH_MAX_SUMMARIES:
@@ -4330,7 +6045,7 @@ async def _paginated_thread_summaries(project: Project, target: CodexBridge) -> 
             "sortKey": "updated_at",
             "sortDirection": "desc",
             "sourceKinds": THREAD_SEARCH_SOURCE_KINDS,
-            "archived": False,
+            "archived": archived,
             "cwd": project.path,
         }
         if cursor:
@@ -4343,6 +6058,172 @@ async def _paginated_thread_summaries(project: Project, target: CodexBridge) -> 
             break
         cursor = str(next_cursor)
     return values[:THREAD_SEARCH_MAX_SUMMARIES]
+
+
+async def _site_access_thread_summaries(
+    project: Project,
+    target: CodexBridge,
+    *,
+    archived: bool,
+) -> list[Dict[str, Any]]:
+    """List the complete Dex history, guarding only against repeated cursors."""
+    values: list[Dict[str, Any]] = []
+    cursor: str | None = None
+    seen_cursors: set[str] = set()
+    while True:
+        params: Dict[str, Any] = {
+            "limit": THREAD_SEARCH_PAGE_SIZE,
+            "sortKey": "updated_at",
+            "sortDirection": "desc",
+            "sourceKinds": THREAD_SEARCH_SOURCE_KINDS,
+            "archived": archived,
+            "cwd": project.path,
+        }
+        if cursor:
+            params["cursor"] = cursor
+        result = await target.request("thread/list", params)
+        page = result.get("data") or [] if isinstance(result, dict) else []
+        values.extend(item for item in page if isinstance(item, dict))
+        next_cursor = str(result.get("nextCursor") or "") if isinstance(result, dict) else ""
+        if not next_cursor or not page or next_cursor in seen_cursors:
+            break
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
+    return values
+
+
+async def _refresh_site_access_history() -> None:
+    global site_access_refresh_state
+    site_access_refresh_state = {
+        "running": True,
+        "completed": False,
+        "projects_scanned": 0,
+        "threads_scanned": 0,
+        "accesses_imported": 0,
+        "error": "",
+        "started_at": time.time(),
+    }
+    try:
+        for project in _all_projects():
+            target = _bridge_for_project(project)
+            if project.kind == "system":
+                await target.start()
+            else:
+                target = await _prepare_project_bridge(project, configure=False)
+            summaries: list[Dict[str, Any]] = []
+            for archived in (False, True):
+                summaries.extend(await _site_access_thread_summaries(project, target, archived=archived))
+            by_id = {
+                str(thread.get("id") or ""): thread
+                for thread in summaries
+                if isinstance(thread, dict) and str(thread.get("id") or "")
+            }
+            metadata = operations.metadata().get("threads", {})
+            for thread_id, summary in by_id.items():
+                try:
+                    result = await target.request("thread/read", {"threadId": thread_id, "includeTurns": True})
+                    detailed = result.get("thread") if isinstance(result, dict) else None
+                    if not isinstance(detailed, dict):
+                        detailed = summary
+                    thread_metadata = metadata.get(thread_id, {}) if isinstance(metadata, dict) else {}
+                    request_summary = str(thread_metadata.get("request_preview") or "")
+                    if not request_summary:
+                        request_summary = conversation_request_preview(first_meaningful_user_request(detailed))
+                    imported = await asyncio.to_thread(
+                        site_access.import_thread,
+                        detailed,
+                        workspace="system" if project.kind == "system" else f"project:{project.id}",
+                        project_id=project.id,
+                        project_name=project.name,
+                        request_summary=request_summary,
+                    )
+                    site_access_refresh_state["accesses_imported"] += imported
+                except (CodexRPCError, RuntimeError, asyncio.TimeoutError) as exc:
+                    LOGGER.info("Histórico web parcial para a conversa %s: %s", thread_id, exc)
+                finally:
+                    site_access_refresh_state["threads_scanned"] += 1
+            site_access_refresh_state["projects_scanned"] += 1
+        site_access_refresh_state["completed"] = True
+        site_access_refresh_state["completed_at"] = time.time()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        LOGGER.exception("Falha ao reconstruir o histórico de sites")
+        site_access_refresh_state["error"] = str(exc)
+    finally:
+        site_access_refresh_state["running"] = False
+
+
+@app.get("/api/site-access")
+async def get_site_access(request: Request, policies_only: bool = False) -> Dict[str, Any]:
+    _session(request)
+    if policies_only:
+        return await asyncio.to_thread(site_access.policy_snapshot)
+    return await asyncio.to_thread(site_access.snapshot, site_access_refresh_state)
+
+
+@app.get("/api/automations")
+async def get_automations(request: Request) -> Dict[str, Any]:
+    _session(request)
+    records = await asyncio.to_thread(automations.store.list_all)
+    project_index = {item.id: item for item in projects.list()}
+    system_project = project_index.get(SYSTEM_PROJECT_ID) or _system_project()
+    thread_metadata = operations.metadata().get("threads", {})
+    if not isinstance(thread_metadata, dict):
+        thread_metadata = {}
+    enriched: list[Dict[str, Any]] = []
+    for record in records:
+        project_id = str(record.get("project_id") or "")
+        if project_id == "system":
+            project_id = SYSTEM_PROJECT_ID
+        project = project_index.get(project_id) or (system_project if project_id == SYSTEM_PROJECT_ID else None)
+        target_thread_id = str(record.get("target_thread_id") or "")
+        metadata = thread_metadata.get(target_thread_id, {}) if target_thread_id else {}
+        enriched.append({
+            **record,
+            "project_id": project_id,
+            "project_name": project.name if project else ("Sistema" if project_id == SYSTEM_PROJECT_ID else project_id),
+            "project_kind": project.kind if project else ("system" if project_id == SYSTEM_PROJECT_ID else "project"),
+            "thread_title": str(metadata.get("title") or "") if isinstance(metadata, dict) else "",
+        })
+    active = sum(1 for item in enriched if item.get("status") == "ACTIVE")
+    paused = sum(1 for item in enriched if item.get("status") == "PAUSED")
+    return {
+        "automations": enriched,
+        "totals": {
+            "all": len(enriched),
+            "active": active,
+            "paused": paused,
+            "projects": len({str(item.get("project_id") or "") for item in enriched}),
+        },
+        "timezone": "America/Sao_Paulo",
+    }
+
+
+@app.put("/api/site-access/{domain}/policy")
+async def update_site_access_policy(
+    request: Request,
+    domain: str,
+    payload: SiteAccessPolicyUpdate,
+) -> Dict[str, str]:
+    _session(request, mutate=True)
+    try:
+        return await asyncio.to_thread(site_access.set_policy, domain, payload.mode)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/site-access/refresh")
+async def refresh_site_access(request: Request) -> Dict[str, Any]:
+    global site_access_refresh_task
+    _session(request, mutate=True)
+    if site_access_refresh_task and not site_access_refresh_task.done():
+        return dict(site_access_refresh_state)
+    site_access_refresh_task = asyncio.create_task(
+        _refresh_site_access_history(), name="clc-site-access-retrospective-index"
+    )
+    await asyncio.sleep(0)
+    return dict(site_access_refresh_state)
 
 
 def _thread_search_revision(thread: Dict[str, Any]) -> tuple[Any, str, str]:
@@ -4500,9 +6381,10 @@ async def create_thread(request: Request, payload: ThreadCreate) -> Dict[str, An
     project = _project_or_404(payload.project_id)
     params: Dict[str, Any] = {
         "cwd": project.path,
-        "approvalPolicy": "on-request" if project.kind == "system" else "never",
+        "approvalPolicy": _thread_approval_policy(project),
         "sandbox": "danger-full-access" if project.kind == "system" else "workspace-write",
         "serviceName": "codex_linux_control_system" if project.kind == "system" else "codex_linux_control_projects",
+        "dynamicTools": [AUTOMATION_TOOL_SPEC],
     }
     if payload.model:
         params["model"] = payload.model
@@ -4510,7 +6392,7 @@ async def create_thread(request: Request, payload: ThreadCreate) -> Dict[str, An
         params["serviceTier"] = payload.service_tier
     if payload.personality:
         params["personality"] = payload.personality
-    result = await _rpc("thread/start", params, target=_bridge_for_project(project))
+    result = await _start_thread_with_gateway_retry(params, target=_bridge_for_project(project))
     thread = result.get("thread", {})
     thread_id = str(thread.get("id") or "")
     if not thread_id:
@@ -4529,7 +6411,7 @@ async def create_thread(request: Request, payload: ThreadCreate) -> Dict[str, An
                 target=_bridge_for_project(project),
             )
             thread["name"] = title_metadata["title"]
-        except (CodexRPCError, RuntimeError, asyncio.TimeoutError) as exc:
+        except (HTTPException, CodexRPCError, RuntimeError, asyncio.TimeoutError) as exc:
             LOGGER.info("Título canônico adiado para a conversa %s: %s", thread_id, exc)
         thread["clc"] = title_metadata
     response: Dict[str, Any] = {
@@ -4708,12 +6590,20 @@ async def _start_turn(
         )
         sandbox = {
             "type": "workspaceWrite",
-            "writableRoots": [project.path],
+            "writableRoots": _project_workspace_paths(project),
             "networkAccess": bool(network_access),
         }
         profile_home = settings.resolved_project_worker_home
         profile.desktop = False
         profile.system_admin = False
+    related_paths = _project_workspace_paths(project)
+    if len(related_paths) > 1:
+        operating_context += (
+            "\nEste workspace possui pastas relacionadas explicitamente selecionadas pelo operador: "
+            + ", ".join(related_paths[1:])
+            + ". Trate a primeira pasta como principal e preserve os limites entre repositórios."
+        )
+    operating_context += workbench["memory_context"](project.id, message)
     referenced_message = await _message_with_references(message, references or [])
     params: Dict[str, Any] = {
         "threadId": thread_id,
@@ -4725,7 +6615,7 @@ async def _start_turn(
             references or [],
         ),
         "cwd": project.path,
-        "approvalPolicy": "on-request" if project.kind == "system" else "never",
+        "approvalPolicy": _thread_approval_policy(project),
         "sandboxPolicy": sandbox,
         # Igual ao painel do Codex no Windows: transmite um resumo visível do
         # andamento sem expor a cadeia de pensamento privada do modelo.
@@ -4751,7 +6641,10 @@ async def _start_turn(
             },
         }
     try:
-        result = await _rpc("turn/start", params, timeout=60, target=_bridge_for_project(project))
+        result = await _start_turn_with_gateway_retry(
+            params,
+            target=_bridge_for_project(project),
+        )
     except Exception:
         if _active_turns.get(turn_key) is reservation:
             _active_turns.pop(turn_key, None)
@@ -4763,6 +6656,68 @@ async def _start_turn(
         state["starting"] = False
         state["last_activity"] = time.monotonic()
     return turn
+
+
+async def _run_automation(automation: Dict[str, Any]) -> str:
+    project_id = str(automation.get("project_id") or SYSTEM_PROJECT_ID)
+    project = _project_or_404(project_id)
+    target = _bridge_for_project(project)
+    kind = str(automation.get("kind") or "heartbeat")
+    thread_id = str(automation.get("target_thread_id") or "")
+    if kind == "cron":
+        params: Dict[str, Any] = {
+            "cwd": project.path,
+            "approvalPolicy": _thread_approval_policy(project),
+            "sandbox": "danger-full-access" if project.kind == "system" else "workspace-write",
+            "serviceName": "codex_linux_control_automations",
+            "dynamicTools": [AUTOMATION_TOOL_SPEC],
+        }
+        if automation.get("model"):
+            params["model"] = automation["model"]
+        result = await _start_thread_with_gateway_retry(params, target=target)
+        thread = result.get("thread", {}) if isinstance(result, dict) else {}
+        thread_id = str(thread.get("id") or "")
+        if not thread_id:
+            raise RuntimeError("o Codex não retornou a conversa da execução agendada")
+        target.mark_thread_loaded(thread_id)
+        profile = tool_profiles.project(project.id)
+        tool_profiles.save_thread(thread_id, project.id, profile)
+        operations.set_metadata(
+            "threads",
+            thread_id,
+            {"title": f"Automação: {str(automation.get('name') or 'agendamento')[:100]}"},
+        )
+        with contextlib.suppress(Exception):
+            await _rpc(
+                "thread/name/set",
+                {"threadId": thread_id, "name": f"Automação: {str(automation.get('name') or 'agendamento')[:100]}"},
+                target=target,
+            )
+    elif not thread_id:
+        raise RuntimeError("agendamento heartbeat não possui conversa de destino")
+
+    workspace = _workspace_for_project(project)
+    if (workspace, thread_id) in _active_turns:
+        raise RuntimeError("a conversa de destino já possui uma execução ativa")
+    await target.ensure_thread_loaded(thread_id)
+    profile = tool_profiles.effective(project.id, thread_id)
+    if project.kind != "system":
+        profile.desktop = False
+        profile.system_admin = False
+    await _start_turn(
+        thread_id,
+        project,
+        str(automation.get("prompt") or ""),
+        str(automation.get("model") or "") or None,
+        str(automation.get("reasoning_effort") or "") or None,
+        None,
+        None,
+        True,
+        profile,
+        [],
+        None,
+    )
+    return thread_id
 
 
 @app.post("/api/threads/{thread_id}/resume")
@@ -4990,14 +6945,86 @@ async def duplicate_thread(request: Request, thread_id: str) -> Dict[str, Any]:
 @app.patch("/api/projects/{project_id}/metadata")
 async def update_project_metadata(request: Request, project_id: str, payload: MetadataUpdate) -> Dict[str, Any]:
     _session(request, mutate=True)
-    _project_or_404(project_id)
-    return {"metadata": operations.set_metadata("projects", project_id, payload.model_dump(exclude_none=True))}
+    project = _project_or_404(project_id)
+    values = payload.model_dump(exclude_none=True)
+    if payload.paths is not None:
+        allowed = [root.resolve() for root in settings.project_roots]
+        validated: list[str] = []
+        for raw in payload.paths:
+            resolved = Path(raw).expanduser().resolve()
+            if not resolved.is_dir():
+                raise HTTPException(status_code=400, detail=f"A pasta relacionada não existe: {raw}")
+            if project.kind != "system" and not any(resolved == root or root in resolved.parents for root in allowed):
+                raise HTTPException(status_code=403, detail=f"Pasta fora das raízes autorizadas: {raw}")
+            value = str(resolved)
+            if value not in validated:
+                validated.append(value)
+        if str(Path(project.path).resolve()) not in validated:
+            validated.insert(0, str(Path(project.path).resolve()))
+        values["paths"] = validated
+        values["main_path"] = str(Path(project.path).resolve())
+    return {"metadata": operations.set_metadata("projects", project_id, values)}
 
 
 @app.get("/api/navigation/metadata")
 async def navigation_metadata(request: Request) -> Dict[str, Any]:
     _session(request)
     return operations.metadata()
+
+
+@app.get("/api/queue")
+async def list_all_conversation_queues(request: Request) -> Dict[str, Any]:
+    """Expose one origin-aware inbox for the queues of every conversation."""
+    _session(request)
+    metadata = operations.metadata()
+    thread_metadata = metadata.get("threads", {})
+    if not isinstance(thread_metadata, dict):
+        thread_metadata = {}
+    project_index = {project.id: project for project in _all_projects()}
+    groups: list[tuple[float, list[Dict[str, Any]]]] = []
+    status_totals: Dict[str, int] = {}
+
+    for thread_id, queue in operations.all_queues().items():
+        if not queue:
+            continue
+        stored_thread = thread_metadata.get(thread_id, {})
+        if not isinstance(stored_thread, dict):
+            stored_thread = {}
+        thread_title = str(
+            stored_thread.get("title")
+            or stored_thread.get("request_preview")
+            or f"Conversa {thread_id[:8]}"
+        ).strip()
+        enriched: list[Dict[str, Any]] = []
+        for position, item in enumerate(queue, start=1):
+            project_id = str(item.get("project_id") or _project_id_for_thread(thread_id) or SYSTEM_PROJECT_ID)
+            project = project_index.get(project_id)
+            status = str(item.get("status") or "queued")
+            status_totals[status] = status_totals.get(status, 0) + 1
+            enriched.append({
+                **item,
+                "thread_id": thread_id,
+                "thread_title": thread_title,
+                "project_id": project_id,
+                "project_name": project.name if project else ("Sistema" if project_id == SYSTEM_PROJECT_ID else project_id),
+                "project_kind": project.kind if project else ("system" if project_id == SYSTEM_PROJECT_ID else "project"),
+                "position": position,
+            })
+        activity = max(float(item.get("created_at") or 0) for item in enriched)
+        groups.append((activity, enriched))
+
+    groups.sort(key=lambda entry: entry[0], reverse=True)
+    items = [item for _activity, queue in groups for item in queue]
+    pending_statuses = {"queued", "steering", "running"}
+    return {
+        "items": items,
+        "totals": {
+            "all": len(items),
+            "pending": sum(count for status, count in status_totals.items() if status in pending_statuses),
+            "conversations": len(groups),
+            "statuses": status_totals,
+        },
+    }
 
 
 @app.get("/api/threads/{thread_id}/queue")
@@ -5192,6 +7219,10 @@ async def event_socket(websocket: WebSocket) -> None:
             "status": "ready" if item.get("initialized") else "idle" if not item.get("running") else "error",
             "error": item.get("last_error"),
         })
+    # Server requests are normally live events. Credential forms must survive
+    # mobile suspension and WebSocket reconnects for their five-minute life.
+    for pending_event in _pending_browser_credential_events():
+        await websocket.send_json(pending_event)
     try:
         while True:
             event = await queue.get()

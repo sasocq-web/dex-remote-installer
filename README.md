@@ -10,7 +10,8 @@ perfis independentes:
 
 O pacote não contém tokens OpenAI, cookies, conversas, chaves SSH, contas de
 nuvem, identificadores OAuth ou configurações do servidor de origem. Cada conta
-é autenticada pelo proprietário depois da instalação.
+é autenticada pelo proprietário depois da instalação, salvo quando o estado
+privado é importado explicitamente de um backup desbloqueado.
 
 [Código-fonte](https://github.com/sasocq-web/dex-remote-installer) ·
 [Downloads e checksums](https://github.com/sasocq-web/dex-remote-installer/releases/latest)
@@ -23,6 +24,22 @@ binário compatível com a arquitetura do computador. Distribuições RPM, Arch 
 outras famílias precisam de outro formato de pacote.
 
 ## Instalação
+
+Para reinstalar a release verificada mais recente no perfil completo, use um
+único comando em uma instalação nova do Ubuntu/Debian:
+
+```bash
+curl -fsSLo /tmp/dex-reinstall https://raw.githubusercontent.com/sasocq-web/dex-remote-installer/main/install.sh && sudo bash /tmp/dex-reinstall --mode full
+```
+
+O reinstalador baixa o `.deb` e seu checksum da GitHub Release, valida o
+SHA-256 antes de instalar e usa a versão do Codex CLI fixada no pacote. Ele
+recusa substituir um Control Plane SASOCQ que esteja ativo.
+
+Para recuperar também o estado privado, restaure primeiro o snapshot Restic em
+uma pasta temporária e acrescente `--restore-from /caminho/do/snapshot`. Isso
+recupera autenticações, conversas, dispositivos, perfis e workspaces sem
+publicar segredos no GitHub.
 
 ```bash
 sudo apt install ./dex-remote-installer_*_all.deb
@@ -76,6 +93,10 @@ Para compilar e testar localmente:
 ./build.sh
 ./tests/test-package.sh
 ```
+
+Depois dos testes, `scripts/create-recovery-bundle` cria em `recovery/` uma
+cópia autocontida do pacote, checksum, reinstalador e manifesto. Essa pasta é
+ignorada pelo Git e preservada pelo backup criptografado SASOCQ.
 
 Veja [docs/AUTOMATION.md](docs/AUTOMATION.md) para o fluxo de atualização e
 [SECURITY.md](SECURITY.md) para relatar vulnerabilidades.

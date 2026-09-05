@@ -4,5 +4,5 @@ __pycache__/
 .mypy_cache/
 dist/*.deb
 dist/*.deb.sha256
+recovery/
 !dist/.gitkeep
-

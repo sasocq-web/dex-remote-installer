@@ -9,6 +9,8 @@ const THREAD_SUMMARY_CACHE_KEY = "codex-linux-control.thread-summaries.v1";
 const THREAD_TERMINAL_STATUS_KEY = "codex-linux-control.thread-terminal-statuses.v1";
 const CONVERSATION_APPROVAL_RULES_KEY = "codex-linux-control.conversation-approval-rules.v1";
 const SYSTEM_UPDATE_AUTOMATIC_KEY = "codex-linux-control.system-update-automatic.v1";
+const COMPOSER_DRAFT_STORAGE_KEY = "codex-linux-control.composer-draft.v1";
+const COMPOSER_DRAFT_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const RECENT_PROJECT_LIMIT = 5;
 const PROJECT_CONVERSATION_LIMIT = 100;
 const THREAD_SEARCH_RESULT_LIMIT = 100;
@@ -42,6 +44,27 @@ function loadProjectUsage() {
     return new Map(Object.entries(saved).map(([projectId, timestamp]) => [projectId, Number(timestamp) || 0]));
   } catch {
     return new Map();
+  }
+}
+
+function loadComposerDraft() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(COMPOSER_DRAFT_STORAGE_KEY) || "null");
+    const text = typeof saved?.text === "string" ? saved.text.slice(0, 200000) : "";
+    const updatedAt = Number(saved?.updated_at || 0);
+    if (!text || !updatedAt || Date.now() - updatedAt > COMPOSER_DRAFT_MAX_AGE_MS) {
+      try { localStorage.removeItem(COMPOSER_DRAFT_STORAGE_KEY); } catch {}
+      return null;
+    }
+    return {
+      text,
+      project_id:String(saved.project_id || ""),
+      thread_id:String(saved.thread_id || ""),
+      updated_at:updatedAt,
+    };
+  } catch {
+    try { localStorage.removeItem(COMPOSER_DRAFT_STORAGE_KEY); } catch {}
+    return null;
   }
 }
 
@@ -103,7 +126,6 @@ function backupRemotePath() {
 }
 
 const state = {
-  installMode: "full",
   csrf: "",
   identity: "",
   session: null,
@@ -121,6 +143,8 @@ const state = {
   composerPreferenceStore: initialComposerPreferenceStore,
   composerPreferenceSyncs: new Map(),
   composerPreferences: emptyComposerPreferences(initialComposerPreferenceStore.networkAccess),
+  composerDraft: loadComposerDraft(),
+  composerDraftRestored: false,
   threads: [],
   projectThreads: loadCachedThreadSummaries(),
   threadTerminalStatuses: loadThreadTerminalStatuses(),
@@ -141,12 +165,15 @@ const state = {
   activeTurnStartedAt: 0,
   executionActivityAt: 0,
   executionTicker: null,
+  threadExecutionTicker: null,
   turnSubmissionPending: false,
   items: new Map(),
   approvals: new Map(),
   conversationApprovalRules: loadConversationApprovalRules(),
   activity: [],
   diff: "",
+  inspectorAttentionKey: "",
+  inspectorAutoOpenedForApproval: false,
   socket: null,
   socketTimer: null,
   socketRetry: 0,
@@ -160,6 +187,9 @@ const state = {
   deferredInstall: null,
   mainInterfaceReady: false,
   pendingNotificationTarget: null,
+  systemUpdateReloadDeferred: false,
+  systemUpdateReloadNotified: false,
+  systemUpdateReloadTimer: null,
   bridgeReady: false,
   lastStatus: null,
   extensions: null,
@@ -169,6 +199,7 @@ const state = {
   toolsTab: "recommended",
   toolsScope: "thread",
   composerMode: null,
+  composerViewportBaseline: 0,
   pluginSearch: "",
   remote: {
     status: null,
@@ -196,6 +227,11 @@ const state = {
     keyboardCompositionText: "",
     keyboardMode: "none",
     keyboardAutoHideTimer: null,
+    keyboardModalityTimer: null,
+    keyboardVisibilityRequest: null,
+    keyboardVisibilityTarget: "",
+    ubuntuKeyboardVisible: null,
+    inputModality: "",
     mobileLayout: false,
     mobileLayoutPending: false,
     opening: false,
@@ -203,6 +239,7 @@ const state = {
   },
   devices: [],
   enrollmentRequests: [],
+  reauthenticationOptions: [],
   localNetworkAdmin: false,
   pairingTimer: null,
   setup: {
@@ -227,12 +264,22 @@ const state = {
   oneDriveFolderMode: "backup",
   pcResources: null,
   pcResourceTimer: null,
+  pcDataTab: "overview",
+  pcStorage: null,
+  pcStorageLoading: false,
+  pcActivities: null,
+  pcActivitiesLoading: false,
+  pcActivitySort: "memory",
+  pcActivityTimer: null,
   systemUpdate: null,
   systemUpdateAutomatic: localStorage.getItem(SYSTEM_UPDATE_AUTOMATIC_KEY) !== "false",
   systemUpdateAutomaticTimer: null,
   systemUpdateStarting: false,
   systemUpdateProgressDismissed: false,
 };
+
+let resolveDexSessionReady;
+window.dexSessionReady = new Promise(resolve => { resolveDexSessionReady = resolve; });
 
 const el = id => document.getElementById(id);
 const selectors = {
@@ -243,7 +290,14 @@ const selectors = {
   network: el("network-select"), title: el("active-title"), projectLabel: el("active-project-label"),
   status: el("status-pill"), connectionLabel: el("connection-label"), loginBanner: el("login-banner"),
   approvalList: el("approval-list"), approvalCount: el("approval-count"), diffView: el("diff-view"),
-  otherApprovalPopups: el("other-conversation-approval-popups"),
+  inspectorSummaryStatus: el("inspector-summary-status"), inspectorStatusIcon: el("inspector-status-icon"),
+  inspectorStatusTitle: el("inspector-status-title"), inspectorStatusCopy: el("inspector-status-copy"),
+  inspectorStatusMeta: el("inspector-status-meta"), inspectorSummaryCount: el("inspector-summary-count"),
+  inspectorAttentionCount: el("inspector-attention-count"), inspectorAttentionSources: el("inspector-attention-sources"), inspectorSummaryEmpty: el("inspector-summary-empty"),
+  summaryApprovalsSection: el("summary-approvals-section"), summaryQueueSection: el("summary-queue-section"),
+  executionActivitySection: el("execution-activity-section"), executionDiffSection: el("execution-diff-section"),
+  executionDiffCount: el("execution-diff-count"), executionEventCount: el("execution-event-count"),
+  inspectorExecutionEmpty: el("inspector-execution-empty"),
   activityList: el("activity-list"), loginDialog: el("login-dialog"), settingsDialog: el("settings-dialog"),
   toastContainer: el("toast-container"), setupOverlay: el("setup-overlay"), setupBody: el("setup-body"),
   setupBack: el("setup-back"), setupNext: el("setup-next"), setupRefresh: el("setup-refresh"),
@@ -273,6 +327,7 @@ const selectors = {
   terminalInput: el("terminal-input"), terminalState: el("terminal-state"),
   backupFolderDialog: el("backup-folder-dialog"), backupFolderList: el("backup-folder-list"),
   pcDataDialog: el("pc-data-dialog"), pcDataContent: el("pc-data-content"),
+  pcDataPanel: el("pc-data-panel"), pcDataTabs: document.querySelector(".pc-data-tabs"),
 };
 
 function escapeHTML(value) {
@@ -357,6 +412,7 @@ function renderPCResources(data) {
     <div class="pc-data-details"><strong>${escapeHTML(data.hostname || "Mini PC SASOCQ")}</strong><span>${escapeHTML(hardware.cpu?.model || data.platform || "Processador não identificado")}</span><span>${escapeHTML(disk.model || "SSD interno")} • kernel ${escapeHTML(data.kernel || "—")} • ligado há ${escapeHTML(uptimeDays.toFixed(1))} dia(s)</span></div>`;
   const updated = el("pc-data-updated");
   if (updated) updated.textContent = `Atualizado em ${formatTime(data.checked_at || Date.now() / 1000)}`;
+  renderPCDataPanel();
 }
 
 async function loadPCResources({openDialog = false, announce = false} = {}) {
@@ -371,6 +427,148 @@ async function loadPCResources({openDialog = false, announce = false} = {}) {
     if (announce) toast(error.message, "error");
     return null;
   }
+}
+
+function pcDataLoading(message) {
+  return `<div class="pc-manager-loading"><span class="spinner"></span><strong>${escapeHTML(message)}</strong><small>A leitura é feita pelo broker administrativo auditado.</small></div>`;
+}
+
+function formatElapsed(seconds) {
+  const value = Math.max(0, Number(seconds || 0));
+  if (value < 60) return `${Math.round(value)} s`;
+  if (value < 3600) return `${Math.floor(value / 60)} min`;
+  if (value < 86400) return `${Math.floor(value / 3600)} h ${Math.floor((value % 3600) / 60)} min`;
+  return `${Math.floor(value / 86400)} d ${Math.floor((value % 86400) / 3600)} h`;
+}
+
+function renderPCStorage() {
+  const data = state.pcStorage;
+  if (state.pcStorageLoading) return pcDataLoading("Analisando as pastas do SSD…");
+  if (!data) return `<div class="pc-manager-empty"><strong>Consumo ainda não analisado</strong><span>Selecione “Analisar armazenamento” para medir as pastas sem apagar ou modificar arquivos.</span><button class="primary-button" type="button" data-pc-load="storage">Analisar armazenamento</button></div>`;
+  const filesystem = data.filesystem || {};
+  const total = Number(filesystem.total || 0);
+  const used = Number(filesystem.used || 0);
+  const free = Number(filesystem.free || 0);
+  const usedPercent = total ? Math.min(100, (used / total) * 100) : 0;
+  const largest = data.largest || [];
+  const top = largest[0] || {};
+  return `
+    <div class="pc-manager-heading"><div><strong>Gerenciador de armazenamento</strong><span>${top.label ? `Maior item identificado: ${escapeHTML(top.label)} (${formatBytes(top.size)})` : "Uso do SSD organizado por categoria e pasta."}</span></div><button class="secondary-button" type="button" data-pc-refresh="storage">Analisar novamente</button></div>
+    <article class="storage-total-card">
+      <div><span>SSD interno</span><strong>${formatBytes(used)} usados</strong><small>${formatBytes(free)} livres de ${formatBytes(total)}</small></div>
+      <div class="storage-meter" role="progressbar" aria-label="Uso do SSD" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${usedPercent.toFixed(0)}"><span style="width:${usedPercent.toFixed(2)}%"></span></div>
+    </article>
+    <section class="pc-manager-section"><div class="pc-manager-section-title"><strong>Por categoria</strong><small>Pastas principais do mesmo SSD</small></div>
+      <div class="storage-category-list">${(data.categories || []).map(item => {
+        const percent = used ? Math.min(100, Number(item.size || 0) / used * 100) : 0;
+        return `<article class="storage-row"><div><strong>${escapeHTML(item.label)}</strong><small>${escapeHTML(item.path)}</small></div><span>${formatBytes(item.size)}</span><div class="storage-row-meter"><span style="width:${percent.toFixed(2)}%"></span></div></article>`;
+      }).join("") || '<div class="panel-empty">Nenhuma categoria encontrada.</div>'}</div>
+    </section>
+    <section class="pc-manager-section"><div class="pc-manager-section-title"><strong>O que mais ocupa espaço</strong><small>Itens reconhecidos, sem expor conteúdo pessoal</small></div>
+      <div class="storage-largest-list">${largest.map((item, index) => `<article class="storage-largest-row"><span class="storage-rank">${index + 1}</span><div><strong>${escapeHTML(item.label)}</strong><small>${escapeHTML(item.path)}</small></div><b>${formatBytes(item.size)}</b></article>`).join("") || '<div class="panel-empty">Nenhum item relevante encontrado.</div>'}</div>
+    </section>
+    <div class="pc-manager-note">Esta página apenas mede o consumo. Exclusões e limpezas continuam exigindo uma solicitação explícita ao Codex para preservar servidor, painel e backups.</div>`;
+}
+
+function activityGroupActions(group) {
+  if (group.scope === "projects") return `<div class="pc-group-actions"><button class="secondary-button" type="button" data-pc-control="workers" data-pc-operation="pause">Pausar</button><button class="danger-button" type="button" data-pc-control="workers" data-pc-operation="stop">Encerrar projetos</button></div>`;
+  if (group.scope === "games") return `<div class="pc-group-actions"><button class="danger-button" type="button" data-pc-control="steam" data-pc-operation="stop">Fechar jogo</button></div>`;
+  return `<span class="pc-protected-badge">${group.protected ? "Protegido" : "Monitorado"}</span>`;
+}
+
+function renderPCActivities() {
+  const data = state.pcActivities;
+  if (state.pcActivitiesLoading && !data) return pcDataLoading("Lendo as atividades atuais…");
+  if (!data) return `<div class="pc-manager-empty"><strong>Atividades ainda não carregadas</strong><span>Veja CPU, memória e processos agrupados por função.</span><button class="primary-button" type="button" data-pc-load="activities">Carregar atividades</button></div>`;
+  const memory = data.memory || {};
+  const processes = [...(data.processes || [])].sort((left, right) => state.pcActivitySort === "cpu" ? Number(right.cpu_percent || 0) - Number(left.cpu_percent || 0) : Number(right.memory_bytes || 0) - Number(left.memory_bytes || 0));
+  return `
+    <div class="pc-manager-heading"><div><strong>Gerenciador de atividades</strong><span>Atualização automática a cada 5 segundos enquanto esta página estiver aberta.</span></div><button class="secondary-button" type="button" data-pc-refresh="activities">Atualizar</button></div>
+    <div class="activity-summary-grid">
+      <article><span>CPU agora</span><strong>${escapeHTML(Number(data.cpu?.percent || 0).toFixed(1))}%</strong><small>${escapeHTML(data.cpu?.logical || "—")} threads</small></article>
+      <article><span>Memória em uso</span><strong>${formatBytes(memory.used)}</strong><small>${formatBytes(memory.available)} disponíveis</small></article>
+      <article><span>Processos visíveis</span><strong>${escapeHTML((data.processes || []).length)}</strong><small>ordenados por consumo</small></article>
+    </div>
+    <section class="pc-manager-section"><div class="pc-manager-section-title"><strong>Atividade por função</strong><small>Controles aparecem somente para cargas que podem ser interrompidas com segurança</small></div>
+      <div class="activity-group-list">${(data.groups || []).map(group => `<article class="activity-group-card"><div><strong>${escapeHTML(group.label)}</strong><small>${escapeHTML(group.description)}</small></div><div class="activity-group-values"><b>${formatBytes(group.memory_bytes)}</b><span>${escapeHTML(Number(group.cpu_percent || 0).toFixed(1))}% CPU acumulada • ${escapeHTML(group.process_count)} processo(s)</span></div>${activityGroupActions(group)}</article>`).join("")}</div>
+    </section>
+    <section class="pc-manager-section"><div class="pc-manager-section-title activity-process-title"><div><strong>Principais processos</strong><small>Comandos completos e segredos não são exibidos</small></div><label>Ordenar por<select id="pc-activity-sort"><option value="memory" ${state.pcActivitySort === "memory" ? "selected" : ""}>Memória</option><option value="cpu" ${state.pcActivitySort === "cpu" ? "selected" : ""}>CPU</option></select></label></div>
+      <div class="activity-process-list">${processes.slice(0, 40).map(process => `<article class="activity-process-row"><div><strong>${escapeHTML(process.command)}</strong><small>PID ${escapeHTML(process.pid)} • ${escapeHTML(process.scope_label)} • ativo há ${escapeHTML(formatElapsed(process.elapsed_seconds))}</small></div><span><b>${formatBytes(process.memory_bytes)}</b><small>${escapeHTML(Number(process.cpu_percent || 0).toFixed(1))}% CPU</small></span>${process.protected ? '<em title="Processo essencial protegido">Protegido</em>' : ""}</article>`).join("")}</div>
+    </section>`;
+}
+
+function updatePCDataTabs() {
+  selectors.pcDataTabs?.querySelectorAll("[data-pc-tab]").forEach(button => {
+    const active = button.dataset.pcTab === state.pcDataTab;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-selected", active ? "true" : "false");
+  });
+}
+
+function renderPCDataPanel() {
+  if (!selectors.pcDataPanel) return;
+  updatePCDataTabs();
+  if (state.pcDataTab === "storage") selectors.pcDataPanel.innerHTML = renderPCStorage();
+  else if (state.pcDataTab === "activities") selectors.pcDataPanel.innerHTML = renderPCActivities();
+  else selectors.pcDataPanel.innerHTML = `<div class="pc-overview-intro"><strong>Mini PC SASOCQ em tempo real</strong><span>Use o gerenciador de armazenamento para descobrir o que ocupa o SSD e o gerenciador de atividades para acompanhar CPU, memória e processos.</span><div class="pc-overview-actions"><button class="primary-button" type="button" data-pc-open-tab="storage">Ver armazenamento</button><button class="secondary-button" type="button" data-pc-open-tab="activities">Ver atividades</button></div></div>`;
+}
+
+async function loadPCStorage({refresh = false, announce = false} = {}) {
+  if (state.pcStorageLoading) return state.pcStorage;
+  state.pcStorageLoading = true;
+  renderPCDataPanel();
+  try {
+    state.pcStorage = await api(`/api/control/pc-storage${refresh ? "?refresh=true" : ""}`);
+    if (announce) toast("Armazenamento analisado.", "success");
+    return state.pcStorage;
+  } catch (error) {
+    if (selectors.pcDataPanel) selectors.pcDataPanel.innerHTML = `<div class="inline-notice error">${escapeHTML(error.message)}</div>`;
+    if (announce) toast(error.message, "error");
+    return null;
+  } finally {
+    state.pcStorageLoading = false;
+    if (state.pcStorage || state.pcDataTab !== "storage") renderPCDataPanel();
+  }
+}
+
+async function loadPCActivities({announce = false} = {}) {
+  if (state.pcActivitiesLoading) return state.pcActivities;
+  state.pcActivitiesLoading = true;
+  if (!state.pcActivities) renderPCDataPanel();
+  try {
+    state.pcActivities = await api("/api/control/pc-activities");
+    if (announce) toast("Atividades atualizadas.", "success");
+    return state.pcActivities;
+  } catch (error) {
+    if (selectors.pcDataPanel && !state.pcActivities) selectors.pcDataPanel.innerHTML = `<div class="inline-notice error">${escapeHTML(error.message)}</div>`;
+    if (announce) toast(error.message, "error");
+    return null;
+  } finally {
+    state.pcActivitiesLoading = false;
+    if (state.pcActivities || state.pcDataTab !== "activities") renderPCDataPanel();
+  }
+}
+
+function stopPCActivityRefresh() {
+  if (state.pcActivityTimer) clearInterval(state.pcActivityTimer);
+  state.pcActivityTimer = null;
+}
+
+function startPCActivityRefresh() {
+  stopPCActivityRefresh();
+  if (state.pcDataTab !== "activities" || !selectors.pcDataDialog?.open) return;
+  state.pcActivityTimer = setInterval(() => {
+    if (document.visibilityState === "visible" && selectors.pcDataDialog?.open && state.pcDataTab === "activities") void loadPCActivities();
+  }, 5000);
+}
+
+async function selectPCDataTab(tab) {
+  if (!["overview", "storage", "activities"].includes(tab)) return;
+  state.pcDataTab = tab;
+  renderPCDataPanel();
+  if (tab === "storage" && !state.pcStorage) await loadPCStorage();
+  if (tab === "activities") await loadPCActivities();
+  startPCActivityRefresh();
 }
 
 function formatQuotaDuration(minutes) {
@@ -491,7 +689,7 @@ function humanStatus(ok, yes, no) {
 }
 
 function activeWorkspace() {
-  if (!state.activeProject) return state.installMode === "projects" ? "projects" : "system";
+  if (!state.activeProject) return "system";
   return state.activeProject.kind === "system" ? "system" : "projects";
 }
 
@@ -500,10 +698,6 @@ function workspaceGroup(workspace) {
 }
 
 function activeEventWorkspace() {
-  if (!state.activeProject && state.installMode === "projects") {
-    const project = state.projects.find(item => item.kind !== "system");
-    return project ? `project:${project.id}` : "projects";
-  }
   if (!state.activeProject) return "system";
   return state.activeProject.kind === "system" ? "system" : `project:${state.activeProject.id}`;
 }
@@ -757,6 +951,7 @@ async function unauthenticatedJSON(path, options = {}) {
 
 function setDeviceAuthOverlay(visible, message = "") {
   selectors.deviceAuthOverlay?.classList.toggle("hidden", !visible);
+  if (!visible) resetDeviceAuthAction();
   if (message && selectors.deviceAuthMessage) selectors.deviceAuthMessage.textContent = message;
 }
 
@@ -767,6 +962,33 @@ function setDeviceAuthBusy(busy, message = "Verificando a chave do dispositivo�
   }
   const retry = el("retry-device-auth");
   if (retry) retry.disabled = busy;
+}
+
+function resetDeviceAuthAction() {
+  const retry = el("retry-device-auth");
+  if (!retry) return;
+  delete retry.dataset.authAction;
+  retry.textContent = "Tentar novamente";
+  if (el("device-auth-title")) el("device-auth-title").textContent = "Autorizar este dispositivo";
+  const help = selectors.deviceAuthOverlay?.querySelector(".device-auth-help");
+  if (help) help.innerHTML = "No computador Linux, abra <strong>Configurações → Dispositivos remotos → Parear dispositivo</strong> e leia o QR Code.";
+}
+
+function showCloudflareReauthentication(detail = {}) {
+  const intervalDays = Math.max(1, Math.round(Number(detail.interval_seconds || 86_400) / 86_400));
+  setDeviceAuthBusy(false);
+  setDeviceAuthOverlay(
+    true,
+    `${detail.device_name || "Este navegador"} exige uma nova confirmação de identidade após ${intervalDays === 1 ? "1 dia" : `${intervalDays} dias`}.`,
+  );
+  const retry = el("retry-device-auth");
+  if (el("device-auth-title")) el("device-auth-title").textContent = "Reautenticar este navegador";
+  const help = selectors.deviceAuthOverlay?.querySelector(".device-auth-help");
+  if (help) help.textContent = "Você será desconectado do Cloudflare Access. Depois da confirmação de identidade, abra dex.sasocq.com novamente.";
+  if (retry) {
+    retry.dataset.authAction = "cloudflare-reauthenticate";
+    retry.textContent = "Reautenticar agora";
+  }
 }
 
 async function registerPairedDevice(token) {
@@ -886,11 +1108,12 @@ async function establishSession() {
   const contentType = response.headers.get("content-type") || "";
   const data = contentType.includes("application/json") ? await response.json() : await response.text();
   if (response.ok) {
+    resetDeviceAuthAction();
     setDeviceAuthOverlay(false);
     return data;
   }
   const detail = data && typeof data === "object" ? data.detail : null;
-  if (response.status !== 401 || detail?.code !== "device_auth_required") {
+  if (response.status !== 401 || !["device_auth_required", "device_reauth_required", "cloudflare_reauth_required"].includes(detail?.code)) {
     throw new Error(typeof detail === "string" ? detail : detail?.message || "Acesso negado");
   }
 
@@ -913,6 +1136,10 @@ async function establishSession() {
     if (detail.verified_enrollment_available) return await enrollVerifiedBrowser(detail);
   } catch (error) {
     console.warn("Autenticação vinculada ao dispositivo falhou", error);
+    if (error.detail?.code === "cloudflare_reauth_required") {
+      showCloudflareReauthentication(error.detail);
+      return null;
+    }
     if (error.status === 400 || error.status === 403 || /revog|inválid|expir/i.test(error.message)) {
       await removeDeviceCredential().catch(() => null);
     }
@@ -949,14 +1176,37 @@ async function api(path, options = {}) {
     await beginMicrosoftAuthentication(session, true);
     throw new Error("Confirmação forte solicitada no Microsoft Authenticator.");
   }
+  if (response.status === 401 && detail?.code === "cloudflare_reauth_required" && !isAuthEndpoint) {
+    await establishSession();
+    throw new Error("Reautenticação solicitada para este navegador.");
+  }
   if (response.status === 401 && !isAuthEndpoint && !options._retried) {
     await renewSession();
     return api(path, {...options, _retried:true});
   }
   if (!response.ok) {
-    throw new Error(typeof detail === "string" ? detail : detail?.message || JSON.stringify(detail || `HTTP ${response.status}`));
+    throw new Error(readableApiError(detail, response.status));
   }
   return data;
+}
+
+function readableApiError(detail, status = 0) {
+  const values = [];
+  const collect = value => {
+    if (typeof value === "string") values.push(value);
+    else if (value && typeof value === "object") {
+      for (const key of ["message", "error", "detail"]) collect(value[key]);
+    }
+  };
+  collect(detail);
+  const text = values.find(value => value.trim())?.trim()
+    || (detail && typeof detail === "object" ? JSON.stringify(detail) : String(detail || `HTTP ${status}`));
+  const gatewayHtml = status === 502 && (/<!doctype\s+html|<html[\s>]/i.test(text)
+    || (/\b502\b/.test(text) && /bad gateway|cloudflare/i.test(text)));
+  if (gatewayHtml) {
+    return "O serviço do Codex encontrou uma falha temporária de gateway (502) ao iniciar a conversa. Tente novamente em alguns instantes.";
+  }
+  return text.length > 1600 ? `${text.slice(0, 1600)}…` : text;
 }
 
 let sessionRenewalPromise = null;
@@ -996,6 +1246,8 @@ async function bootstrap() {
       await beginMicrosoftAuthentication(session, false);
       return;
     }
+    resolveDexSessionReady?.(session);
+    resolveDexSessionReady = null;
     connectEvents();
     registerServiceWorker();
 
@@ -1019,29 +1271,133 @@ async function initializeMainInterface() {
     publishCachedThreadSummaries();
     setConversationContextUI();
   }
-  await loadStatus();
+  const statusPromise = loadStatus({light:true});
   await loadProjects({loadConversationList:false});
+  await window.loadSiteAccessPolicies?.({policiesOnly:true}).catch(error => console.warn("Políticas de sites indisponíveis", error));
+  await statusPromise;
   void refreshUpdateControl();
   clearInterval(state.systemUpdateAutomaticTimer);
   state.systemUpdateAutomaticTimer = window.setInterval(() => {
-    if (document.visibilityState === "visible") void maybeStartAutomaticSystemUpdate();
+    // Releases are published independently by the rolling coordinator. Poll
+    // their status even when this tab did not previously know about a pending
+    // release, otherwise a long-lived PWA can keep an old JavaScript bundle.
+    if (document.visibilityState === "visible") void refreshUpdateControl();
   }, 5000);
-  await loadPCResources();
+  void loadPCResources();
   clearInterval(state.pcResourceTimer);
   state.pcResourceTimer = window.setInterval(() => {
     if (document.visibilityState === "visible") void loadPCResources();
   }, 60000);
   state.mainInterfaceReady = true;
-  await openNotificationTarget();
+  const openedNotificationTarget = await openNotificationTarget();
+  if (!openedNotificationTarget) await restoreComposerDraft();
   if (state.bridgeReady) {
     void Promise.all([loadModels(), loadAccount()]);
     if (!state.activeProject) void loadThreads();
   } else selectors.loginBanner.classList.add("hidden");
 }
 
+function shouldReloadForCompletedRollout(previous, current) {
+  if (!previous || current?.state !== "ready" || !current?.active_release) return false;
+  const previousActive = String(previous.active_release || "");
+  const currentActive = String(current.active_release || "");
+  return Boolean(
+    (previous.pending && !current.pending)
+    || (previousActive && currentActive !== previousActive)
+  );
+}
+
+function composerDraftText() {
+  return String(selectors.prompt?.value || "");
+}
+
+function persistComposerDraft() {
+  const text = composerDraftText();
+  if (!text) {
+    state.composerDraft = null;
+    try { localStorage.removeItem(COMPOSER_DRAFT_STORAGE_KEY); } catch {}
+    return null;
+  }
+  const previous = state.composerDraft || {};
+  const activeProjectId = String(state.activeProject?.id || "");
+  const draft = {
+    text:text.slice(0, 200000),
+    project_id:activeProjectId || String(previous.project_id || ""),
+    thread_id:activeProjectId
+      ? String(state.activeThreadId || "")
+      : String(previous.thread_id || ""),
+    updated_at:Date.now(),
+  };
+  state.composerDraft = draft;
+  try { localStorage.setItem(COMPOSER_DRAFT_STORAGE_KEY, JSON.stringify(draft)); }
+  catch { /* O rascunho continua no campo quando o armazenamento está indisponível. */ }
+  return draft;
+}
+
+function clearComposerDraft() {
+  state.composerDraft = null;
+  try { localStorage.removeItem(COMPOSER_DRAFT_STORAGE_KEY); }
+  catch { /* Não há ação adicional segura quando o armazenamento está indisponível. */ }
+}
+
+async function restoreComposerDraft() {
+  if (state.composerDraftRestored) return false;
+  state.composerDraftRestored = true;
+  const draft = state.composerDraft;
+  if (!draft?.text || composerDraftText()) return false;
+  const project = state.projects.find(item => item.id === draft.project_id);
+  if (project && state.activeProject?.id !== project.id) await selectProject(project.id);
+  if (project && draft.thread_id && state.activeThreadId !== draft.thread_id) await openThread(draft.thread_id);
+  if (composerDraftText()) return false;
+  selectors.prompt.value = draft.text;
+  autoResizePrompt();
+  selectors.prompt.focus();
+  toast("Seu rascunho foi restaurado.", "success");
+  return true;
+}
+
+function hasUnsentComposerDraft() {
+  return Boolean(composerDraftText().trim());
+}
+
+function requestSystemUpdateReload(delay = 0) {
+  if (delay > 0) {
+    if (state.systemUpdateReloadTimer) window.clearTimeout(state.systemUpdateReloadTimer);
+    state.systemUpdateReloadTimer = window.setTimeout(() => {
+      state.systemUpdateReloadTimer = null;
+      requestSystemUpdateReload();
+    }, delay);
+    return true;
+  }
+  if (hasUnsentComposerDraft()) {
+    persistComposerDraft();
+    state.systemUpdateReloadDeferred = true;
+    const button = el("system-update");
+    if (button) {
+      button.title = "Atualização concluída; o Dex recarregará depois que o rascunho for enviado ou apagado";
+      button.setAttribute("aria-label", button.title);
+    }
+    if (!state.systemUpdateReloadNotified) {
+      state.systemUpdateReloadNotified = true;
+      toast("Atualização pronta. O Dex preservará seu rascunho e recarregará depois que você o enviar ou apagar.", "success");
+    }
+    return false;
+  }
+  state.systemUpdateReloadDeferred = false;
+  clearComposerDraft();
+  window.location.reload();
+  return true;
+}
+
+function finishDeferredSystemUpdateReload() {
+  if (!state.systemUpdateReloadDeferred || hasUnsentComposerDraft()) return;
+  requestSystemUpdateReload(400);
+}
+
 async function refreshUpdateControl() {
   const button = el("system-update");
   if (!button) return null;
+  const previousRollout = state.systemUpdate;
   let rollout = null;
   try {
     rollout = await api("/api/update/status");
@@ -1088,6 +1444,10 @@ async function refreshUpdateControl() {
     button.disabled = !pending;
     const automaticToggle = el("settings-system-update-automatic");
     if (automaticToggle) automaticToggle.checked = state.systemUpdateAutomatic;
+    if (shouldReloadForCompletedRollout(previousRollout, rollout)) {
+      requestSystemUpdateReload();
+      return rollout;
+    }
     if (pending) window.setTimeout(() => void maybeStartAutomaticSystemUpdate(), 1000);
     return rollout;
   } catch (_) {
@@ -1126,15 +1486,15 @@ async function maybeStartAutomaticSystemUpdate() {
     // The rolling coordinator starts automatic releases itself. While it is
     // waiting for active turns, keep the Dex fully usable and do not present a
     // progress dialog: no implementation work has begun yet.
-    const previousPendingRelease = String(state.systemUpdate?.pending_release || "");
+    const previousRollout = state.systemUpdate;
     const rollout = await api("/api/update/status");
     state.systemUpdate = rollout;
     if (!rollout.pending) {
       button.dataset.updatePending = "false";
       button.classList.remove("update-ready");
       button.disabled = true;
-      if (rollout.state === "ready" && previousPendingRelease && rollout.active_release === previousPendingRelease) {
-        window.location.reload();
+      if (shouldReloadForCompletedRollout(previousRollout, rollout)) {
+        requestSystemUpdateReload();
       }
       return;
     }
@@ -1179,7 +1539,7 @@ async function waitForUpdatedBackend() {
     try {
       const response = await fetch(`/api/health?rollout=${Date.now()}`, {cache:"no-store"});
       if (response.ok) {
-        window.location.reload();
+        requestSystemUpdateReload();
         return;
       }
     } catch (_) {}
@@ -1249,7 +1609,7 @@ async function monitorInitialSystemUpdate() {
         showSystemUpdateProgress(progress.percent, progress.message || "Atualizando o sistema…");
         if (progress.state === "complete") {
           el("system-update-progress-close").disabled = false;
-          window.setTimeout(() => window.location.reload(), 1200);
+          requestSystemUpdateReload(1200);
           return;
         }
         if (["failed", "rolled-back"].includes(progress.state)) {
@@ -1274,7 +1634,7 @@ async function monitorRollingSystemUpdate() {
       showSystemUpdateProgress(rollout.percent, rollout.message || rollout.error || "Atualizando o sistema…");
       if (["ready", "rolled_back", "failed"].includes(rollout.state) && Number(rollout.percent) >= 100) {
         el("system-update-progress-close").disabled = false;
-        if (rollout.state === "ready") window.setTimeout(() => window.location.reload(), 400);
+        if (rollout.state === "ready") requestSystemUpdateReload(400);
         return;
       }
     } catch (_) {
@@ -1377,11 +1737,9 @@ async function openNotificationTarget(payload = null) {
   return true;
 }
 
-async function loadStatus() {
-  const data = await api("/api/status");
+async function loadStatus({light = false} = {}) {
+  const data = await api(light ? "/api/status?light=true" : "/api/status");
   state.lastStatus = data;
-  state.installMode = data.app?.install_mode === "projects" ? "projects" : "full";
-  document.body.dataset.installMode = state.installMode;
   const legacy = data.bridge || {};
   state.bridges = {
     system: {...(data.bridges?.system || legacy)},
@@ -1406,9 +1764,6 @@ async function loadProjects({loadConversationList = true} = {}) {
   try { localStorage.setItem(PROJECT_CATALOG_CACHE_KEY, JSON.stringify(state.projects)); }
   catch { /* The live catalog remains available when browser storage is full. */ }
   if (state.activeProject) state.activeProject = state.projects.find(item => item.id === state.activeProject.id) || null;
-  if (!state.activeProject && state.installMode === "projects") {
-    state.activeProject = state.projects.find(item => item.kind !== "system") || null;
-  }
   renderProjects();
   setConversationContextUI();
   if (loadConversationList) await loadThreads();
@@ -1425,7 +1780,8 @@ async function loadModels(workspace = activeWorkspace()) {
     state.models.forEach(model => {
       const option = document.createElement("option");
       option.value = model.id || model.model;
-      option.textContent = model.displayName || model.model || model.id;
+      const retirement = model.upgradeInfo?.retirementAt || model.retirementAt;
+      option.textContent = `${model.displayName || model.model || model.id}${retirement ? " • migração necessária" : ""}`;
       option.title = model.description || option.textContent;
       selectors.model.appendChild(option);
     });
@@ -1537,6 +1893,15 @@ function effortName(value) {
 
 function syncModelDependentControls() {
   const model = state.models.find(item => (item.id || item.model) === selectors.model.value);
+  const lifecycle = el("model-lifecycle-warning");
+  const upgrade = model?.upgradeInfo || {};
+  const retirement = upgrade.retirementAt || model?.retirementAt;
+  if (lifecycle) {
+    const replacement = upgrade.replacementModel || upgrade.replacement || upgrade.model || "um modelo atual";
+    const retirementText = retirement ? formatTime(epochMilliseconds(retirement)) : "em breve";
+    lifecycle.textContent = retirement ? `Este modelo será retirado em ${retirementText}. Migre para ${replacement}.` : "";
+    lifecycle.classList.toggle("hidden", !retirement);
+  }
   const efforts = (model?.supportedReasoningEfforts || []).map(item => typeof item === "string"
     ? {reasoningEffort:item, description:""}
     : item).filter(item => item.reasoningEffort);
@@ -1608,13 +1973,6 @@ async function loadAccount(options = {}, workspace = activeWorkspace()) {
     addActivity(`Conta • ${workspaceLabel(workspace)}`, error.message, "error");
     return null;
   }
-}
-
-async function loadConfiguredAccounts() {
-  if (state.installMode === "projects") {
-    return Promise.all([loadAccount({}, "projects")]);
-  }
-  return Promise.all([loadAccount({}, "system"), loadAccount({}, "projects")]);
 }
 
 function updateMobileNavigationAuth() {
@@ -2439,6 +2797,7 @@ async function clearProjectSelection() {
   setConversationContextUI();
   updateRunningUI();
   closeMobilePanels();
+  syncApprovalInspectorAutoOpen({force:true});
   await loadThreads();
 }
 
@@ -2767,6 +3126,54 @@ async function selectProject(projectId) {
   });
 }
 
+function epochMilliseconds(value) {
+  if (typeof value === "number" && Number.isFinite(value)) return value < 1e12 ? value * 1000 : value;
+  const parsed = Date.parse(value || "");
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function conversationExecutionTiming(thread) {
+  let completedMs = 0;
+  let activeStartedAt = 0;
+  let firstStartedAt = 0;
+  let turnCount = 0;
+  for (const turn of thread?.turns || []) {
+    const startedAt = epochMilliseconds(turn?.startedAt ?? turn?.started_at);
+    const completedAt = epochMilliseconds(turn?.completedAt ?? turn?.completed_at);
+    const durationMs = Number(turn?.durationMs ?? turn?.duration_ms);
+    const status = String(turn?.status || "").toLowerCase();
+    if (startedAt && (!firstStartedAt || startedAt < firstStartedAt)) firstStartedAt = startedAt;
+    turnCount += 1;
+    if (!completedAt && ["inprogress", "in_progress", "running"].includes(status)) {
+      activeStartedAt = startedAt;
+      continue;
+    }
+    if (Number.isFinite(durationMs) && durationMs >= 0) completedMs += durationMs;
+    else if (startedAt && completedAt >= startedAt) completedMs += completedAt - startedAt;
+  }
+  return {
+    completed_ms:Math.max(0, Math.round(completedMs)),
+    active_started_at:activeStartedAt,
+    first_started_at:firstStartedAt,
+    turn_count:turnCount,
+  };
+}
+
+async function enrichActiveThreadExecution(project, threads) {
+  const active = threads.filter(thread => thread?.status?.type === "active" && thread.id);
+  await Promise.all(active.map(async thread => {
+    try {
+      const query = new URLSearchParams({project_id:project.id});
+      const data = await api(`/api/threads/${encodeURIComponent(thread.id)}?${query}`);
+      if (!data?.thread) return;
+      thread.clc = {...(thread.clc || {}), execution_timing:conversationExecutionTiming(data.thread)};
+    } catch (error) {
+      console.warn(`Não foi possível calcular o tempo acumulado da conversa ${thread.id}:`, error);
+    }
+  }));
+  return threads;
+}
+
 async function loadThreads() {
   const generation = ++state.threadLoadGeneration;
   const projects = state.activeProject ? [state.activeProject] : [...state.projects];
@@ -2805,6 +3212,8 @@ async function loadThreads() {
             _projectKind:project.kind,
           };
         });
+        await enrichActiveThreadExecution(project, threads);
+        if (generation !== state.threadLoadGeneration) return;
         state.projectThreads.set(project.id, threads);
         results[index] = threads;
         state.projectActivity.set(project.id, threads.reduce((latest, thread) => Math.max(latest, threadActivityTimestamp(thread)), 0));
@@ -2859,6 +3268,55 @@ function threadStatus(thread) {
   return "";
 }
 
+function accumulatedThreadExecutionMs(thread, now = Date.now()) {
+  const timing = thread?.clc?.execution_timing || {};
+  const completed = Math.max(0, Number(timing.completed_ms || 0));
+  const activeStartedAt = Math.max(0, Number(timing.active_started_at || 0));
+  return completed + (activeStartedAt ? Math.max(0, now - activeStartedAt) : 0);
+}
+
+function formatAccumulatedExecution(milliseconds) {
+  const seconds = Math.max(0, Math.floor(Number(milliseconds || 0) / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}min ${String(seconds % 60).padStart(2, "0")}s`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ${String(minutes % 60).padStart(2, "0")}min`;
+  return `${Math.floor(hours / 24)}d ${String(hours % 24).padStart(2, "0")}h`;
+}
+
+function threadExecutionTimeHTML(thread) {
+  const timing = thread?.clc?.execution_timing;
+  if (!timing || !Number(timing.turn_count || 0)) return "";
+  const completed = Math.max(0, Number(timing.completed_ms || 0));
+  const running = thread?.status?.type === "active";
+  const activeStartedAt = running ? Math.max(0, Number(timing.active_started_at || 0)) : 0;
+  const elapsed = formatAccumulatedExecution(completed + (activeStartedAt ? Math.max(0, Date.now() - activeStartedAt) : 0));
+  const label = running ? "Tempo acumulado de execução" : "Tempo total de execução";
+  return `<span class="thread-execution-time" data-thread-execution-time data-completed-ms="${completed}" data-active-started-at="${activeStartedAt}" aria-label="${label}: ${escapeHTML(elapsed)}" title="${label}; intervalos aguardando nova solicitação não são contados">◷ ${escapeHTML(elapsed)}</span>`;
+}
+
+function refreshThreadExecutionTimes() {
+  document.querySelectorAll("[data-thread-execution-time]").forEach(node => {
+    const completed = Math.max(0, Number(node.dataset.completedMs || 0));
+    const activeStartedAt = Math.max(0, Number(node.dataset.activeStartedAt || 0));
+    const elapsed = formatAccumulatedExecution(completed + (activeStartedAt ? Math.max(0, Date.now() - activeStartedAt) : 0));
+    node.textContent = `◷ ${elapsed}`;
+    node.setAttribute("aria-label", `Tempo acumulado de execução: ${elapsed}`);
+  });
+}
+
+function syncThreadExecutionTicker() {
+  const hasActiveTimes = [...document.querySelectorAll("[data-thread-execution-time]")]
+    .some(node => Number(node.dataset.activeStartedAt || 0) > 0);
+  if (hasActiveTimes && !state.threadExecutionTicker) {
+    state.threadExecutionTicker = setInterval(refreshThreadExecutionTimes, 1000);
+  } else if (!hasActiveTimes && state.threadExecutionTicker) {
+    clearInterval(state.threadExecutionTicker);
+    state.threadExecutionTicker = null;
+  }
+}
+
 function threadUserActionLabel(thread) {
   return String(thread?.clc?.awaiting_user_action_label || "Responder ao Codex");
 }
@@ -2888,7 +3346,7 @@ function threadWaitingKind(value) {
 
 function requestWaitingKind(method, params = {}) {
   if (method === "item/tool/requestUserInput" && params.isBlocking === false) return "";
-  if (["item/tool/requestUserInput", "mcpServer/elicitation/request"].includes(method)) return "input";
+  if (["item/tool/requestUserInput", "mcpServer/elicitation/request", "browser/credentials/request", "browser/payment-card/request"].includes(method)) return "input";
   if (["item/commandExecution/requestApproval", "item/fileChange/requestApproval", "item/permissions/requestApproval"].includes(method)) return "approval";
   return "";
 }
@@ -2919,6 +3377,8 @@ function userActionLabel(approval) {
     if (/confirm|approve|allow|permit|autorize|autoriza|aprovar|permitir/i.test(actionText)) return "Confirmar ação";
     return "Responder à ferramenta";
   }
+  if (method === "browser/credentials/request") return "Informar credenciais";
+  if (method === "browser/payment-card/request") return "Informar cartão com segurança";
   return "Responder ao Codex";
 }
 
@@ -3396,8 +3856,10 @@ async function runThreadSearch(rawQuery, generation) {
 }
 
 function handleThreadSearchInput() {
+  const searchInput = el("thread-search");
+  if (!searchInput) return;
   clearTimeout(state.threadSearch.timer);
-  const rawQuery = el("thread-search").value.replace(/\s+/g, " ").trim();
+  const rawQuery = searchInput.value.replace(/\s+/g, " ").trim();
   const query = normalizeThreadSearchText(rawQuery);
   const generation = ++state.threadSearch.generation;
   state.threadSearch.query = query;
@@ -3412,7 +3874,9 @@ function handleThreadSearchInput() {
 }
 
 function renderThreads() {
-  const query = normalizeThreadSearchText(el("thread-search").value);
+  const searchInput = el("thread-search");
+  if (!searchInput) return;
+  const query = normalizeThreadSearchText(searchInput.value);
   selectors.threadList.innerHTML = "";
   const filtered = query
     ? mergedThreadSearchCandidates()
@@ -3442,6 +3906,7 @@ function renderThreads() {
     if (detail) detail.textContent = state.threadSearch.error || (query
       ? "Tente outras palavras do título ou da solicitação."
       : "Selecione um projeto e inicie uma nova conversa.");
+    syncThreadExecutionTicker();
     return;
   }
   const visibleThreads = query ? filtered : state.activeProject ? filtered.slice(0, PROJECT_CONVERSATION_LIMIT) : filtered;
@@ -3462,13 +3927,15 @@ function renderThreads() {
       : statusClass === "waiting"
         ? `<span class="thread-state waiting">${escapeHTML(waitingLabel)}</span>`
         : statusClass === "active" ? '<span class="thread-state active">Em execução</span>' : "";
-    button.innerHTML = `<span class="nav-dot ${statusClass}"></span><span class="nav-copy"><span class="recent-thread-meta"><span class="project-badge">${escapeHTML(projectName)}</span>${statusLabel}<time>${escapeHTML(formatTime(activity) || "")}</time></span><span class="nav-title">${escapeHTML(title)}</span><span class="nav-preview">${escapeHTML(preview || "")}</span></span><span class="recent-thread-arrow" aria-hidden="true">›</span>`;
+    const executionTime = threadExecutionTimeHTML(thread);
+    button.innerHTML = `<span class="nav-dot ${statusClass}"></span><span class="nav-copy"><span class="recent-thread-meta"><span class="project-badge">${escapeHTML(projectName)}</span>${statusLabel}${executionTime}<time>${escapeHTML(formatTime(activity) || "")}</time></span><span class="nav-title">${escapeHTML(title)}</span><span class="nav-preview">${escapeHTML(preview || "")}</span></span><span class="recent-thread-arrow" aria-hidden="true">›</span>`;
     button.addEventListener("click", async () => {
       if (thread._projectId && state.activeProject?.id !== thread._projectId) await selectProject(thread._projectId);
       await openThread(thread.id);
     });
     selectors.threadList.appendChild(button);
   });
+  syncThreadExecutionTicker();
 }
 
 async function openThread(threadId) {
@@ -3485,6 +3952,7 @@ async function openThread(threadId) {
   state.activeTurnId = null;
   state.turnSubmissionPending = false;
   state.items.clear();
+  state.activity = [];
   state.diff = "";
   selectors.title.textContent = conversationTitle(threadSummary);
   el("rename-thread").disabled = false;
@@ -3492,6 +3960,7 @@ async function openThread(threadId) {
   renderThreads();
   renderMessages();
   renderApprovals();
+  renderActivity();
   renderDiff();
   updateRunningUI();
   closeMobilePanels();
@@ -3547,9 +4016,13 @@ function hydrateThread(thread) {
 
 async function newThread() {
   if (!state.activeProject) {
-    toast("Selecione um projeto para iniciar uma nova conversa.");
-    selectors.sidebar.classList.add("open");
-    return;
+    const defaultProject = state.projects.find(project => project.kind === "system") || state.projects[0];
+    if (!defaultProject) {
+      toast("Adicione um projeto para iniciar uma nova conversa.", "error");
+      selectors.sidebar.classList.add("open");
+      return;
+    }
+    await selectProject(defaultProject.id);
   }
   state.conversationViewGeneration += 1;
   state.conversationAutoFollow = true;
@@ -3742,6 +4215,11 @@ function browserActivityGroupCard(item) {
       ? `<div class="browser-session-preview-empty" data-browser-preview-empty aria-hidden="true"><span>◉</span><strong>${escapeHTML(host)}</strong><small>Carregando a última página aberta…</small></div><img class="browser-session-preview-image" src="/api/remote-desktop/browser-preview?${escapeHTML(previewQuery.toString())}" alt="Print da última página aberta em ${escapeHTML(host)}" data-browser-preview-image hidden>`
     : `<div class="browser-session-preview-empty" aria-hidden="true"><span>◉</span><strong>${escapeHTML(host)}</strong><small>A página ao vivo abre no visor seguro.</small></div>`;
   const details = activities.map(activity => `${activity.server || "MCP"}/${activity.tool || ""}`).join("\n");
+  const readOnlyLiveView = Boolean(state.session?.read_only_automation);
+  const liveButtonLabel = readOnlyLiveView ? "Ver ao vivo" : "Ver e controlar ao vivo";
+  const liveHint = readOnlyLiveView
+    ? "Mostra a mesma janela usada pelo Codex sem enviar mouse, teclado ou alterações."
+    : "Mostra a mesma janela usada pelo Codex; mouse, toque e teclado ficam disponíveis.";
   return `<article class="message-card tool browser-session-card" data-item-id="${escapeHTML(item.id || "")}" data-browser-status="${status}">
     <div class="browser-session-header">
       <span class="browser-session-icon" aria-hidden="true">◉</span>
@@ -3750,8 +4228,8 @@ function browserActivityGroupCard(item) {
     </div>
     <div class="browser-session-preview">${visual}</div>
     <div class="browser-session-actions">
-      <button type="button" class="primary-button browser-session-open" data-browser-open="${escapeHTML(url)}"><span aria-hidden="true">◉</span><span>Ver e controlar ao vivo</span></button>
-      <span class="browser-session-hint">Mostra a mesma janela usada pelo Codex; mouse, toque e teclado ficam disponíveis.</span>
+      <button type="button" class="primary-button browser-session-open" data-browser-open="${escapeHTML(url)}"><span aria-hidden="true">◉</span><span>${liveButtonLabel}</span></button>
+      <span class="browser-session-hint">${liveHint}</span>
       ${technicalDetails(`<pre class="tool-output">${escapeHTML(details)}</pre>`)}
     </div>
   </article>`;
@@ -3996,6 +4474,7 @@ function refreshExecutionStatusClock() {
       ? (quietSeconds < 15 ? "Recebendo atualizações" : `Aguardando a próxima atualização há ${compactElapsed(now - activityAt)}`)
       : "Reconectando ao acompanhamento; a execução pode continuar no servidor";
   });
+  renderInspectorSummary();
 }
 
 function syncExecutionTicker() {
@@ -4139,9 +4618,12 @@ function renderMessages() {
   state.browserPreviewGroupId = items.find(item => item?.type === "browserActivityGroup")?.id || "";
   const visibleItems = items.slice(0, state.messageRenderLimit);
   selectors.empty.classList.toggle("hidden", items.length > 0);
-  const approvals = [...state.approvals.values()]
+  const activeApprovals = [...state.approvals.values()]
     .filter(approval => !approval.resolved && approvalBelongsToActiveThread(approval))
-    .reverse()
+    .reverse();
+  const credentialApprovals = activeApprovals.filter(isCredentialElicitation);
+  const approvals = activeApprovals
+    .filter(approval => !isCredentialElicitation(approval))
     .map(approval => approvalCardHTML(approval, true));
   const older = items.length > visibleItems.length
     ? `<button type="button" class="secondary-button load-older-messages" data-load-older-messages>Mostrar mais ${Math.min(100, items.length - visibleItems.length)} itens anteriores</button>`
@@ -4150,7 +4632,10 @@ function renderMessages() {
   const attentionStack = attentionCards.length
     ? `<div class="conversation-attention-stack" aria-label="Atividade e aprovações da conversa">${attentionCards.join("")}</div>`
     : "";
-  selectors.messageList.innerHTML = [attentionStack, ...visibleItems.map(itemCard), older].filter(Boolean).join("");
+  const credentialModal = credentialApprovals.length
+    ? `<div class="credential-modal-layer" role="dialog" aria-label="Credenciais protegidas"><div class="credential-modal-stack">${credentialApprovals.map(approval => approvalCardHTML(approval, true)).join("")}</div></div>`
+    : "";
+  selectors.messageList.innerHTML = [credentialModal, attentionStack, ...visibleItems.map(itemCard), older].filter(Boolean).join("");
   armBrowserSessionPreviews();
   // Restore before the browser paints the replaced list. Waiting only for the
   // next frame exposes one displaced frame and makes the top appear to jump
@@ -4205,6 +4690,7 @@ async function sendMessage() {
   clearThreadTerminalStatus(initialThreadId);
   setThreadAwaitingUserAction(initialThreadId, false);
   const messageReferences = (state.references || []).map(reference => ({...reference}));
+  persistComposerDraft();
   selectors.prompt.value = "";
   autoResizePrompt();
   addLocalUserMessage(message, messageReferences);
@@ -4256,12 +4742,14 @@ async function sendMessage() {
         return;
       }
     }
+    clearComposerDraft();
     state.turnSubmissionPending = false;
     if (data.queued) {
       state.activeTurnId = data.turn?.id || state.activeTurnId;
       updateRunningUI();
       if (typeof loadOperationQueue === "function") await loadOperationQueue();
       toast("Mensagem preservada na fila para depois da execução atual.", "success");
+      finishDeferredSystemUpdateReload();
       return;
     }
     if (data.toolProfile) state.toolProfile = normalizeToolProfile(data.toolProfile);
@@ -4272,6 +4760,7 @@ async function sendMessage() {
     if (typeof renderOperationReferences === "function") renderOperationReferences();
     if (typeof window.renderComposerMode === "function") window.renderComposerMode();
     updateRunningUI();
+    finishDeferredSystemUpdateReload();
     await loadThreads();
   } catch (error) {
     if (state.conversationViewGeneration !== viewGeneration) {
@@ -4280,6 +4769,11 @@ async function sendMessage() {
     }
     clearLocalActivity();
     state.turnSubmissionPending = false;
+    if (!composerDraftText()) {
+      selectors.prompt.value = message;
+      autoResizePrompt();
+      persistComposerDraft();
+    }
     state.items.set(`error-${crypto.randomUUID()}`, {id:crypto.randomUUID(), type:"error", message:error.message});
     state.activeTurnId = null;
     setStatus("error", "Falha");
@@ -4305,6 +4799,7 @@ function updateRunningUI() {
   if (running) setStatus("busy", executionWaitingState() ? activeUserActionLabel() : "Executando");
   else if (activeBridge().initialized) syncActiveBridgeUI();
   syncExecutionTicker();
+  renderInspectorSummary();
   renderMessages();
 }
 
@@ -4395,14 +4890,19 @@ function handleEvent(event) {
       markBridgeExecutionsFailed(rawWorkspace, event.error || (event.returncode !== undefined ? `código ${event.returncode}` : ""));
     }
     if (active) syncActiveBridgeUI();
-    else addActivity(`${workspaceLabel(rawWorkspace)} • estado`, event.status === "ready" ? "Pronto" : (event.error || event.status));
     if (state.setup.active) refreshSetupState().catch(console.error);
     return;
   }
   if (event.kind === "server_request") {
     const request = event.request;
-    const approval = {id:request.id, method:request.method, params:request.params || {}, workspace:rawWorkspace, resolved:false, receivedAt:Date.now()};
     const approvalKey = `${rawWorkspace}:${request.id}`;
+    const previousApproval = state.approvals.get(approvalKey);
+    // Credential requests are intentionally replayed so a suspended PWA can
+    // recover them. Once rendered, keep the existing DOM untouched: replacing
+    // it would clear selection, focus and partially typed values. A delayed
+    // replay must not resurrect a request that was already resolved either.
+    if (previousApproval) return;
+    const approval = {id:request.id, method:request.method, params:request.params || {}, workspace:rawWorkspace, resolved:false, receivedAt:previousApproval?.receivedAt || Date.now()};
     state.approvals.set(approvalKey, approval);
     const waitingKind = requestWaitingKind(request.method, request.params || {});
     const requestThreadId = String(request.params?.threadId || "");
@@ -4419,7 +4919,18 @@ function handleEvent(event) {
       renderMessages();
       setStatus("busy", waitingKind ? userActionLabel(approval) : "Executando");
     }
-    if (window.Notification?.permission === "granted" && waitingKind) new Notification(`${workspaceLabel(rawWorkspace)} • ${userActionLabel(approval)}`, {body:approvalTitle(request.method, request.params || {})});
+    if (!previousApproval && window.Notification?.permission === "granted" && waitingKind) new Notification(`${workspaceLabel(rawWorkspace)} • ${userActionLabel(approval)}`, {body:approvalTitle(request.method, request.params || {})});
+    return;
+  }
+  if (event.kind === "browser_credentials_resolved") {
+    const key = `${rawWorkspace}:${String(event.request_id || "")}`;
+    const approval = state.approvals.get(key);
+    if (approval) approval.resolved = true;
+    const requestThreadId = String(event.thread_id || approval?.params?.threadId || "");
+    if (requestThreadId) syncThreadWaitingStatus(requestThreadId);
+    renderApprovals();
+    if (requestThreadId === state.activeThreadId) renderMessages();
+    updateRunningUI();
     return;
   }
   if (event.kind !== "notification") return;
@@ -4488,11 +4999,10 @@ function handleEvent(event) {
     }
     renderApprovals();
     if (belongsToActiveThread) updateRunningUI();
-    addActivity("Recuperação automática", `Solicitação expirada após ${compactElapsed(Number(params.waitedSeconds || 0) * 1000)}.`, "error");
+    if (belongsToActiveThread) addActivity("Recuperação automática", `Solicitação expirada após ${compactElapsed(Number(params.waitedSeconds || 0) * 1000)}.`, "error");
     return;
   }
   if (!active) {
-    addActivity(`${workspaceLabel(rawWorkspace)} • ${method}`, summarizeEvent(params));
     if (["account/updated", "account/login/completed"].includes(method)) {
       loadAccount({}, workspaceGroup(rawWorkspace));
       if (method === "account/login/completed" && params.success && state.loginWorkspace === workspace) {
@@ -4505,7 +5015,6 @@ function handleEvent(event) {
     return;
   }
   if (params.threadId && params.threadId !== state.activeThreadId) {
-    addActivity(method, summarizeEvent(params));
     if (["thread/status/changed", "turn/completed"].includes(method)) loadThreads();
     return;
   }
@@ -4613,12 +5122,311 @@ function completedTurnUserAction(turn = {}) {
 }
 
 function approvalTitle(method, params) {
-  if (method === "item/commandExecution/requestApproval") return params.reason || "Executar comando";
-  if (method === "item/fileChange/requestApproval") return params.reason || "Alterar arquivos";
-  if (method === "item/permissions/requestApproval") return params.reason || "Conceder permissões";
-  if (method === "mcpServer/elicitation/request") return params.message || "Responder à ferramenta";
+  if (method === "item/commandExecution/requestApproval") return "Autorizar execução de comando";
+  if (method === "item/fileChange/requestApproval") return "Autorizar alteração de arquivos";
+  if (method === "item/permissions/requestApproval") return "Conceder permissões solicitadas";
+  if (method === "mcpServer/elicitation/request") {
+    if (isCredentialElicitation({method, params})) return "Entrar com segurança";
+    const {tool} = mcpApprovalIdentity(params);
+    if (tool === "browser_run_code_unsafe") return "Executar código avançado no navegador";
+    return params.message || "Responder à ferramenta";
+  }
+  if (method === "browser/credentials/request") {
+    const site = String(params.message || "").split("\n")[1] || "site";
+    return `Entrar em ${site}`;
+  }
+  if (method === "browser/payment-card/request") {
+    const site = String(params.message || "").split("\n")[1] || "site";
+    return `Preencher cartão em ${site}`;
+  }
   if (method === "item/tool/requestUserInput") return params.questions?.[0]?.header || "Sua resposta é necessária";
-  return method;
+  return params.title || params.reason || params.message || "Confirmar operação";
+}
+
+function mcpApprovalIdentity(params = {}) {
+  const message = String(params.message || "");
+  const parsed = message.match(/Allow the\s+(.+?)\s+MCP server\s+to run tool\s+["']([^"']+)["']/i);
+  return {
+    server:String(params.serverName || params.server || parsed?.[1] || "MCP").trim(),
+    tool:String(params.toolName || params.tool || parsed?.[2] || "ferramenta não identificada").trim(),
+  };
+}
+
+function mcpApprovalCapability(server, tool) {
+  const name = `${server} ${tool}`.toLowerCase();
+  if (tool === "browser_run_code_unsafe") return {
+    level:"high",
+    label:"Risco elevado",
+    summary:"Executar um trecho de JavaScript/Playwright no processo do navegador, com acesso às páginas abertas e à sessão autenticada desta conversa.",
+    reason:"Esta capacidade é marcada como unsafe porque o código pode ler dados da página, navegar, clicar, preencher campos e executar ações com alcance equivalente ao processo do servidor Playwright.",
+  };
+  if (/browser_evaluate/.test(name)) return {
+    level:"medium",
+    label:"Acesso à página",
+    summary:"Executar JavaScript dentro da página aberta para consultar ou operar elementos que as ações comuns do navegador não alcançam.",
+    reason:"O código executado pode ler e alterar o conteúdo da página atual, inclusive dados visíveis na sessão autenticada.",
+  };
+  if (/playwright|browser|chrome/.test(name)) return {
+    level:"medium",
+    label:"Controle do navegador",
+    summary:"Permitir que a ferramenta opere a página aberta nesta conversa.",
+    reason:"A aprovação é solicitada porque a operação pode usar a sessão autenticada, navegar ou interagir com conteúdo da página.",
+  };
+  if (/desktop|computer|screen/.test(name)) return {
+    level:"high",
+    label:"Controle da interface",
+    summary:"Permitir que a ferramenta opere a interface gráfica do computador.",
+    reason:"A operação pode agir em aplicativos visíveis usando mouse, teclado ou recursos da sessão gráfica.",
+  };
+  return {
+    level:"medium",
+    label:"Ferramenta externa",
+    summary:`Permitir a execução de ${tool} pelo servidor ${server}.`,
+    reason:"O servidor MCP pediu uma confirmação explícita antes de continuar esta etapa.",
+  };
+}
+
+function mcpApprovalToolCall(server, tool) {
+  const serverKey = String(server || "").toLowerCase();
+  const toolKey = String(tool || "").toLowerCase();
+  const matches = [...state.items.values()].filter(item => item?.type === "mcpToolCall"
+    && String(item.server || "").toLowerCase() === serverKey
+    && String(item.tool || "").toLowerCase() === toolKey);
+  return [...matches].reverse().find(item => (item.status || "inProgress") === "inProgress")
+    || matches.at(-1)
+    || null;
+}
+
+function approvalContextText() {
+  const message = [...state.items.values()].reverse().find(item => ["agentMessage", "assistantMessage", "agent_message"].includes(item?.type));
+  return String(message ? extractContent(message) : "").replace(/\s+/g, " ").trim().slice(0, 900);
+}
+
+function sanitizeApprovalString(value) {
+  return String(value)
+    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, "[token oculto]")
+    .replace(/\bBearer\s+[A-Za-z0-9._~+\/-]+=*/gi, "Bearer [oculto]")
+    .replace(/([?&](?:access_token|token|key|secret|password)=)[^&\s'"`]+/gi, "$1[oculto]")
+    .replace(/\b(authorization|cookie|password|passwd|secret|api[_-]?key|token)(\s*[:=]\s*)(["'`])[^"'`\n]+\3/gi, "$1$2$3[oculto]$3");
+}
+
+function sanitizedApprovalValue(value, key = "", seen = new Set()) {
+  if (value == null || typeof value === "number" || typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    if (key !== "code" && /password|passwd|secret|token|cookie|authorization|credential|api[_-]?key/i.test(key)) return "[oculto]";
+    return sanitizeApprovalString(value);
+  }
+  if (typeof value !== "object" || seen.has(value)) return "[valor não exibido]";
+  seen.add(value);
+  if (Array.isArray(value)) return value.map(item => sanitizedApprovalValue(item, key, seen));
+  return Object.fromEntries(Object.entries(value).map(([childKey, child]) => [childKey, sanitizedApprovalValue(child, childKey, seen)]));
+}
+
+function approvalRelatedItem(params = {}, type = "") {
+  const ids = [params.itemId, params.commandExecutionId, params.fileChangeId].filter(Boolean);
+  for (const id of ids) {
+    const item = state.items.get(id);
+    if (item && (!type || item.type === type)) return item;
+  }
+  const matches = [...state.items.values()].filter(item => !type || item?.type === type);
+  const active = matches.filter(item => (item.status || "inProgress") === "inProgress");
+  return active.length === 1 ? active[0] : null;
+}
+
+function approvalTechnicalText(params = {}, fallback = "Nenhum detalhe técnico adicional foi fornecido.") {
+  const technical = sanitizedApprovalValue(params);
+  if (technical && typeof technical === "object" && technical.requestedSchema
+      && typeof technical.requestedSchema === "object" && !Object.keys(technical.requestedSchema).length) delete technical.requestedSchema;
+  const text = JSON.stringify(technical, null, 2);
+  return text && text !== "{}" ? text.slice(0, 12000) : fallback;
+}
+
+function approvalRisk(method, params = {}, relatedItem = null) {
+  const technical = JSON.stringify(sanitizedApprovalValue({params, relatedItem})).toLowerCase();
+  const command = commandText(params.command || relatedItem?.command).toLowerCase();
+  const combined = `${technical} ${command}`;
+  if (/\b(?:rm\s+-rf|mkfs|wipefs|dd\s+if=|delete|destroy|erase|excluir|apagar|remover|destruir|reboot|shutdown|poweroff)\b/.test(combined)) {
+    return {level:"high", label:"Risco elevado"};
+  }
+  if (method === "item/commandExecution/requestApproval" && /\b(?:sudo|systemctl|service|apt|dpkg|install|deploy|chmod|chown)\b/.test(combined)) {
+    return {level:"high", label:"Ação administrativa"};
+  }
+  if (method === "item/fileChange/requestApproval") return {level:"medium", label:"Altera arquivos"};
+  if (method === "item/permissions/requestApproval") return {level:"medium", label:"Amplia acesso"};
+  return {level:"medium", label:"Confirmação necessária"};
+}
+
+function approvalContextRow() {
+  const context = approvalContextText();
+  return context
+    ? `<div><dt>Finalidade informada nesta etapa</dt><dd>${escapeHTML(sanitizeApprovalString(context))}</dd></div>`
+    : `<div><dt>Finalidade informada nesta etapa</dt><dd>O Codex não forneceu uma descrição adicional antes desta solicitação.</dd></div>`;
+}
+
+function approvalExplanationShell({risk, summary, rows, technicalLabel = "Ver detalhes técnicos", technicalText}) {
+  return `<div class="approval-explanation" data-risk="${escapeHTML(risk.level)}">
+    <div class="approval-explanation-head"><strong>O que será autorizado</strong><span class="approval-risk ${escapeHTML(risk.level)}">${escapeHTML(risk.label)}</span></div>
+    <p>${escapeHTML(summary)}</p>
+    <dl>${approvalContextRow()}${rows.join("")}</dl>
+    <details class="approval-details"><summary>${escapeHTML(technicalLabel)}</summary><pre class="tool-output">${escapeHTML(technicalText)}</pre></details>
+  </div>`;
+}
+
+function commandApprovalExplanationHTML(approval) {
+  const params = approval.params || {};
+  const related = approvalRelatedItem(params, "commandExecution");
+  const command = commandText(params.command || related?.command).trim();
+  const cwd = String(params.cwd || params.workingDirectory || related?.cwd || related?.workingDirectory || "").trim();
+  const purpose = command ? commandActivitySummary({command}) : "Executar uma etapa técnica solicitada pelo Codex.";
+  const reason = String(params.reason || "O ambiente exige sua confirmação antes de executar este comando.");
+  const rows = [
+    `<div><dt>Ação</dt><dd>${escapeHTML(purpose)}</dd></div>`,
+    `<div><dt>Comando</dt><dd>${command ? `<code>${escapeHTML(sanitizeApprovalString(command))}</code>` : "O protocolo não informou o comando nesta solicitação."}</dd></div>`,
+    `<div><dt>Local de execução</dt><dd>${escapeHTML(cwd || "Diretório de trabalho padrão da conversa.")}</dd></div>`,
+    `<div><dt>Por que pede aprovação</dt><dd>${escapeHTML(sanitizeApprovalString(reason))}</dd></div>`,
+  ];
+  if (params.networkApprovalContext) rows.push(`<div><dt>Acesso de rede</dt><dd>${escapeHTML(JSON.stringify(sanitizedApprovalValue(params.networkApprovalContext)))}</dd></div>`);
+  return approvalExplanationShell({
+    risk:approvalRisk(approval.method, params, related),
+    summary:"Permitir que o Codex execute o comando exibido abaixo no ambiente desta conversa.",
+    rows,
+    technicalLabel:"Ver comando e parâmetros completos",
+    technicalText:approvalTechnicalText(params),
+  });
+}
+
+function fileChangeApprovalExplanationHTML(approval) {
+  const params = approval.params || {};
+  const related = approvalRelatedItem(params, "fileChange");
+  const changes = Array.isArray(params.changes) ? params.changes : Array.isArray(related?.changes) ? related.changes : [];
+  const paths = changes.map(change => {
+    const path = change?.path || change?.filePath || change?.name || "arquivo não identificado";
+    const rawKind = String(change?.kind || change?.type || "alterar");
+    const kind = ({add:"criar", create:"criar", update:"alterar", modify:"alterar", delete:"remover", remove:"remover", move:"mover", rename:"renomear"})[rawKind.toLowerCase()] || rawKind;
+    return `${path} (${kind})`;
+  });
+  const scope = paths.length ? paths.join("; ") : String(params.grantRoot || "Os caminhos exatos não foram informados nesta solicitação.");
+  const reason = String(params.reason || "O ambiente exige sua confirmação antes de gravar as alterações.");
+  return approvalExplanationShell({
+    risk:approvalRisk(approval.method, params, related),
+    summary:"Permitir que o Codex crie, edite, mova ou remova arquivos dentro do alcance mostrado.",
+    rows:[
+      `<div><dt>Arquivos afetados</dt><dd>${escapeHTML(scope)}</dd></div>`,
+      `<div><dt>Alcance concedido</dt><dd>${escapeHTML(String(params.grantRoot || "Somente esta alteração solicitada."))}</dd></div>`,
+      `<div><dt>Por que pede aprovação</dt><dd>${escapeHTML(sanitizeApprovalString(reason))}</dd></div>`,
+    ],
+    technicalLabel:"Ver lista e parâmetros completos",
+    technicalText:paths.length ? `${paths.join("\n")}\n\n${approvalTechnicalText(params)}` : approvalTechnicalText(params),
+  });
+}
+
+function permissionLabel(key, value) {
+  const normalized = String(key || "").toLowerCase();
+  const safeValue = sanitizedApprovalValue(value, key);
+  const detail = typeof safeValue === "string" ? safeValue : Array.isArray(safeValue) ? safeValue.join(", ") : safeValue === true ? "permitido" : JSON.stringify(safeValue);
+  if (/network|internet|domain|host|url|web/.test(normalized)) return `Acessar rede ou Internet${detail ? `: ${detail}` : ""}`;
+  if (/write|edit|modify|filesystem.*write/.test(normalized)) return `Gravar ou alterar arquivos${detail ? `: ${detail}` : ""}`;
+  if (/read|filesystem|path|directory|folder/.test(normalized)) return `Ler arquivos ou pastas${detail ? `: ${detail}` : ""}`;
+  if (/execute|command|shell|process/.test(normalized)) return `Executar comandos ou processos${detail ? `: ${detail}` : ""}`;
+  if (/camera/.test(normalized)) return `Usar a câmera${detail ? `: ${detail}` : ""}`;
+  if (/microphone|audio/.test(normalized)) return `Usar o microfone ou áudio${detail ? `: ${detail}` : ""}`;
+  if (/clipboard/.test(normalized)) return `Acessar a área de transferência${detail ? `: ${detail}` : ""}`;
+  return `${String(key || "Permissão")}${detail ? `: ${detail}` : ""}`;
+}
+
+function permissionDescriptions(permissions = {}) {
+  if (Array.isArray(permissions)) return permissions.map((value, index) => permissionLabel(`Permissão ${index + 1}`, value));
+  if (!permissions || typeof permissions !== "object") return permissions ? [String(permissions)] : [];
+  return Object.entries(permissions).map(([key, value]) => permissionLabel(key, value));
+}
+
+function permissionsApprovalExplanationHTML(approval) {
+  const params = approval.params || {};
+  const descriptions = permissionDescriptions(params.permissions);
+  const reason = String(params.reason || "A etapa precisa de acessos que ainda não foram concedidos à conversa.");
+  return approvalExplanationShell({
+    risk:approvalRisk(approval.method, params),
+    summary:"Conceder à conversa apenas os acessos listados abaixo para continuar esta etapa.",
+    rows:[
+      `<div><dt>Permissões</dt><dd>${escapeHTML(descriptions.length ? descriptions.join("; ") : "A solicitação não enumerou as permissões em linguagem estruturada.")}</dd></div>`,
+      `<div><dt>Duração</dt><dd>Esta concessão vale para o turno atual. “Este tipo nesta conversa” também autoriza solicitações equivalentes até a conversa terminar.</dd></div>`,
+      `<div><dt>Por que pede aprovação</dt><dd>${escapeHTML(sanitizeApprovalString(reason))}</dd></div>`,
+    ],
+    technicalLabel:"Ver permissões técnicas completas",
+    technicalText:approvalTechnicalText(params),
+  });
+}
+
+function genericApprovalExplanationHTML(approval) {
+  const params = approval.params || {};
+  const action = String(params.action || params.operation || params.title || params.message || params.reason || "Executar a operação solicitada.");
+  return approvalExplanationShell({
+    risk:approvalRisk(approval.method, params),
+    summary:sanitizeApprovalString(action),
+    rows:[
+      `<div><dt>Tipo da solicitação</dt><dd><code>${escapeHTML(String(approval.method || "não identificado"))}</code></dd></div>`,
+      `<div><dt>Por que pede aprovação</dt><dd>${escapeHTML(sanitizeApprovalString(String(params.reason || "A operação exige uma decisão explícita antes de continuar.")))}</dd></div>`,
+    ],
+    technicalText:approvalTechnicalText(params),
+  });
+}
+
+function approvalExplanationHTML(approval) {
+  if (approval.method === "item/commandExecution/requestApproval") return commandApprovalExplanationHTML(approval);
+  if (approval.method === "item/fileChange/requestApproval") return fileChangeApprovalExplanationHTML(approval);
+  if (approval.method === "item/permissions/requestApproval") return permissionsApprovalExplanationHTML(approval);
+  if (approval.method === "mcpServer/elicitation/request") return mcpApprovalExplanationHTML(approval);
+  return genericApprovalExplanationHTML(approval);
+}
+
+function approvalDisclosureMeta(approval) {
+  const params = approval.params || {};
+  if (approval.method === "mcpServer/elicitation/request") {
+    const {server, tool} = mcpApprovalIdentity(params);
+    const capability = mcpApprovalCapability(server, tool);
+    return {risk:capability, subject:"Ferramenta, alcance e motivo"};
+  }
+  const relatedType = approval.method === "item/commandExecution/requestApproval" ? "commandExecution"
+    : approval.method === "item/fileChange/requestApproval" ? "fileChange" : "";
+  const risk = approvalRisk(approval.method, params, relatedType ? approvalRelatedItem(params, relatedType) : null);
+  const subject = approval.method === "item/commandExecution/requestApproval" ? "Comando, local e motivo"
+    : approval.method === "item/fileChange/requestApproval" ? "Arquivos, alcance e motivo"
+    : approval.method === "item/permissions/requestApproval" ? "Acessos, duração e motivo"
+    : "Alcance, motivo e dados técnicos";
+  return {risk, subject};
+}
+
+function approvalDisclosureHTML(approval) {
+  const {risk, subject} = approvalDisclosureMeta(approval);
+  return `<details class="approval-disclosure" data-risk="${escapeHTML(risk.level)}">
+    <summary><span class="approval-disclosure-copy"><strong>Ver detalhes da solicitação</strong><small>${escapeHTML(subject)}</small></span><span class="approval-risk ${escapeHTML(risk.level)}">${escapeHTML(risk.label)}</span></summary>
+    <div class="approval-disclosure-body">${approvalExplanationHTML(approval)}</div>
+  </details>`;
+}
+
+function mcpApprovalExplanationHTML(approval) {
+  const {server, tool} = mcpApprovalIdentity(approval.params || {});
+  const capability = mcpApprovalCapability(server, tool);
+  const toolCall = mcpApprovalToolCall(server, tool);
+  const context = approvalContextText();
+  const rawArguments = toolCall?.arguments ?? approval.params?.arguments ?? approval.params?.toolArguments;
+  const hasArguments = rawArguments && typeof rawArguments === "object" && Object.keys(rawArguments).length > 0;
+  const argumentsText = hasArguments
+    ? JSON.stringify(sanitizedApprovalValue(rawArguments), null, 2).slice(0, 12000)
+    : "A solicitação não forneceu parâmetros adicionais. O schema vazio mostrado anteriormente descrevia apenas a resposta esperada da aprovação; ele não explicava a ação.";
+  const contextHTML = context
+    ? `<div><dt>Finalidade informada nesta etapa</dt><dd>${escapeHTML(sanitizeApprovalString(context))}</dd></div>`
+    : `<div><dt>Finalidade informada nesta etapa</dt><dd>O Codex não forneceu uma descrição adicional antes desta solicitação.</dd></div>`;
+  return `<div class="approval-explanation" data-risk="${escapeHTML(capability.level)}">
+    <div class="approval-explanation-head"><strong>O que será autorizado</strong><span class="approval-risk ${escapeHTML(capability.level)}">${escapeHTML(capability.label)}</span></div>
+    <p>${escapeHTML(capability.summary)}</p>
+    <dl>
+      ${contextHTML}
+      <div><dt>Ferramenta</dt><dd><code>${escapeHTML(`${server}/${tool}`)}</code></dd></div>
+      <div><dt>Por que pede aprovação</dt><dd>${escapeHTML(capability.reason)}</dd></div>
+    </dl>
+    <details class="approval-details"><summary>${hasArguments ? "Ver parâmetros ou código solicitado" : "Ver informação técnica disponível"}</summary><pre class="tool-output">${escapeHTML(argumentsText)}</pre></details>
+  </div>`;
 }
 
 function userInputQuestionsHTML(approval) {
@@ -4633,31 +5441,76 @@ function userInputQuestionsHTML(approval) {
   }).join("");
 }
 
+function isCredentialElicitation(approval) {
+  if (!["mcpServer/elicitation/request", "browser/credentials/request", "browser/payment-card/request"].includes(approval?.method)) return false;
+  const params = approval.params || {};
+  const properties = params.requestedSchema?.properties || {};
+  const message = String(params.message || "");
+  if (message.startsWith("SASOCQ_CREDENTIALS\n")) {
+    return ["login", "password", "one_time_code"].some(name => properties[name]?.type === "string");
+  }
+  return message.startsWith("SASOCQ_PAYMENT_CARD\n")
+    && ["cardholder_name", "card_number", "expiration", "expiration_month", "expiration_year", "security_code", "postal_code"].some(name => properties[name]?.type === "string");
+}
+
+function credentialElicitationHTML(approval) {
+  const params = approval.params || {};
+  const schema = params.requestedSchema || {};
+  const required = new Set(Array.isArray(schema.required) ? schema.required : []);
+  const properties = schema.properties || {};
+  const message = String(params.message || "").split("\n");
+  const paymentCard = message[0] === "SASOCQ_PAYMENT_CARD";
+  const site = message[1] || "este site";
+  const purpose = message.slice(2).join(" ") || (paymentCard ? "Preencher dados de pagamento" : "Concluir autenticação");
+  const previewUrl = String(params.previewUrl || "");
+  const fields = [
+    ["login", "text", "username", "Login"],
+    ["password", "password", "current-password", "Senha"],
+    ["one_time_code", "text", "one-time-code", "Código temporário"],
+    ["cardholder_name", "text", "cc-name", "Nome no cartão", "text", 200],
+    ["card_number", "text", "cc-number", "Número do cartão", "numeric", 32],
+    ["expiration", "text", "cc-exp", "Validade", "numeric", 9],
+    ["expiration_month", "text", "cc-exp-month", "Mês", "numeric", 2],
+    ["expiration_year", "text", "cc-exp-year", "Ano", "numeric", 4],
+    ["security_code", "password", "cc-csc", "CVV/CVC", "numeric", 8],
+    ["postal_code", "text", "postal-code", "CEP", "text", 32],
+  ].filter(([name]) => properties[name]?.type === "string").map(([name, type, autocomplete, fallback, inputmode = "text", fallbackMaxLength = 8192]) => {
+    const definition = properties[name] || {};
+    const maxLength = Math.min(Number(definition.maxLength) || fallbackMaxLength, fallbackMaxLength);
+    return `<label class="credential-field"><span>${escapeHTML(definition.title || fallback)}</span><input type="${type}" data-credential-field="${name}" autocomplete="${autocomplete}" inputmode="${inputmode}" maxlength="${maxLength}" autocapitalize="none" spellcheck="false" ${required.has(name) ? "required" : ""}></label>`;
+  }).join("");
+  return `<div class="credential-elicitation" role="group" aria-label="${paymentCard ? "Dados de pagamento protegidos" : "Credenciais protegidas"}">
+    <div class="credential-security-head"><span aria-hidden="true">◆</span><div><strong>${escapeHTML(site)}</strong><small>${escapeHTML(purpose)}</small></div></div>
+    ${previewUrl ? `<figure class="credential-page-preview"><img src="${escapeHTML(previewUrl)}" alt="Prévia da página de login em ${escapeHTML(site)}"><figcaption>Confira a página e o endereço antes de continuar.</figcaption></figure>` : ""}
+    <p>${paymentCard ? "Digite aqui sem abrir o navegador remoto. Os valores serão usados uma única vez apenas para preencher a página; nenhuma compra será confirmada automaticamente e nada aparecerá para o Codex ou no histórico." : "Digite aqui sem abrir o navegador remoto. Os valores serão usados uma única vez para preencher a página e não aparecerão para o Codex nem no histórico da conversa."}</p>
+    <div class="credential-fields${paymentCard ? " payment-card-fields" : ""}">${fields}</div>
+  </div>`;
+}
+
 function approvalCardHTML(approval, inline = false) {
   const {method, params} = approval;
   const title = approvalTitle(method, params);
-  let details = "";
-  if (method === "item/commandExecution/requestApproval") details = commandText(params.command) || JSON.stringify(params.networkApprovalContext || {}, null, 2);
-  else if (method === "item/fileChange/requestApproval") details = params.reason || params.grantRoot || "O Codex deseja aplicar alterações.";
-  else if (method !== "item/tool/requestUserInput") details = JSON.stringify(params.permissions || params.requestedSchema || params, null, 2);
-  const questionApproval = method === "item/tool/requestUserInput";
-  const cls = `${inline ? "message-card tool approval-inline" : "approval-panel-card"} ${questionApproval ? "approval-input-card" : "approval-detail-card"}`;
-  const detailLabel = method === "item/commandExecution/requestApproval" ? "Ver comando completo" : "Ver detalhes";
-  const content = questionApproval
-    ? `<div class="approval-input-scroll">${userInputQuestionsHTML(approval)}</div>`
-    : `<details class="approval-details"><summary>${detailLabel}</summary><pre class="tool-output">${escapeHTML(details)}</pre></details>`;
-  const timeout = method === "mcpServer/elicitation/request" ? "5 minutos" : method === "item/tool/requestUserInput" ? "60 minutos" : "15 minutos";
-  return `<article class="${cls}" data-approval-key="${escapeHTML(`${approval.workspace || "system"}:${String(approval.id)}`)}" data-approval-id="${escapeHTML(String(approval.id))}"><div class="message-meta"><strong>${escapeHTML(title)}</strong><span title="${escapeHTML(method)}">${escapeHTML(workspaceLabel(approval.workspace))} • ${escapeHTML(userActionLabel(approval))}</span></div>${content}<small class="approval-timeout-note">Expira em ${timeout} sem resposta.</small><div class="approval-actions">${approvalButtons(approval)}</div></article>`;
+  const key = `${approval.workspace || "system"}:${String(approval.id)}`;
+  const origin = approvalOriginDetails(approval);
+  const credentialApproval = isCredentialElicitation(approval);
+  const questionApproval = method === "item/tool/requestUserInput" || credentialApproval;
+  const cls = `${inline ? "message-card tool approval-inline" : "approval-panel-card"} ${questionApproval ? "approval-input-card" : "approval-detail-card"} ${credentialApproval ? "credential-approval-card" : ""}`;
+  const content = credentialApproval
+    ? credentialElicitationHTML(approval)
+    : questionApproval ? `<div class="approval-input-scroll">${userInputQuestionsHTML(approval)}</div>`
+    : approvalDisclosureHTML(approval);
+  const originHTML = inline ? "" : `<div class="approval-origin"><span class="approval-origin-mark">${escapeHTML(approvalOriginInitials(origin.projectName))}</span><div class="approval-origin-copy"><strong title="${escapeHTML(origin.projectName)}">${escapeHTML(origin.projectName)}</strong><small title="${escapeHTML(origin.threadName)}">${escapeHTML(origin.threadName)}</small></div>${origin.threadId ? `<button type="button" class="secondary-button" data-open-approval-origin="${escapeHTML(key)}">Abrir conversa</button>` : ""}</div>`;
+  const timeout = ["mcpServer/elicitation/request", "browser/credentials/request", "browser/payment-card/request"].includes(method) ? "5 minutos" : method === "item/tool/requestUserInput" ? "60 minutos" : "15 minutos";
+  return `<article class="${cls}" data-approval-key="${escapeHTML(key)}" data-approval-id="${escapeHTML(String(approval.id))}">${originHTML}<div class="message-meta"><strong>${escapeHTML(title)}</strong><span title="${escapeHTML(method)}">${escapeHTML(userActionLabel(approval))}</span></div>${content}<small class="approval-timeout-note">Expira em ${timeout} sem resposta.</small><div class="approval-actions">${approvalButtons(approval)}</div></article>`;
 }
 
 function approvalTypeKey(approval) {
   const method = String(approval?.method || "");
   const params = approval?.params || {};
   if (method === "mcpServer/elicitation/request") {
-    const message = String(params.message || "");
-    const parsed = message.match(/Allow the\s+(.+?)\s+MCP server\s+to run tool\s+["']([^"']+)["']/i);
-    const server = String(params.serverName || params.server || parsed?.[1] || "mcp").trim().toLowerCase();
-    const tool = String(params.toolName || params.tool || parsed?.[2] || "request").trim().toLowerCase();
+    const identity = mcpApprovalIdentity(params);
+    const server = String(identity.server || "mcp").trim().toLowerCase();
+    const tool = String(identity.tool || "request").trim().toLowerCase();
     return `${method}:${server}:${tool}`;
   }
   if (method === "item/commandExecution/requestApproval") {
@@ -4685,6 +5538,10 @@ function rememberConversationApprovalRule(approval) {
 }
 
 function automaticConversationApprovalAction(approval) {
+  if (isCredentialElicitation(approval)) return "";
+  const siteAction = window.automaticSiteAccessApprovalAction?.(approval) || "";
+  if (siteAction === "requirePrompt") return "";
+  if (siteAction) return siteAction;
   if (!state.conversationApprovalRules.has(conversationApprovalRuleKey(approval))) return "";
   if (approval.method === "item/permissions/requestApproval") return "grant";
   if (["item/commandExecution/requestApproval", "item/fileChange/requestApproval"].includes(approval.method)) return "acceptForSession";
@@ -4692,40 +5549,192 @@ function automaticConversationApprovalAction(approval) {
   return "";
 }
 
+function manualPendingApprovals() {
+  return [...state.approvals.values()].filter(item =>
+    !item.resolved && !automaticConversationApprovalAction(item));
+}
+
+function isGeneralConversationList() {
+  return !state.activeThreadId && !state.activeProject;
+}
+
+function activeInspectorApprovals() {
+  return manualPendingApprovals();
+}
+
+function approvalOriginDetails(approval) {
+  const threadId = String(approval?.params?.threadId || "");
+  const thread = typeof findApprovalThread === "function" ? findApprovalThread(approval) : null;
+  const rawWorkspace = String(approval?.workspace || "system");
+  const projectId = rawWorkspace.startsWith("project:") ? rawWorkspace.slice("project:".length) : "";
+  const project = projectId && Array.isArray(state.projects) ? state.projects.find(item => item.id === projectId) : null;
+  const projectName = thread?._projectName || project?.name || (rawWorkspace === "system" ? "Sistema" : "Projetos");
+  const threadName = thread
+    ? (typeof conversationTitle === "function" ? conversationTitle(thread) : String(thread.name || thread.preview || "Conversa"))
+    : (threadId ? `Conversa ${threadId.slice(0, 8)}…` : "Origem não identificada");
+  return {projectName, threadName, threadId};
+}
+
+function approvalOriginInitials(label) {
+  const words = String(label || "")
+    .replace(/^Projeto:\s*/i, "")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  return (words.slice(0, 2).map(word => word[0]).join("") || "?").toLocaleUpperCase("pt-BR");
+}
+
+function approvalOriginGroups(approvals) {
+  const groups = new Map();
+  for (const approval of approvals) {
+    const origin = approvalOriginDetails(approval);
+    const group = groups.get(origin.projectName) || {projectName:origin.projectName, count:0, conversations:new Set()};
+    group.count += 1;
+    group.conversations.add(origin.threadName);
+    groups.set(origin.projectName, group);
+  }
+  return [...groups.values()];
+}
+
+function renderInspectorApprovalOrigins(approvals) {
+  const groups = approvalOriginGroups(approvals);
+  if (selectors.inspectorAttentionSources) {
+    const visible = groups.slice(0, 3).map(group => `<span class="inspector-attention-source">${escapeHTML(approvalOriginInitials(group.projectName))}</span>`);
+    if (groups.length > 3) visible.push(`<span class="inspector-attention-source more">+${groups.length - 3}</span>`);
+    selectors.inspectorAttentionSources.innerHTML = visible.join("");
+    selectors.inspectorAttentionSources.classList.toggle("hidden", groups.length === 0);
+  }
+  const toggle = el("open-inspector");
+  if (!toggle) return;
+  if (!groups.length) {
+    toggle.title = "Mostrar ou recolher painel direito";
+    toggle.setAttribute("aria-label", "Mostrar ou recolher painel direito");
+    return;
+  }
+  const origins = groups.map(group => `${group.projectName}: ${group.count}`).join(", ");
+  const description = `${approvals.length} ${approvals.length === 1 ? "aprovação manual pendente" : "aprovações manuais pendentes"} — ${origins}`;
+  toggle.title = description;
+  toggle.setAttribute("aria-label", `Abrir painel direito. ${description}`);
+}
+
+function activeInspectorQueue() {
+  return (state.globalQueue || []).filter(item => ["queued", "steering", "running"].includes(item.status));
+}
+
+function activeInspectorError() {
+  const terminal = state.threadTerminalStatuses?.get(state.activeThreadId);
+  return terminal?.message ? String(terminal.message) : "";
+}
+
+function updateInspectorExecutionEmpty() {
+  const events = executionActivityCount(state.activity) + (state.diff ? 1 : 0);
+  if (selectors.inspectorExecutionEmpty) selectors.inspectorExecutionEmpty.classList.toggle("hidden", events > 0);
+  if (selectors.executionEventCount) {
+    selectors.executionEventCount.textContent = String(events);
+    selectors.executionEventCount.classList.toggle("hidden", events === 0);
+  }
+}
+
+function renderInspectorSummary() {
+  if (!selectors.inspectorSummaryStatus) return;
+  const approvals = activeInspectorApprovals();
+  const activeApprovals = approvals.filter(approvalBelongsToActiveThread);
+  const queue = activeInspectorQueue();
+  const error = activeInspectorError();
+  const thread = activeThreadSummary() || state.threadDetails.get(state.activeThreadId);
+  const deferred = !executionIsActive() && Boolean(thread?.clc?.awaiting_user_action);
+  let mode = "ready";
+  let icon = "✓";
+  let title = "Conversa pronta";
+  let copy = "Envie uma mensagem quando quiser iniciar a próxima etapa.";
+  let meta = "Sem atividade em andamento.";
+
+  if (approvals.length) {
+    mode = "waiting";
+    icon = "!";
+    title = activeApprovals.length ? activeUserActionLabel() : "Aprovação manual necessária";
+    copy = activeApprovals.length
+      ? "A execução está pausada até você analisar a solicitação abaixo."
+      : "Outras conversas aguardam uma decisão que o Dex não pode aprovar automaticamente.";
+    meta = `${approvals.length} ${approvals.length === 1 ? "aprovação pendente" : "aprovações pendentes"}${queue.length ? ` • ${queue.length} na fila` : ""}`;
+  } else if (!state.activeThreadId) {
+    mode = "idle";
+    icon = "◇";
+    title = "Selecione uma conversa";
+    copy = "Aprovações e filas acompanham todas as conversas; a execução detalhada segue a conversa aberta.";
+    meta = queue.length ? `${queue.length} ${queue.length === 1 ? "item na fila global" : "itens nas filas globais"}.` : "Nenhuma aprovação manual pendente.";
+  } else if (error) {
+    mode = "error";
+    icon = "×";
+    title = "A execução terminou com problema";
+    copy = sanitizeApprovalString(error).replace(/\s+/g, " ").trim().slice(0, 240);
+    meta = "Consulte Execução para ver as últimas etapas registradas.";
+  } else if (executionIsActive()) {
+    mode = executionWaitingState() ? "waiting" : "running";
+    icon = executionWaitingState() ? "!" : "◉";
+    title = executionWaitingState() ? activeUserActionLabel() : "Codex está trabalhando";
+    copy = executionStatusSummary();
+    meta = `Em execução há ${compactElapsed(Date.now() - (state.activeTurnStartedAt || Date.now()))}${queue.length ? ` • ${queue.length} na fila` : ""}`;
+  } else if (deferred) {
+    mode = "waiting";
+    icon = "!";
+    title = threadUserActionLabel(thread);
+    copy = "Esta conversa depende da sua próxima mensagem para continuar.";
+    meta = queue.length ? `${queue.length} ${queue.length === 1 ? "item aguarda" : "itens aguardam"} na fila.` : "Pendência mantida até sua resposta.";
+  } else if (queue.length) {
+    mode = "ready";
+    icon = "☷";
+    title = "Próximas etapas organizadas";
+    copy = "A fila será executada na ordem mostrada abaixo.";
+    meta = `${queue.length} ${queue.length === 1 ? "item na fila" : "itens na fila"}.`;
+  }
+
+  selectors.inspectorSummaryStatus.className = `inspector-status-card ${mode}`;
+  selectors.inspectorStatusIcon.textContent = icon;
+  selectors.inspectorStatusTitle.textContent = title;
+  selectors.inspectorStatusCopy.textContent = copy;
+  selectors.inspectorStatusMeta.textContent = meta;
+  const attention = approvals.length + queue.length + (error ? 1 : 0);
+  if (selectors.inspectorSummaryCount) {
+    selectors.inspectorSummaryCount.textContent = String(attention);
+    selectors.inspectorSummaryCount.classList.toggle("hidden", attention === 0);
+  }
+  if (selectors.inspectorAttentionCount) {
+    selectors.inspectorAttentionCount.textContent = String(approvals.length);
+    selectors.inspectorAttentionCount.classList.toggle("hidden", approvals.length === 0);
+    selectors.inspectorAttentionCount.setAttribute("aria-label", `${approvals.length} ${approvals.length === 1 ? "aprovação pendente" : "aprovações pendentes"}`);
+  }
+  renderInspectorApprovalOrigins(approvals);
+  if (selectors.inspectorSummaryEmpty) selectors.inspectorSummaryEmpty.classList.toggle("hidden", approvals.length > 0 || queue.length > 0);
+  updateInspectorExecutionEmpty();
+}
+
 function approvalButtons(approval) {
   const id = escapeHTML(`${approval.workspace || "system"}:${String(approval.id)}`);
-  if (approval.method === "item/permissions/requestApproval") return `<button class="primary-button" data-approval="${id}" data-action="grant">Conceder solicitado</button><button class="secondary-button" data-approval="${id}" data-action="grant-all">Aprovar todas deste tipo</button><button class="danger-button" data-approval="${id}" data-action="deny-permissions">Negar</button>`;
-  if (["item/commandExecution/requestApproval", "item/fileChange/requestApproval"].includes(approval.method)) return `<button class="primary-button" data-approval="${id}" data-action="accept">Aprovar uma vez</button><button class="secondary-button" data-approval="${id}" data-action="acceptForSession">Aprovar todas deste tipo</button><button class="danger-button" data-approval="${id}" data-action="decline">Recusar</button>`;
-  if (approval.method === "mcpServer/elicitation/request") return `<button class="primary-button" data-approval="${id}" data-action="accept-elicitation">Aprovar</button><button class="secondary-button" data-approval="${id}" data-action="accept-all-elicitation">Aprovar todas deste tipo</button><button class="danger-button" data-approval="${id}" data-action="cancel-elicitation">Cancelar solicitação</button>`;
+  if (isCredentialElicitation(approval)) {
+    const paymentCard = String(approval.params?.message || "").startsWith("SASOCQ_PAYMENT_CARD\n");
+    return `<button class="primary-button" data-approval="${id}" data-action="submit-credentials">${paymentCard ? "Preencher cartão" : "Preencher com segurança"}</button><button class="danger-button" data-approval="${id}" data-action="cancel-credentials">Cancelar</button>`;
+  }
+  if (approval.method === "item/permissions/requestApproval") return `<button class="primary-button" data-approval="${id}" data-action="grant">Conceder uma vez</button><button class="secondary-button" data-approval="${id}" data-action="grant-all">Conceder este tipo nesta conversa</button><button class="danger-button" data-approval="${id}" data-action="deny-permissions">Negar</button>`;
+  if (["item/commandExecution/requestApproval", "item/fileChange/requestApproval"].includes(approval.method)) return `<button class="primary-button" data-approval="${id}" data-action="accept">Aprovar uma vez</button><button class="secondary-button" data-approval="${id}" data-action="acceptForSession">Aprovar este tipo nesta conversa</button><button class="danger-button" data-approval="${id}" data-action="decline">Recusar</button>`;
+  if (approval.method === "mcpServer/elicitation/request") return `<button class="primary-button" data-approval="${id}" data-action="accept-elicitation">Aprovar uma vez</button><button class="secondary-button" data-approval="${id}" data-action="accept-all-elicitation">Aprovar este tipo nesta conversa</button><button class="danger-button" data-approval="${id}" data-action="cancel-elicitation">Cancelar solicitação</button>`;
   if (approval.method === "item/tool/requestUserInput") return `<button class="primary-button" data-approval="${id}" data-action="submit-user-input">Responder e continuar</button><button class="danger-button" data-approval="${id}" data-action="cancel-user-input">Cancelar solicitação</button>`;
   return `<button class="danger-button" data-approval="${id}" data-action="cancel">Cancelar</button>`;
 }
 
 function renderApprovals() {
-  const pending = [...state.approvals.values()].filter(item => !item.resolved && approvalBelongsToActiveThread(item));
+  const pending = activeInspectorApprovals();
   selectors.approvalCount.textContent = String(pending.length);
-  selectors.approvalList.innerHTML = pending.length ? pending.map(item => approvalCardHTML(item)).join("") : '<div class="panel-empty">Nenhuma aprovação pendente.</div>';
+  selectors.approvalList.innerHTML = pending.map(item => approvalCardHTML(item)).join("");
+  selectors.summaryApprovalsSection?.classList.toggle("hidden", pending.length === 0);
+  syncApprovalInspectorAutoOpen();
+  renderInspectorSummary();
   renderOtherConversationApprovals();
 }
 
-function otherConversationApprovalHTML(key, approval) {
-  const threadId = approvalThreadId(approval);
-  const thread = findApprovalThread(approval);
-  const projectName = thread?._projectName || workspaceLabel(approval.workspace || "system");
-  const threadName = thread ? conversationTitle(thread) : (threadId ? `Conversa ${threadId.slice(0, 8)}…` : "Origem não identificada");
-  const requestTitle = approvalTitle(approval.method, approval.params || {});
-  return `<article class="other-conversation-approval-popup" data-other-approval-key="${escapeHTML(key)}">
-    <div class="other-approval-popup-header"><span>${escapeHTML(userActionLabel(approval))}</span><button type="button" class="secondary-button" data-open-approval-origin="${escapeHTML(key)}">Abrir</button></div>
-    <strong title="${escapeHTML(threadName)}">${escapeHTML(threadName)}</strong>
-    <small title="${escapeHTML(`${projectName} • ${requestTitle}`)}">${escapeHTML(projectName)} • ${escapeHTML(requestTitle)}</small>
-  </article>`;
-}
-
 function renderOtherConversationApprovals() {
-  if (!selectors.otherApprovalPopups) return;
-  const pending = [...state.approvals.entries()]
-    .filter(([, approval]) => !approval.resolved && !approvalBelongsToActiveThread(approval));
-  selectors.otherApprovalPopups.innerHTML = pending.map(([key, approval]) => otherConversationApprovalHTML(key, approval)).join("");
+  // Compatibility hook used by operations.js. Manual approvals live only in the inspector inbox.
 }
 
 async function openApprovalOrigin(key) {
@@ -4748,7 +5757,23 @@ async function respondApproval(key, action, options = {}) {
   const approval = state.approvals.get(String(key));
   if (!approval) return;
   const payload = {request_id:approval.id, workspace:approval.workspace || "system"};
-  if (["grant", "grant-all"].includes(action)) payload.result = {scope:"turn", permissions:approval.params.permissions || {}};
+  if (["submit-credentials", "cancel-credentials"].includes(action)) {
+    const content = {};
+    const cards = [...document.querySelectorAll(`[data-approval-key="${CSS.escape(String(key))}"]`)];
+    if (action === "submit-credentials") {
+      const schema = approval.params.requestedSchema || {};
+      const required = new Set(Array.isArray(schema.required) ? schema.required : []);
+      for (const name of ["login", "password", "one_time_code", "cardholder_name", "card_number", "expiration", "expiration_month", "expiration_year", "security_code", "postal_code"]) {
+        if (schema.properties?.[name]?.type !== "string") continue;
+        const inputs = cards.map(card => card.querySelector(`[data-credential-field="${name}"]`)).filter(Boolean);
+        const value = inputs.map(input => input.value).find(value => value !== "") || "";
+        if (required.has(name) && !value) return toast(`Preencha ${schema.properties[name].title || name}.`, "error");
+        content[name] = value;
+      }
+    }
+    payload.result = action === "submit-credentials" ? {action:"accept", content} : {action:"cancel", content:null};
+  }
+  else if (["grant", "grant-all"].includes(action)) payload.result = {scope:"turn", permissions:approval.params.permissions || {}};
   else if (action === "deny-permissions") payload.result = {scope:"turn", permissions:{}};
   else if (["accept-elicitation", "accept-all-elicitation"].includes(action)) payload.result = {action:"accept", content:{}};
   else if (action === "cancel-elicitation") payload.result = {action:"cancel", content:null};
@@ -4767,15 +5792,23 @@ async function respondApproval(key, action, options = {}) {
     payload.result = {answers};
   }
   else payload.decision = action;
+  let serializedPayload = "";
+  if (isCredentialElicitation(approval)) {
+    serializedPayload = JSON.stringify(payload);
+    document.querySelectorAll(`[data-approval-key="${CSS.escape(String(key))}"] [data-credential-field]`).forEach(input => { input.value = ""; });
+    if (payload.result?.content) payload.result.content = {};
+  }
   try {
     if (["grant-all", "acceptForSession", "accept-all-elicitation"].includes(action)) rememberConversationApprovalRule(approval);
-    await api("/api/approvals/respond", {method:"POST", body:JSON.stringify(payload)});
+    const endpoint = ["browser/credentials/request", "browser/payment-card/request"].includes(approval.method) ? "/api/browser-credentials/respond" : "/api/approvals/respond";
+    await api(endpoint, {method:"POST", body:serializedPayload || JSON.stringify(payload)});
     approval.resolved = true;
     const requestThreadId = String(approval.params?.threadId || "");
     syncThreadWaitingStatus(requestThreadId);
     renderApprovals(); updateRunningUI();
     if (!options.automatic) {
-      toast(action === "submit-user-input" ? "Resposta enviada." : action.startsWith("accept") || action.startsWith("grant") ? (["grant-all", "acceptForSession", "accept-all-elicitation"].includes(action) ? "Este tipo foi aprovado para a conversa." : "Operação aprovada.") : "Operação recusada.");
+      const paymentCard = String(approval.params?.message || "").startsWith("SASOCQ_PAYMENT_CARD\n");
+      toast(action === "submit-credentials" ? (paymentCard ? "Cartão encaminhado com segurança; confirme o pagamento separadamente." : "Credenciais encaminhadas com segurança.") : action === "submit-user-input" ? "Resposta enviada." : action.startsWith("accept") || action.startsWith("grant") ? (["grant-all", "acceptForSession", "accept-all-elicitation"].includes(action) ? "Este tipo foi aprovado para a conversa." : "Operação aprovada.") : "Operação recusada.");
     }
   } catch (error) { toast(error.message, "error"); }
 }
@@ -4783,6 +5816,10 @@ async function respondApproval(key, action, options = {}) {
 function renderDiff() {
   if (!state.diff) {
     selectors.diffView.textContent = "Nenhuma alteração registrada nesta conversa.";
+    selectors.executionDiffSection?.classList.add("hidden");
+    if (selectors.executionDiffCount) selectors.executionDiffCount.textContent = "0";
+    updateInspectorExecutionEmpty();
+    renderInspectorSummary();
     return;
   }
   selectors.diffView.innerHTML = state.diff.split("\n").map(line => {
@@ -4791,6 +5828,11 @@ function renderDiff() {
     if (line.startsWith("-") && !line.startsWith("---")) cls = "diff-line-del";
     return `<span class="${cls}">${escapeHTML(line)}</span>`;
   }).join("\n");
+  const changedLines = state.diff.split("\n").filter(line => (line.startsWith("+") && !line.startsWith("+++")) || (line.startsWith("-") && !line.startsWith("---"))).length;
+  selectors.executionDiffSection?.classList.remove("hidden");
+  if (selectors.executionDiffCount) selectors.executionDiffCount.textContent = String(changedLines || 1);
+  updateInspectorExecutionEmpty();
+  renderInspectorSummary();
 }
 
 function summarizeEvent(value) {
@@ -4801,10 +5843,158 @@ function summarizeEvent(value) {
   } catch { return String(value); }
 }
 
+function parseActivityDetail(detail) {
+  if (detail && typeof detail === "object") return detail;
+  try { return JSON.parse(String(detail || "")); }
+  catch { return String(detail || ""); }
+}
+
+function humanizeActivityIdentifier(value) {
+  return String(value || "")
+    .replace(/^browser_/, "")
+    .replace(/([a-z])([A-Z])/g, "$1 $2")
+    .replace(/[\/_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/^./, letter => letter.toUpperCase());
+}
+
+function activityToolSummary(item) {
+  const tool = String(item?.tool || "");
+  const server = String(item?.server || "");
+  const known = {
+    browser_navigate:"Abrindo uma página no navegador supervisionado.",
+    browser_snapshot:"Lendo a estrutura e os controles visíveis da página.",
+    browser_take_screenshot:"Registrando o estado visual atual da página.",
+    browser_click:"Interagindo com um controle da página.",
+    browser_find:"Localizando conteúdo na página.",
+    browser_evaluate:"Consultando informações diretamente na página.",
+    browser_close:"Encerrando a sessão do navegador supervisionado.",
+  };
+  if (known[tool]) return known[tool];
+  if (/playwright|browser|chrome/i.test(`${server} ${tool}`)) return "Usando o navegador supervisionado nesta etapa.";
+  if (/desktop|screen/i.test(`${server} ${tool}`)) return "Inspecionando ou operando a interface gráfica supervisionada.";
+  return `Usando ${humanizeActivityIdentifier(tool || server || "uma ferramenta associada")}.`;
+}
+
+function activityPresentation(title, detail) {
+  const value = parseActivityDetail(detail);
+  const itemType = String(value?.type || "");
+  const status = String(value?.status || "").toLowerCase();
+  const completed = /completed|conclu/i.test(title) || status === "completed";
+  const failed = /failed|error|falh/i.test(`${title} ${status}`);
+  let displayTitle = humanizeActivityIdentifier(title || "Atividade");
+  let summary = typeof value === "string" ? value : "Etapa registrada pelo Codex.";
+  let kind = "technical";
+
+  if (title === "turn/started") {
+    kind = "milestone";
+    displayTitle = "Execução iniciada";
+    summary = "O Codex começou a trabalhar na solicitação.";
+  } else if (title === "turn/completed") {
+    kind = "milestone";
+    displayTitle = failed ? "Execução encerrada com problema" : "Execução concluída";
+    summary = failed ? "A execução terminou antes de concluir todas as etapas." : "O turno terminou e a conversa está pronta para continuar.";
+  } else if (["item/started", "item/completed"].includes(title)) {
+    if (itemType === "mcpToolCall") {
+      const toolLabel = humanizeActivityIdentifier(value.tool || "ferramenta");
+      displayTitle = `${toolLabel} ${completed ? "concluída" : "em andamento"}`;
+      summary = activityToolSummary(value);
+    } else if (itemType === "commandExecution") {
+      displayTitle = `Comando ${completed ? "concluído" : "em execução"}`;
+      summary = commandActivitySummary(value);
+    } else if (itemType === "fileChange") {
+      kind = "change";
+      const count = Array.isArray(value.changes) ? value.changes.length : 0;
+      displayTitle = `Arquivos ${completed ? "atualizados" : "em atualização"}`;
+      summary = count ? `${count} ${count === 1 ? "arquivo foi incluído" : "arquivos foram incluídos"} nesta etapa.` : "Preparando alterações nos arquivos da tarefa.";
+    } else if (itemType === "reasoning") {
+      displayTitle = completed ? "Análise concluída" : "Analisando a próxima etapa";
+      summary = "Organizando o contexto necessário para continuar o trabalho.";
+    } else if (/agentMessage/i.test(itemType)) {
+      displayTitle = completed ? "Resposta preparada" : "Preparando resposta";
+      summary = "Atualizando a resposta visível da conversa.";
+    } else {
+      displayTitle = `${humanizeActivityIdentifier(itemType || "Etapa")} ${completed ? "concluída" : "em andamento"}`;
+      summary = failed ? "Esta etapa informou uma falha." : "Etapa técnica necessária para concluir a solicitação.";
+    }
+  } else if (/recuperação/i.test(title)) {
+    kind = "recovery";
+    displayTitle = "Recuperação automática";
+    summary = typeof value === "string" ? value : "O Dex recuperou automaticamente uma etapa que deixou de responder.";
+  }
+
+  const safeTechnical = typeof value === "string" ? sanitizeApprovalString(value) : JSON.stringify(sanitizedApprovalValue(value), null, 2);
+  return {
+    title:displayTitle,
+    summary:sanitizeApprovalString(summary).replace(/\s+/g, " ").trim().slice(0, 360),
+    technical:String(safeTechnical || "").slice(0, 12000),
+    failed,
+    kind,
+    activityStatus:failed ? "failed" : completed ? "completed" : "inProgress",
+    key:value && typeof value === "object" && value.id && ["item/started", "item/completed"].includes(title) ? `item:${value.id}` : "",
+  };
+}
+
+function executionActivityGroups(items = []) {
+  return (items || []).reduce((groups, item) => {
+    groups[item.kind === "technical" ? "technical" : "important"].push(item);
+    return groups;
+  }, {important:[], technical:[]});
+}
+
+function executionActivityCount(items = []) {
+  const groups = executionActivityGroups(items);
+  return groups.important.length + (groups.technical.length ? 1 : 0);
+}
+
+function activityTimeLabel(value) {
+  const date = new Date(Number(value || Date.now()));
+  return Number.isNaN(date.getTime()) ? "" : date.toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"});
+}
+
+function renderActivityCard(item, technical = false) {
+  return `<article class="activity-card ${technical ? "technical" : ""} ${item.type === "error" || item.failed ? "error" : ""}">
+    <div class="activity-card-head"><strong>${escapeHTML(item.displayTitle || item.title)}</strong><small>${escapeHTML(activityTimeLabel(item.at))}</small></div>
+    <p>${escapeHTML(item.summary || item.detail)}</p>
+    ${item.technical ? `<details class="activity-technical"><summary>Detalhes técnicos</summary><pre>${escapeHTML(item.technical)}</pre></details>` : ""}
+  </article>`;
+}
+
+function renderTechnicalActivityGroup(items, open = false) {
+  const active = items.some(item => item.activityStatus === "inProgress");
+  const latest = items[0] || {};
+  const label = `${items.length} ${items.length === 1 ? "registro agrupado" : "registros agrupados"}`;
+  return `<details class="execution-technical-log" data-status="${active ? "inProgress" : "completed"}"${open ? " open" : ""}>
+    <summary><span class="execution-technical-summary-copy"><strong>Atividade técnica${active ? " em andamento" : ""}</strong><small>${escapeHTML(label)} • ${escapeHTML(latest.displayTitle || latest.title || "Etapa técnica")}</small></span><span class="badge">${items.length}</span></summary>
+    <div class="execution-technical-items">${items.map(item => renderActivityCard(item, true)).join("")}</div>
+  </details>`;
+}
+
+function renderActivity() {
+  const items = state.activity;
+  const technical = executionActivityGroups(items).technical;
+  const technicalOpen = Boolean(selectors.activityList.querySelector(".execution-technical-log[open]"));
+  let technicalRendered = false;
+  selectors.activityList.innerHTML = items.map(item => {
+    if (item.kind !== "technical") return renderActivityCard(item);
+    if (technicalRendered) return "";
+    technicalRendered = true;
+    return renderTechnicalActivityGroup(technical, technicalOpen);
+  }).join("");
+  selectors.executionActivitySection?.classList.toggle("hidden", items.length === 0);
+  updateInspectorExecutionEmpty();
+  renderInspectorSummary();
+}
+
 function addActivity(title, detail, type = "") {
-  state.activity.unshift({title, detail, type, at:Date.now()});
+  const presentation = activityPresentation(title, detail);
+  const item = {title, detail, type, at:Date.now(), displayTitle:presentation.title, summary:presentation.summary, technical:presentation.technical, failed:presentation.failed, kind:type === "error" ? "error" : presentation.kind, activityStatus:type === "error" ? "failed" : presentation.activityStatus, key:presentation.key};
+  const existing = item.key ? state.activity.findIndex(value => value.key === item.key) : -1;
+  if (existing >= 0) state.activity.splice(existing, 1, item);
+  else state.activity.unshift(item);
   state.activity = state.activity.slice(0, 100);
-  selectors.activityList.innerHTML = state.activity.length ? state.activity.map(item => `<article class="activity-card ${escapeHTML(item.type)}"><strong>${escapeHTML(item.title)}</strong><small>${formatTime(item.at)}</small><pre>${escapeHTML(item.detail)}</pre></article>`).join("") : '<div class="panel-empty">Nenhuma atividade.</div>';
+  renderActivity();
 }
 
 function setStatus(kind, text) {
@@ -4816,12 +6006,65 @@ function setStatus(kind, text) {
 // Graphical settings and maintenance
 // ---------------------------------------------------------------------------
 
+function approvalRiskTone(level) {
+  const selected = Number(level || 1);
+  if (selected <= 3) return "low";
+  if (selected <= 6) return "guarded";
+  if (selected <= 8) return "elevated";
+  if (selected <= 11) return "high";
+  if (selected <= 13) return "very-high";
+  return "critical";
+}
+
+function approvalLevelMaximum(levels = []) {
+  const values = Array.isArray(levels) ? levels.map(item => Number(item?.level || 0)).filter(Number.isFinite) : [];
+  return values.length ? Math.max(1, ...values) : 15;
+}
+
+function approvalLevelSummaryMarkup(level, definition = {}) {
+  const selected = Number(level || definition.level || 1);
+  return `
+    <div class="approval-level-summary-head">
+      <strong>${selected} · ${escapeHTML(definition.name || "Nível de autonomia")}</strong>
+      <span class="approval-risk risk-${approvalRiskTone(selected)}">Risco aceito: ${escapeHTML(definition.risk || "Variável")}</span>
+    </div>
+    <span class="approval-level-description">${escapeHTML(definition.summary || "")}</span>
+    <div class="approval-level-facts">
+      <div class="approval-level-fact"><b>Passa automaticamente</b><span>${escapeHTML(definition.automatic || "Consulte a política deste nível.")}</span></div>
+      <div class="approval-level-fact"><b>Ainda pede aprovação</b><span>${escapeHTML(definition.still_prompts || "Ações protegidas pelas políticas permanentes.")}</span></div>
+    </div>`;
+}
+
 function renderSettings(data) {
   if (!data || !selectors.settingsContent) return;
   const codex = data.codex || {};
   const tailscale = data.tailscale || {};
   const service = data.service || {};
   const security = data.security || {};
+  const approvalAutonomy = security.approval_autonomy || {};
+  const fallbackApprovalLevels = [
+    {level:1, name:"Supervisão total", risk:"Mínimo", summary:"O navegador só age depois de cada aprovação.", automatic:"Nenhuma ferramenta Playwright.", still_prompts:"Capturas, leitura, navegação, interação e qualquer alteração."},
+    {level:2, name:"Leitura visual", risk:"Muito baixo", summary:"Permite enxergar e localizar conteúdo sem navegar nem alterar a página.", automatic:"Capturas, árvore acessível, busca na página e leitura do console.", still_prompts:"Rede, cookies, navegação, movimentos, sessões e interações."},
+    {level:3, name:"Diagnóstico", risk:"Baixo", summary:"Acrescenta diagnóstico técnico e leitura do estado local do navegador.", automatic:"Rede e leitura de cookies, localStorage e sessionStorage.", still_prompts:"Abrir páginas, mover a interface, registrar sessões e interagir."},
+    {level:4, name:"Navegação", risk:"Baixo", summary:"Permite percorrer sites e aguardar conteúdo sem clicar em controles.", automatic:"Abrir URL, voltar, avançar e aguardar conteúdo.", still_prompts:"Rolagem, hover, abas, registros, JavaScript, estado e interação."},
+    {level:5, name:"Interface passiva", risk:"Baixo a moderado", summary:"Acrescenta exploração visual sem ativar botões ou campos.", automatic:"Rolagem, hover, realces, movimento do ponteiro e redimensionamento.", still_prompts:"Abas e registros, JavaScript, estado persistente e interação."},
+    {level:6, name:"Sessão e registros", risk:"Moderado", summary:"Permite administrar abas e produzir artefatos locais de diagnóstico.", automatic:"Abas, fechar página, PDF, anotação, trace, vídeo e exportação do estado.", still_prompts:"JavaScript na página, teclas, mudanças persistentes e interação."},
+    {level:7, name:"Equilibrado", risk:"Moderado", summary:"Libera automação dentro da página, sem clicar ou preencher formulários.", automatic:"browser_evaluate, teclas e definição de cookies.", still_prompts:"Limpar/restaurar estado, clicar, digitar, preencher, arrastar e enviar arquivos."},
+    {level:8, name:"Estado do navegador", risk:"Elevado", summary:"Permite alterar dados persistentes da sessão do navegador.", automatic:"Definir, excluir, limpar ou restaurar cookies e armazenamentos locais.", still_prompts:"Cliques, digitação, formulários, arraste, diálogos e uploads."},
+    {level:9, name:"Clique e digitação", risk:"Alto", summary:"Resolve interações diretas comuns, inclusive o caso browser_type mostrado na conversa.", automatic:"browser_click e browser_type.", still_prompts:"Formulários estruturados, seleção, diálogos, coordenadas, arraste e arquivos."},
+    {level:10, name:"Formulários estruturados", risk:"Alto", summary:"Permite preencher vários campos e escolher opções, ainda sem aceitar diálogos.", automatic:"browser_fill_form, browser_select_option e browser_press_key.", still_prompts:"Diálogos, coordenadas, arraste, dados externos e arquivos."},
+    {level:11, name:"Diálogos do site", risk:"Alto", summary:"Permite aceitar ou recusar alertas, confirmações e prompts exibidos pela página.", automatic:"browser_handle_dialog.", still_prompts:"Interação por coordenadas, arraste, dados externos e arquivos."},
+    {level:12, name:"Controle por coordenadas", risk:"Muito alto", summary:"Libera cliques físicos em posições da tela, com menor contexto semântico.", automatic:"browser_mouse_click_xy, browser_mouse_down e browser_mouse_up.", still_prompts:"Arraste por elemento/coordenadas, dados externos e arquivos."},
+    {level:13, name:"Arraste avançado", risk:"Muito alto", summary:"Permite mover elementos e executar gestos de arraste na página.", automatic:"browser_drag e browser_mouse_drag_xy.", still_prompts:"Dados arrastados de fora da página e uploads de arquivos."},
+    {level:14, name:"Dados externos", risk:"Crítico", summary:"Permite soltar dados ou caminhos externos sobre a página.", automatic:"browser_drop.", still_prompts:"Seleção e upload explícito de arquivos locais."},
+    {level:15, name:"Autonomia máxima", risk:"Crítico", summary:"Libera todas as ferramentas normais do navegador, inclusive arquivos locais.", automatic:"browser_file_upload, além de tudo dos níveis anteriores.", still_prompts:"browser_run_code_unsafe e confirmações críticas externas protegidas por política."},
+  ];
+  const approvalLevels = Array.isArray(approvalAutonomy.levels) && approvalAutonomy.levels.length >= 10 ? approvalAutonomy.levels : fallbackApprovalLevels;
+  const approvalMax = approvalLevelMaximum(approvalLevels);
+  const approvalLevel = Math.max(1, Math.min(approvalMax, Number(approvalAutonomy.level || 7)));
+  const selectedApprovalLevel = approvalLevels.find(item => Number(item.level) === approvalLevel) || approvalLevels[6];
+  const approvalLevelButtons = approvalLevels.map(item => `<button type="button" data-approval-autonomy-level="${Number(item.level)}" class="${Number(item.level) === approvalLevel ? "active" : ""}" aria-label="Nível ${Number(item.level)}: ${escapeHTML(item.name)}" aria-current="${Number(item.level) === approvalLevel ? "true" : "false"}">${Number(item.level)}</button>`).join("");
+  const approvalLevelRows = approvalLevels.map(item => `<li class="${Number(item.level) === approvalLevel ? "active" : ""}">${approvalLevelSummaryMarkup(Number(item.level), item)}</li>`).join("");
   const remoteDesktop = data.remote_desktop || {};
   const upstream = data.upstream || {};
   const upstreamCurrent = upstream.current || {};
@@ -4882,11 +6125,30 @@ function renderSettings(data) {
   const enrollmentRequests = state.enrollmentRequests || [];
   const deviceAdmin = Boolean(state.deviceAdmin);
   const deviceLimit = Number(state.deviceLimit || 6);
-  const deviceRows = devices.length ? devices.map(device => `
+  const reauthenticationOptions = state.reauthenticationOptions.length ? state.reauthenticationOptions : [
+    {seconds:86_400, label:"Diariamente"},
+    {seconds:604_800, label:"A cada 7 dias"},
+    {seconds:2_592_000, label:"A cada 30 dias"},
+  ];
+  const deviceEventLabel = event => ({
+    authenticated:"Acesso",
+    registered:"Cadastro",
+    revoked:"Revogação",
+    reauthenticated:"Identidade confirmada",
+    reauthentication_required:"Reautenticação exigida",
+    reauthentication_policy:"Prazo alterado",
+  })[event] || "Evento";
+  const deviceRows = devices.length ? devices.map(device => {
+    const reauthenticationStatus = device.reauthentication_required
+      ? "Reautenticação exigida agora"
+      : `Próxima confirmação: ${formatTime(device.reauthentication_due_at)}`;
+    const options = reauthenticationOptions.map(option => `<option value="${Number(option.seconds)}" ${Number(device.reauthentication_interval_seconds) === Number(option.seconds) ? "selected" : ""}>${escapeHTML(option.label)}</option>`).join("");
+    return `
     <div class="settings-project-row device-row">
-      <div class="project-copy"><strong>${escapeHTML(device.name)}</strong><small>${escapeHTML(device.identity || "")}</small><small>Chave: ${escapeHTML(device.fingerprint || "")}</small><small>Último acesso: ${escapeHTML(formatTime(device.last_seen_at || device.created_at))}</small>${(device.access_history || []).slice(0, 5).map(entry => `<small>${escapeHTML(entry.event === "authenticated" ? "Acesso" : entry.event === "registered" ? "Cadastro" : "Revogação")} • ${escapeHTML(entry.email || "")} • ${escapeHTML(formatTime(entry.at))}${entry.ip ? ` • IP ${escapeHTML(entry.ip)}` : ""}</small>`).join("")}</div>
-      <button class="danger-button compact-button" data-device-revoke="${escapeHTML(device.id)}">Revogar</button>
-    </div>`).join("") : '<div class="inline-notice">Nenhum dispositivo remoto cadastrado.</div>';
+      <div class="project-copy"><strong>${escapeHTML(device.name)}</strong><small>${escapeHTML(device.identity || "")}</small><small>Chave: ${escapeHTML(device.fingerprint || "")}</small><small>Último acesso: ${escapeHTML(formatTime(device.last_seen_at || device.created_at))}</small><small>${escapeHTML(reauthenticationStatus)}</small>${(device.access_history || []).slice(0, 5).map(entry => `<small>${escapeHTML(deviceEventLabel(entry.event))} • ${escapeHTML(entry.email || "")} • ${escapeHTML(formatTime(entry.at))}${entry.ip ? ` • IP ${escapeHTML(entry.ip)}` : ""}</small>`).join("")}</div>
+      <div class="device-actions"><label>Reautenticação<select data-device-reauthentication="${escapeHTML(device.id)}" aria-label="Prazo de reautenticação de ${escapeHTML(device.name)}">${options}</select></label><button class="danger-button compact-button" data-device-revoke="${escapeHTML(device.id)}">Revogar</button></div>
+    </div>`;
+  }).join("") : '<div class="inline-notice">Nenhum dispositivo remoto cadastrado.</div>';
   const enrollmentRows = enrollmentRequests.length ? enrollmentRequests.map(request => `
     <div class="settings-project-row device-row">
       <div class="project-copy"><strong>${escapeHTML(request.name)}</strong><small>${escapeHTML(request.email || request.identity || "")}</small><small>Solicitado: ${escapeHTML(formatTime(request.created_at))} • ${escapeHTML(request.client_ip || "IP indisponível")}</small><small>Chave: ${escapeHTML(request.fingerprint || "")}</small></div>
@@ -4901,7 +6163,7 @@ function renderSettings(data) {
       <button type="button" data-settings-jump="codex-account" data-settings-title="Codex"><span class="category-icon">›_</span><span><strong>Codex</strong><small>Conta e ferramentas</small></span></button>
       <button type="button" data-settings-jump="projects-control" data-settings-title="Projetos"><span class="category-icon">◇</span><span><strong>Projetos</strong><small>Workers e sincronização</small></span></button>
       <button type="button" data-settings-jump="backup-recovery" data-settings-title="Backup e recuperação"><span class="category-icon">↻</span><span><strong>Backup</strong><small>Proteção e recuperação</small></span></button>
-      <button type="button" data-settings-jump="security-control" data-settings-title="Segurança"><span class="category-icon">✓</span><span><strong>Segurança</strong><small>Identidade e dispositivos</small></span></button>
+      <button type="button" data-settings-jump="security-control" data-settings-title="Segurança"><span class="category-icon">✓</span><span><strong>Segurança</strong><small>Identidade, dispositivos e autonomia</small></span></button>
       <button type="button" data-settings-jump="diagnostics-control" data-settings-title="Aplicativo e diagnóstico"><span class="category-icon">⋯</span><span><strong>Aplicativo</strong><small>Atualização e diagnóstico</small></span></button>
     </nav>
     <header class="settings-subpage-header hidden"><button type="button" class="secondary-button" data-settings-home>← Categorias</button><div><small>Configurações</small><strong id="settings-subpage-title"></strong></div></header>
@@ -4990,9 +6252,17 @@ function renderSettings(data) {
     <section id="security-control" class="settings-section">
       <div class="settings-section-title"><div><h3>Acesso externo de alta segurança</h3><p>Cloudflare Access ou Tailscale, identidade exata, chave do dispositivo e nenhuma porta administrativa pública.</p></div></div>
       <div class="maintenance-grid">
+        <article class="maintenance-card full approval-autonomy-card">
+          <div class="approval-autonomy-heading"><div><h3>Autonomia das aprovações</h3><p>Escolha quanto da navegação Playwright pode continuar sem interromper a conversa.</p></div><span class="approval-level-badge">Nível <strong id="approval-autonomy-output">${approvalLevel}</strong>/${approvalMax}</span></div>
+          <label class="approval-autonomy-range" for="settings-approval-autonomy"><span>Mais supervisão</span><input id="settings-approval-autonomy" type="range" min="1" max="${approvalMax}" step="1" value="${approvalLevel}" aria-valuetext="${escapeHTML(selectedApprovalLevel.name)}"><span>Mais autonomia</span></label>
+          <div class="approval-level-buttons" role="list" aria-label="Selecionar nível de autonomia">${approvalLevelButtons}</div>
+          <div id="approval-autonomy-summary" class="approval-level-summary">${approvalLevelSummaryMarkup(approvalLevel, selectedApprovalLevel)}</div>
+          <details class="approval-level-details"><summary>Comparar os ${approvalMax} níveis</summary><ol>${approvalLevelRows}</ol></details>
+          <div class="inline-notice approval-protection-note"><strong>Proteções que não mudam com o nível</strong><span><code>browser_run_code_unsafe</code>, operações destrutivas ou privilegiadas do host e confirmações fortes do Control Plane continuam exigindo avaliação explícita.</span><span>Compras, pagamentos, mensagens, publicações, permissões, login/MFA e ações irreversíveis também continuam exigindo confirmação específica.</span></div>
+        </article>
         <article class="maintenance-card"><h3>${cloudflareIdentity ? "Cloudflare Access ativo" : tailscale.installed ? "Tailscale instalado" : "Rede privada não configurada"}</h3><p>${cloudflareIdentity ? "Identidade Cloudflare verificada" : escapeHTML(tailscale.version || "Acesso somente local")}</p><span class="value">${cloudflareIdentity ? escapeHTML(state.identity) : tailscale.connected ? `Conectado: ${escapeHTML(tailscale.login || tailscale.dns_name || "sim")}` : "Desconectado"}</span>${local ? `<div class="card-actions">${!tailscale.installed ? '<button class="secondary-button" data-settings-action="install-tailscale">Instalar Tailscale opcional</button>' : ""}${tailscale.installed && !tailscale.connected ? '<button class="secondary-button" data-settings-action="connect-tailscale">Conectar Tailscale</button>' : ""}</div>` : ""}</article>
         <article class="maintenance-card"><h3>${security.remote_enabled ? "HTTPS privado ativo" : "Acesso remoto desativado"}</h3><p>${escapeHTML(security.external_url || "Somente localhost")}</p><span class="value">${escapeHTML(security.allowed_tailscale_login || "Nenhuma identidade externa liberada")}</span>${local ? `<div class="card-actions">${tailscale.connected && !security.remote_enabled ? '<button class="primary-button" data-settings-action="enable-remote">Ativar</button>' : ""}${security.remote_enabled ? '<button class="danger-button" data-settings-action="disable-remote">Desativar</button>' : ""}</div>` : ""}</article>
-        <article class="maintenance-card"><h3>Dispositivos cadastrados</h3><p>${security.paired_devices || devices.length}/${deviceLimit} dispositivo(s) autorizado(s)</p><span class="value">Novos dispositivos podem ser aprovados ou recusados por uma sessão já pareada</span><div class="card-actions"><button class="primary-button" data-settings-action="pair-device" ${!security.remote_enabled ? "disabled" : ""}>Pareamento manual</button></div></article>
+        <article class="maintenance-card"><h3>Dispositivos cadastrados</h3><p>${security.paired_devices || devices.length}/${deviceLimit} dispositivo(s) autorizado(s)</p><span class="value">Defina confirmação diária para navegadores públicos ou do trabalho e até 30 dias para os pessoais.</span><div class="card-actions"><button class="primary-button" data-settings-action="pair-device" ${!security.remote_enabled ? "disabled" : ""}>Pareamento manual</button></div></article>
         <article class="maintenance-card"><h3>Sessão atual</h3><p>${state.session?.device_id ? "Chave do dispositivo verificada" : "Acesso local confiável"}</p><span class="value">${escapeHTML(state.session?.device_id || "localhost")}</span></article>
       </div>
       ${deviceAdmin ? `<div class="settings-project-list device-list">${deviceRows}</div><h4>Solicitações pendentes</h4><div class="settings-project-list device-list">${enrollmentRows}</div>` : '<div class="inline-notice">A administração de dispositivos exige uma sessão já pareada.</div>'}
@@ -5096,6 +6366,59 @@ function showSettingsPage(pageId = "overview") {
     section.classList.toggle("hidden", page === "overview" || section.id !== page);
   });
   if (selectors.settingsContent) selectors.settingsContent.scrollTop = 0;
+}
+
+function previewApprovalAutonomy(level) {
+  const autonomy = state.lastStatus?.security?.approval_autonomy || {};
+  const levels = Array.isArray(autonomy.levels) ? autonomy.levels : [];
+  const selected = Math.max(1, Math.min(approvalLevelMaximum(levels), Number(level || 1)));
+  const definition = levels.find(item => Number(item.level) === selected);
+  const range = el("settings-approval-autonomy");
+  const output = el("approval-autonomy-output");
+  const summary = el("approval-autonomy-summary");
+  if (range) {
+    range.value = String(selected);
+    if (definition?.name) range.setAttribute("aria-valuetext", definition.name);
+  }
+  if (output) output.textContent = String(selected);
+  if (summary && definition) summary.innerHTML = approvalLevelSummaryMarkup(selected, definition);
+  selectors.settingsContent?.querySelectorAll("[data-approval-autonomy-level]").forEach(button => {
+    const active = Number(button.dataset.approvalAutonomyLevel) === selected;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-current", String(active));
+  });
+  selectors.settingsContent?.querySelectorAll(".approval-level-details li").forEach((item, index) => item.classList.toggle("active", index + 1 === selected));
+}
+
+let approvalAutonomySaveChain = Promise.resolve();
+
+function updateApprovalAutonomyLevel(level) {
+  const levels = state.lastStatus?.security?.approval_autonomy?.levels || [];
+  const selected = Math.max(1, Math.min(approvalLevelMaximum(levels), Number(level || 1)));
+  previewApprovalAutonomy(selected);
+  const save = approvalAutonomySaveChain.then(async () => {
+    const controls = [...(selectors.settingsContent?.querySelectorAll("#settings-approval-autonomy, [data-approval-autonomy-level]") || [])];
+    controls.forEach(control => { control.disabled = true; });
+    try {
+      const result = await api("/api/security/approval-autonomy", {
+        method:"PATCH",
+        body:JSON.stringify({level:selected}),
+      });
+      if (state.lastStatus?.security) state.lastStatus.security.approval_autonomy = result.approval_autonomy;
+      renderSettings(state.lastStatus);
+      toast(`Autonomia de aprovações ajustada para o nível ${result.approval_autonomy?.level || selected}.`, "success");
+      return result;
+    } catch (error) {
+      const current = Number(state.lastStatus?.security?.approval_autonomy?.level || 7);
+      previewApprovalAutonomy(current);
+      controls.forEach(control => { control.disabled = false; });
+      throw error;
+    }
+  });
+  // Keep the queue usable after a failed request while returning the original
+  // promise so the event handler can still present that error to the operator.
+  approvalAutonomySaveChain = save.catch(() => undefined);
+  return save;
 }
 
 async function sendControl(action, params = {}, destructive = false) {
@@ -5786,7 +7109,7 @@ function connectTerminal(workspaceOverride = state.terminalWorkspace || activeWo
   selectors.terminalState.className = "status-chip warn";
   const emergency = workspace === "codex-emergency";
   el("terminal-scope").textContent = emergency ? "Codex Sistema • emergência" : workspace === "system" ? "Codex do Sistema" : state.activeProject.name;
-  el("terminal-privilege").textContent = emergency ? "Codex do Sistema • sudo sem senha" : workspace === "system" ? "root no host • sudo sem senha" : "Codex de Projetos • sem sudo no host";
+  el("terminal-privilege").textContent = emergency ? "codex • administração auditável pelo broker" : workspace === "system" ? "root no host • sudo sem senha" : "codex-worker • sem sudo no host";
   el("terminal-prompt").textContent = emergency ? "›" : "$";
   selectors.terminalInput.placeholder = emergency ? "Diga ao Codex o que deseja verificar, operar ou reparar" : "Digite um comando";
   selectors.terminalInput.setAttribute("aria-label", emergency ? "Instrução para o Codex Sistema" : "Comando do terminal");
@@ -5846,7 +7169,9 @@ function populateRemoteEnvironmentChooser() {
   const select = selectors.remoteProjectSelect;
   if (!select) return [];
   const projects = state.projects.filter(project => project.kind !== "system");
-  const preferred = state.activeProject?.kind !== "system" ? state.activeProject.id : select.value;
+  const preferred = state.activeProject && state.activeProject.kind !== "system"
+    ? state.activeProject.id
+    : select.value;
   select.replaceChildren();
   if (!projects.length) {
     const option = document.createElement("option");
@@ -5945,12 +7270,14 @@ async function loadPairedDevices() {
     const data = await api("/api/security/devices");
     state.devices = data.devices || [];
     state.enrollmentRequests = data.enrollment_requests || [];
+    state.reauthenticationOptions = data.reauthentication_options || [];
     state.localNetworkAdmin = Boolean(data.local_network_admin);
     state.deviceAdmin = Boolean(data.device_admin);
     state.deviceLimit = Number(data.device_limit || 6);
   } catch (error) {
     state.devices = [];
     state.enrollmentRequests = [];
+    state.reauthenticationOptions = [];
     state.localNetworkAdmin = false;
     state.deviceAdmin = false;
     state.deviceLimit = 6;
@@ -5973,6 +7300,17 @@ async function revokePairedDevice(deviceId) {
   await loadPairedDevices();
   if (state.lastStatus) renderSettings(state.lastStatus);
   toast("Dispositivo revogado.", "success");
+}
+
+async function updateDeviceReauthentication(deviceId, intervalSeconds) {
+  const data = await api(`/api/security/devices/${encodeURIComponent(deviceId)}/reauthentication`, {
+    method:"PATCH",
+    body:JSON.stringify({interval_seconds:Number(intervalSeconds)}),
+  });
+  const index = state.devices.findIndex(item => item.id === deviceId);
+  if (index >= 0 && data.device) state.devices[index] = data.device;
+  if (state.lastStatus) renderSettings(state.lastStatus);
+  toast("Prazo de reautenticação atualizado.", "success");
 }
 
 function remoteDeviceInfo(profileOverride = selectors.remoteProfile?.value || "auto") {
@@ -6105,6 +7443,7 @@ async function openRemoteDesktop(options = {}) {
   const launchBrowser = Boolean(options.browser);
   const liveBrowser = Boolean(options.liveBrowser);
   const liveAndroid = Boolean(options.liveAndroid);
+  const readOnlyBrowserView = liveBrowser && Boolean(state.session?.read_only_automation);
   const launchApplication = String(options.application || "");
   const browserSession = launchBrowser || liveBrowser || liveAndroid;
   const browserUrl = String(options.url || "about:blank");
@@ -6132,13 +7471,14 @@ async function openRemoteDesktop(options = {}) {
   state.remote.launchBrowserOnOpen = launchBrowser;
   setRemoteToolbarExpanded(false);
   selectors.remoteDialog.classList.toggle("browser-session", browserSession);
+  selectors.remoteDialog.classList.toggle("read-only-session", readOnlyBrowserView);
   // O acesso remoto comum segue o visor ao vivo: toda a janela pertence à
   // transmissão e os controles ficam sobrepostos em um menu flutuante.
   selectors.remoteDialog.classList.add("immersive");
   el("remote-fullscreen")?.setAttribute("aria-pressed", String(Boolean(document.fullscreenElement)));
   const remoteTitle = el("remote-dialog-title");
-  if (remoteTitle) remoteTitle.textContent = String(options.title || (liveAndroid ? "Android da conversa ao vivo" : liveBrowser ? "Navegador da conversa ao vivo" : launchBrowser ? "Navegador compartilhado" : "Área de trabalho Linux"));
-  if (selectors.remoteFrame) selectors.remoteFrame.title = liveAndroid ? "Android da conversa, visualização e controle em tempo real" : browserSession ? "Navegador da conversa, visualização e controle em tempo real" : "Tela interativa do computador Linux";
+  if (remoteTitle) remoteTitle.textContent = String(options.title || (liveAndroid ? "Android da conversa ao vivo" : readOnlyBrowserView ? "Navegação da conversa ao vivo" : liveBrowser ? "Navegador da conversa ao vivo" : launchBrowser ? "Navegador compartilhado" : "Área de trabalho Linux"));
+  if (selectors.remoteFrame) selectors.remoteFrame.title = readOnlyBrowserView ? "Navegação da conversa, visualização ao vivo somente leitura" : liveAndroid ? "Android da conversa, visualização e controle em tempo real" : browserSession ? "Navegador da conversa, visualização e controle em tempo real" : "Tela interativa do computador Linux";
   if (launchBrowser && selectors.remoteProfile?.value === "auto") {
     const touchPhone = (navigator.maxTouchPoints > 0 || matchMedia("(pointer: coarse)").matches)
       && Math.min(window.innerWidth, window.innerHeight) <= 700;
@@ -6149,7 +7489,10 @@ async function openRemoteDesktop(options = {}) {
   state.remote.dialogOpen = true;
   document.body.classList.add("remote-open");
   setRemotePlaceholder(true);
-  selectors.remoteLiveStatus.textContent = liveAndroid ? "Conectando à sessão Android privada…" : liveBrowser ? "Preparando a janela Playwright isolada…" : state.remote.target === "codex" ? "Preparando o GNOME Ubuntu do Codex…" : state.remote.target === "projects" ? "Preparando o perfil Ubuntu do Codex de Projetos…" : state.remote.target === "desktop" ? "Preparando o GNOME padrão remoto no mini PC…" : "Trocando o perfil do HDMI para jogos sem reiniciar o computador…";
+  selectors.remoteLiveStatus.textContent = liveAndroid ? "Conectando à sessão Android privada…" : readOnlyBrowserView ? "Conectando ao visor Playwright somente leitura…" : liveBrowser ? "Preparando a janela Playwright isolada…" : state.remote.target === "codex" ? "Preparando o GNOME Ubuntu do Codex…" : state.remote.target === "projects" ? "Preparando o perfil Ubuntu do Codex de Projetos…" : state.remote.target === "desktop" ? "Preparando o GNOME padrão remoto no mini PC…" : "Trocando o perfil do HDMI para jogos sem reiniciar o computador…";
+  if (readOnlyBrowserView) {
+    setRemotePlaceholder(true, "Abrindo a navegação ao vivo", "A identidade interna pode acompanhar a tela sem enviar mouse, teclado ou comandos.");
+  }
   if (liveAndroid) {
     setRemotePlaceholder(true, "Preparando o Android ao vivo", "A mesma sessão Waydroid usada na automação será exibida com toque, mouse e teclado.");
   }
@@ -6158,15 +7501,40 @@ async function openRemoteDesktop(options = {}) {
     setRemotePlaceholder(true, projects ? "Preparando o Codex de Projetos" : state.remote.target === "desktop" ? "Preparando o Desktop Ubuntu" : "Preparando a tela de jogos", projects ? "Uma sessão privada do usuário codex-worker será aberta sem interromper os workers nem a VM." : state.remote.target === "desktop" ? "Uma sessão GNOME padrão segura será aberta no mini PC; servidor e Codex continuam ativos." : "A sessão do HDMI será trocada para o perfil de jogos; servidor e Codex continuam ativos.");
   }
   try {
+    if (readOnlyBrowserView) {
+      const threadId = String(options.threadId || state.activeThreadId || "").trim();
+      if (!/^[A-Za-z0-9_-]{1,200}$/.test(threadId)) throw new Error("Selecione uma conversa com navegação ativa.");
+      const status = await api("/api/remote-desktop/status?target=playwright");
+      if (!status.running || !status.browser_running) throw new Error("A navegação ao vivo desta conversa ainda não está ativa.");
+      const query = new URLSearchParams({
+        target:"playwright",
+        thread_id:threadId,
+        view_only:"1",
+        v:"20260826-internal-live-view248",
+      });
+      status.viewer_url = `/remote-viewer.html?${query.toString()}`;
+      status.read_only = true;
+      state.remote.status = status;
+      state.remote.lastResizeSignature = "read-only-view";
+      loadRemoteViewer(status.viewer_url);
+      selectors.remoteLiveStatus.textContent = "Ao vivo • somente consulta";
+      return status;
+    }
     const payload = {
       ...remoteDeviceInfo(),
       target:remoteTarget,
       thread_id:liveBrowser ? String(options.threadId || state.activeThreadId || "") : "",
     };
     const status = await api("/api/remote-desktop/start", {method:"POST", body:JSON.stringify(payload)});
+    const viewerUrl = String(
+      status.viewer_url
+      || (remoteTarget === "jogos" ? "/remote-viewer.html?target=jogos&v=20260830-steam-viewer281" : ""),
+    );
+    if (!viewerUrl) throw new Error("A sessão foi iniciada, mas o endereço do visor remoto não foi informado.");
+    status.viewer_url = viewerUrl;
     state.remote.status = status;
     state.remote.lastResizeSignature = remoteResizeSignature(payload);
-    loadRemoteViewer(status.viewer_url);
+    loadRemoteViewer(viewerUrl);
     selectors.remoteLiveStatus.textContent = describeRemoteStatus(status);
     if (remoteTarget === "playwright") await syncRemoteMobileLayoutControl();
     if (launchApplication && remoteTarget === "codex") {
@@ -6199,6 +7567,7 @@ function closeRemoteDialog() {
   setRemoteToolbarExpanded(false);
   selectors.remoteDialog.classList.remove("immersive");
   selectors.remoteDialog.classList.remove("browser-session");
+  selectors.remoteDialog.classList.remove("read-only-session");
   if (document.fullscreenElement) document.exitFullscreen().catch(() => null);
   if (selectors.remoteDialog.open) selectors.remoteDialog.close();
   state.remote.dialogOpen = false;
@@ -6237,6 +7606,7 @@ async function launchRemoteApplication(application) {
 
 async function fitRemoteDesktop() {
   if (!state.remote.dialogOpen) return;
+  if (selectors.remoteDialog.classList.contains("read-only-session")) return;
   clearTimeout(state.remote.resizeTimer);
   state.remote.resizeTimer = setTimeout(async () => {
     try {
@@ -6295,7 +7665,15 @@ function resetRemoteKeyboardTransport(discard = false) {
   clearRemoteKeyboardAckTimer();
   state.remote.keyboardViewerReady = false;
   state.remote.keyboardInFlight = null;
-  if (discard) state.remote.keyboardQueue = [];
+  if (discard) {
+    state.remote.keyboardQueue = [];
+    clearTimeout(state.remote.keyboardModalityTimer);
+    state.remote.keyboardModalityTimer = null;
+    state.remote.keyboardVisibilityRequest = null;
+    state.remote.keyboardVisibilityTarget = "";
+    state.remote.ubuntuKeyboardVisible = null;
+    state.remote.inputModality = "";
+  }
 }
 
 function flushRemoteKeyboardQueue() {
@@ -6363,6 +7741,10 @@ function handleRemoteKeyboardBridgeMessage(data) {
     scheduleRemoteUbuntuKeyboardAutoHide(data.x, data.y, data.target);
     return true;
   }
+  if (data?.type === "sasocq-remote-input-modality") {
+    noteRemoteInputModality(data.modality, data.target);
+    return true;
+  }
   if (data?.type === "sasocq-remote-diagnostic") {
     console.debug("[visor remoto]", data.stage || "evento", data.detail || "");
     return true;
@@ -6411,31 +7793,65 @@ function installRemotePointerStateBridge() {
 }
 
 async function showRemoteUbuntuKeyboard(options = {}) {
-  const target = state.remote.sessionTarget || state.remote.target || "codex";
+  const target = String(options.target || state.remote.sessionTarget || state.remote.target || "codex");
+  if (!["codex", "desktop", "playwright"].includes(target)) {
+    throw new Error("O teclado touch do Ubuntu não está disponível nesta sessão.");
+  }
   hideRemoteKeyboard({preserveMode:true});
-  if (target === "playwright") {
-    const status = await api("/api/remote-desktop/keyboard?target=playwright&toggle=true", {method:"POST"});
-    setRemoteKeyboardMode(status.visible ? "ubuntu" : "none");
-    selectors.remoteLiveStatus.textContent = status.visible ? "Teclado touch do Ubuntu aberto." : "Teclado touch do Ubuntu ocultado.";
-    setRemoteToolbarExpanded(false);
-    return;
-  }
-  if (target !== "codex") throw new Error("O teclado touch do Ubuntu não está disponível nesta sessão.");
+  const automatic = Boolean(options.automatic);
+  const hasVisible = Object.hasOwn(options, "visible");
+  const desired = hasVisible ? Boolean(options.visible) : null;
+  const query = new URLSearchParams({target});
+  if (hasVisible) query.set("visible", String(desired));
+  else query.set("toggle", "true");
+  const requestKey = `${target}:${hasVisible ? desired : "toggle"}`;
+  if (automatic && state.remote.keyboardVisibilityRequest === requestKey) return null;
+  state.remote.keyboardVisibilityRequest = requestKey;
   try {
-    const viewer = selectors.remoteFrame?.contentWindow;
-    if (!viewer || viewer.location.pathname !== "/remote-viewer.html") throw new Error("Visor nativo indisponível");
-    viewer.postMessage({type:"sasocq-remote-native-keyboard"}, location.origin);
-    setRemoteKeyboardMode("none");
-    selectors.remoteLiveStatus.textContent = "Alternando o teclado touch nativo do Ubuntu…";
+    const status = await api(`/api/remote-desktop/keyboard?${query}`, {method:"POST"});
+    state.remote.keyboardVisibilityTarget = target;
+    state.remote.ubuntuKeyboardVisible = Boolean(status.visible);
+    setRemoteKeyboardMode(status.visible ? "ubuntu" : "none");
+    if (selectors.remoteLiveStatus && (!automatic || status.visible === desired)) {
+      selectors.remoteLiveStatus.textContent = status.visible
+        ? (automatic ? "Toque detectado • teclado do Ubuntu aberto." : "Teclado touch do Ubuntu aberto.")
+        : (automatic ? "Teclado físico detectado • digitação direta ativa." : "Teclado touch do Ubuntu ocultado.");
+    }
     setRemoteToolbarExpanded(false);
+    return status;
   } catch (error) {
-    if (!options.automatic) toast("Não foi possível abrir o teclado touch do Ubuntu nesta transmissão.", "error");
+    state.remote.ubuntuKeyboardVisible = null;
+    if (!automatic) toast("Não foi possível controlar o teclado touch do Ubuntu nesta transmissão.", "error");
     throw error;
+  } finally {
+    if (state.remote.keyboardVisibilityRequest === requestKey) state.remote.keyboardVisibilityRequest = null;
   }
+}
+
+function noteRemoteInputModality(modality, target = state.remote.sessionTarget || state.remote.target || "codex") {
+  const mode = String(modality || "");
+  const remoteTarget = String(target || "");
+  if (!["touch", "physical-keyboard"].includes(mode)) return;
+  if (!["codex", "desktop", "playwright"].includes(remoteTarget)) return;
+  if (!state.remote.dialogOpen || selectors.remoteDialog?.classList.contains("read-only-session")) return;
+  const desired = mode === "touch";
+  const alreadySelected = state.remote.inputModality === mode
+    && state.remote.keyboardVisibilityTarget === remoteTarget
+    && state.remote.ubuntuKeyboardVisible === desired;
+  state.remote.inputModality = mode;
+  if (alreadySelected) return;
+  clearTimeout(state.remote.keyboardModalityTimer);
+  state.remote.keyboardModalityTimer = setTimeout(() => {
+    state.remote.keyboardModalityTimer = null;
+    showRemoteUbuntuKeyboard({automatic:true, visible:desired, target:remoteTarget}).catch(error => {
+      console.debug("Não foi possível sincronizar a modalidade de entrada remota", error);
+    });
+  }, mode === "touch" ? 40 : 0);
 }
 
 function scheduleRemoteUbuntuKeyboardAutoHide(x, y, target) {
   if (String(target || "") !== "playwright") return;
+  if (state.remote.inputModality === "touch") return;
   const remoteX = Number(x);
   const remoteY = Number(y);
   if (!Number.isFinite(remoteX) || !Number.isFinite(remoteY)) return;
@@ -6944,6 +8360,10 @@ function installRemoteTouchBridge() {
     };
     doc.documentElement.style.touchAction = "none";
     doc.body && (doc.body.style.touchAction = "none");
+    doc.addEventListener("keydown", event => {
+      if (!event.isTrusted || event.repeat || event.isComposing) return;
+      noteRemoteInputModality("physical-keyboard");
+    }, true);
     doc.addEventListener("touchstart", event => {
       if (event.touches.length < 2) return;
       if (gesture?.directDown) postNativeRemotePointer({action:"direct-cancel", x:gesture.lastX, y:gesture.lastY});
@@ -6971,6 +8391,7 @@ function installRemoteTouchBridge() {
     doc.addEventListener("touchcancel", finishNativeMultiTouch, {capture:true, passive:false});
     doc.addEventListener("pointerdown", event => {
       if (event.pointerType !== "touch") return;
+      noteRemoteInputModality("touch");
       points.set(event.pointerId, {x:event.clientX, y:event.clientY});
       if (points.size >= 2) {
         if (gesture?.directDown) postNativeRemotePointer({action:"direct-cancel", x:gesture.lastX, y:gesture.lastY});
@@ -7210,12 +8631,41 @@ function autoResizePrompt() {
   selectors.prompt.style.height = `${Math.min(selectors.prompt.scrollHeight, 180)}px`;
 }
 
+function isDigitalKeyboardEnter(event) {
+  return Number(event.keyCode || event.which || 0) === 229
+    || event.code === "Unidentified"
+    || document.body.classList.contains("virtual-keyboard-open")
+    || Number(navigator.virtualKeyboard?.boundingRect?.height || 0) > 0;
+}
+
+function handlePromptKeydown(event) {
+  if (event.defaultPrevented || event.key !== "Enter" || event.shiftKey || event.isComposing) return;
+  if (isDigitalKeyboardEnter(event)) return;
+  event.preventDefault();
+  sendMessage();
+}
+
 function closeMobilePanels() {
   selectors.sidebar.classList.remove("open");
   selectors.inspector.classList.remove("open");
 }
 
 const desktopLayout = window.matchMedia("(min-width: 901px)");
+
+function selectInspectorTab(name, {open = false, focusSelector = ""} = {}) {
+  const normalized = ({queue:"summary", approvals:"summary", diff:"execution", activity:"execution", terminal:"execution", tools:"execution"})[name] || name;
+  document.querySelectorAll(".inspector .tab").forEach(tab => {
+    const active = tab.dataset.tab === normalized;
+    tab.classList.toggle("active", active);
+    tab.setAttribute("aria-selected", String(active));
+  });
+  document.querySelectorAll(".inspector .tab-panel").forEach(panel => panel.classList.toggle("active", panel.id === `tab-${normalized}`));
+  if (open) setDesktopPanel("inspector", true);
+  if (normalized === "screen") refreshRemoteStatus();
+  if (focusSelector) window.setTimeout(() => document.querySelector(focusSelector)?.scrollIntoView({block:"nearest"}), 40);
+}
+
+window.selectInspectorTab = selectInspectorTab;
 
 function setDesktopPanel(panel, open, {persist = true} = {}) {
   if (!desktopLayout.matches) {
@@ -7226,6 +8676,32 @@ function setDesktopPanel(panel, open, {persist = true} = {}) {
   el("app").classList.toggle(collapsedClass, !open);
   if (panel === "inspector") el("open-inspector").setAttribute("aria-pressed", String(open));
   if (persist) localStorage.setItem(`clc-desktop-${panel}`, open ? "open" : "closed");
+}
+
+function inspectorPanelIsOpen() {
+  if (!desktopLayout.matches) return selectors.inspector.classList.contains("open");
+  return !el("app").classList.contains("inspector-collapsed");
+}
+
+function syncApprovalInspectorAutoOpen({force = false} = {}) {
+  const manual = manualPendingApprovals();
+  const attentionKey = manual.map(item => `${item.workspace || "system"}:${item.id}`).sort().join("|");
+  const newAttention = Boolean(attentionKey && attentionKey !== state.inspectorAttentionKey);
+  const shouldOpen = isGeneralConversationList() && Boolean(attentionKey) && (force || newAttention);
+
+  if (shouldOpen && !inspectorPanelIsOpen()) {
+    selectInspectorTab("summary");
+    setDesktopPanel("inspector", true, {persist:false});
+    state.inspectorAutoOpenedForApproval = true;
+  } else if (state.inspectorAutoOpenedForApproval && (!isGeneralConversationList() || !attentionKey)) {
+    setDesktopPanel("inspector", false, {persist:false});
+    state.inspectorAutoOpenedForApproval = false;
+  }
+  state.inspectorAttentionKey = attentionKey;
+}
+
+function claimAutoOpenedInspector() {
+  state.inspectorAutoOpenedForApproval = false;
 }
 
 function restoreDesktopPanels() {
@@ -7285,17 +8761,28 @@ function installVisualViewportSizing() {
     const offsetTop = Math.max(0, Math.round(viewport?.offsetTop || 0));
     const remoteOpen = document.body.classList.contains("remote-open");
     const stableRemoteHeight = Number(state.remote.stableViewportHeight || 0);
-    const keyboardOpen = remoteOpen && stableRemoteHeight > 0
+    const geometryKeyboardOpen = Number(navigator.virtualKeyboard?.boundingRect?.height || 0) > 0;
+    const touchComposer = document.activeElement === selectors.prompt
+      && navigator.maxTouchPoints > 0
+      && window.matchMedia?.("(pointer: coarse)")?.matches;
+    const composerKeyboardOpen = touchComposer
+      && Number(state.composerViewportBaseline || 0) - height > 120;
+    const keyboardOpen = geometryKeyboardOpen || composerKeyboardOpen || (remoteOpen && stableRemoteHeight > 0
       ? stableRemoteHeight - height > 160
-      : window.innerHeight - height > 160;
+      : window.innerHeight - height > 160);
+    if (!remoteOpen && !keyboardOpen) {
+      state.composerViewportBaseline = Math.max(window.innerHeight, height);
+    }
     const bottomInset = Math.max(0, Math.round(window.innerHeight - height - offsetTop));
-    root.style.setProperty("--app-height", `${keyboardOpen ? stableRemoteHeight : height}px`);
+    const appHeight = keyboardOpen && remoteOpen && stableRemoteHeight > 0 ? stableRemoteHeight : height;
+    root.style.setProperty("--app-height", `${appHeight}px`);
     root.style.setProperty("--visual-viewport-bottom", `${bottomInset}px`);
     document.body.classList.toggle("virtual-keyboard-open", keyboardOpen);
   };
   sync();
   window.visualViewport?.addEventListener("resize", sync, {passive:true});
   window.visualViewport?.addEventListener("scroll", sync, {passive:true});
+  navigator.virtualKeyboard?.addEventListener?.("geometrychange", sync);
   window.addEventListener("orientationchange", sync, {passive:true});
   window.addEventListener("resize", sync, {passive:true});
 }
@@ -7357,11 +8844,20 @@ function bindEvents() {
   selectors.effort.addEventListener("change", saveComposerPreferences);
   selectors.speed.addEventListener("change", saveComposerPreferences);
   selectors.network.addEventListener("change", saveComposerPreferences);
-  selectors.prompt.addEventListener("input", autoResizePrompt);
+  selectors.prompt.addEventListener("focus", () => {
+    const height = Math.round(window.visualViewport?.height || window.innerHeight);
+    state.composerViewportBaseline = Math.max(state.composerViewportBaseline || 0, window.innerHeight, height);
+  });
+  selectors.prompt.addEventListener("input", () => {
+    autoResizePrompt();
+    persistComposerDraft();
+    finishDeferredSystemUpdateReload();
+  });
+  selectors.prompt.addEventListener("keydown", handlePromptKeydown);
   el("new-thread").addEventListener("click", newThread);
   el("project-new-thread").addEventListener("click", newThread);
   el("refresh-threads").addEventListener("click", loadThreads);
-  el("thread-search").addEventListener("input", handleThreadSearchInput);
+  el("thread-search")?.addEventListener("input", handleThreadSearchInput);
   selectors.messageList.addEventListener("click", event => {
     if (event.target.closest(".execution-status-card")) {
       resumeConversationAutoFollow();
@@ -7488,16 +8984,51 @@ function bindEvents() {
     closeMobilePanels();
     state.settingsPage = "system-control";
     if (!selectors.settingsDialog.open) selectors.settingsDialog.showModal();
-    await Promise.all([loadProjects(), loadStatus(), loadConfiguredAccounts()]);
+    await Promise.all([loadProjects(), loadStatus(), loadAccount({}, "system"), loadAccount({}, "projects")]);
   });
   const openPCData = () => {
     closeMobilePanels();
+    state.pcDataTab = "overview";
+    renderPCDataPanel();
     loadPCResources({openDialog:true}).catch(error => toast(error.message, "error"));
   };
   el("open-pc-data")?.addEventListener("click", openPCData);
   el("resource-alert")?.addEventListener("click", openPCData);
-  el("close-pc-data")?.addEventListener("click", () => selectors.pcDataDialog?.close());
-  el("refresh-pc-data")?.addEventListener("click", () => loadPCResources({announce:true}));
+  const closePCData = () => { stopPCActivityRefresh(); selectors.pcDataDialog?.close(); };
+  el("close-pc-data")?.addEventListener("click", closePCData);
+  selectors.pcDataDialog?.addEventListener("close", stopPCActivityRefresh);
+  selectors.pcDataTabs?.addEventListener("click", event => {
+    const tab = event.target.closest("[data-pc-tab]")?.dataset.pcTab;
+    if (tab) selectPCDataTab(tab).catch(error => toast(error.message, "error"));
+  });
+  selectors.pcDataPanel?.addEventListener("click", async event => {
+    const openTab = event.target.closest("[data-pc-open-tab]")?.dataset.pcOpenTab;
+    if (openTab) return selectPCDataTab(openTab);
+    const load = event.target.closest("[data-pc-load]")?.dataset.pcLoad;
+    if (load === "storage") return loadPCStorage({refresh:true, announce:true});
+    if (load === "activities") return loadPCActivities({announce:true});
+    const refresh = event.target.closest("[data-pc-refresh]")?.dataset.pcRefresh;
+    if (refresh === "storage") return loadPCStorage({refresh:true, announce:true});
+    if (refresh === "activities") return loadPCActivities({announce:true});
+    const control = event.target.closest("[data-pc-control]");
+    if (!control) return;
+    const action = control.dataset.pcControl;
+    const operation = control.dataset.pcOperation;
+    if (action === "workers" && operation === "stop" && !window.confirm("Encerrar agora todas as atividades do Codex de Projetos? Conversas em execução serão interrompidas.")) return;
+    if (action === "steam" && operation === "stop" && !window.confirm("Fechar o jogo e a sessão Steam agora? Progresso não salvo pode ser perdido.")) return;
+    await sendControl(action, {operation});
+    await loadPCActivities({announce:true});
+  });
+  selectors.pcDataPanel?.addEventListener("change", event => {
+    if (event.target.id !== "pc-activity-sort") return;
+    state.pcActivitySort = event.target.value === "cpu" ? "cpu" : "memory";
+    renderPCDataPanel();
+  });
+  el("refresh-pc-data")?.addEventListener("click", async () => {
+    if (state.pcDataTab === "storage") await loadPCStorage({refresh:true, announce:true});
+    else if (state.pcDataTab === "activities") await loadPCActivities({announce:true});
+    else await loadPCResources({announce:true});
+  });
   el("pc-data-system-details")?.addEventListener("click", () => {
     selectors.pcDataDialog?.close();
     el("open-system").click();
@@ -7507,15 +9038,15 @@ function bindEvents() {
     closeMobilePanels();
     state.settingsPage = "overview";
     if (!selectors.settingsDialog.open) selectors.settingsDialog.showModal();
-    await Promise.all([loadProjects(), loadStatus(), loadConfiguredAccounts()]);
+    await Promise.all([loadProjects(), loadStatus(), loadAccount({}, "system"), loadAccount({}, "projects")]);
   };
   el("open-settings").addEventListener("click", openSettings);
   el("rail-open-settings")?.addEventListener("click", openSettings);
   el("close-settings").addEventListener("click", () => selectors.settingsDialog.close());
   el("close-settings-bottom").addEventListener("click", () => selectors.settingsDialog.close());
-  el("refresh-status").addEventListener("click", async () => { await loadProjects(); await loadStatus(); await loadConfiguredAccounts(); });
+  el("refresh-status").addEventListener("click", async () => { await loadProjects(); await loadStatus(); await Promise.all([loadAccount({}, "system"), loadAccount({}, "projects")]); });
   el("open-conversation-home").addEventListener("click", () => clearProjectSelection().catch(error => toast(error.message, "error")));
-  el("reload-page").addEventListener("click", () => window.location.reload());
+  el("reload-page").addEventListener("click", () => { persistComposerDraft(); window.location.reload(); });
   el("system-update").addEventListener("click", () => handleSystemUpdate());
   el("system-update-blockers-close").addEventListener("click", () => el("system-update-blockers-dialog").close());
   el("system-update-progress-close").addEventListener("click", () => {
@@ -7525,10 +9056,14 @@ function bindEvents() {
   el("open-sidebar").addEventListener("click", () => setDesktopPanel("sidebar", true));
   el("close-sidebar").addEventListener("click", () => setDesktopPanel("sidebar", false));
   el("open-inspector").addEventListener("click", () => {
+    claimAutoOpenedInspector();
     const open = !desktopLayout.matches || el("app").classList.contains("inspector-collapsed");
     setDesktopPanel("inspector", open);
   });
-  el("close-inspector").addEventListener("click", () => setDesktopPanel("inspector", false));
+  el("close-inspector").addEventListener("click", () => {
+    claimAutoOpenedInspector();
+    setDesktopPanel("inspector", false);
+  });
 
   selectors.setupBack.addEventListener("click", backSetup);
   selectors.setupNext.addEventListener("click", advanceSetup);
@@ -7693,6 +9228,10 @@ function bindEvents() {
   });
 
   el("retry-device-auth").addEventListener("click", async () => {
+    if (el("retry-device-auth").dataset.authAction === "cloudflare-reauthenticate") {
+      window.location.assign("/cdn-cgi/access/logout");
+      return;
+    }
     const session = await establishSession().catch(error => { setDeviceAuthOverlay(true, error.message); return null; });
     if (session) { state.session = session; state.csrf = session.csrf; state.identity = session.identity; location.reload(); }
   });
@@ -7720,6 +9259,12 @@ function bindEvents() {
       showSettingsPage(targetId);
       return;
     }
+    const approvalLevel = event.target.closest("[data-approval-autonomy-level]")?.dataset.approvalAutonomyLevel;
+    if (approvalLevel) {
+      previewApprovalAutonomy(approvalLevel);
+      updateApprovalAutonomyLevel(approvalLevel).catch(error => toast(error.message, "error"));
+      return;
+    }
     const action = event.target.closest("[data-settings-action]")?.dataset.settingsAction;
     if (action) { handleSettingsAction(action).catch(error => toast(error.message, "error")); return; }
     const deviceId = event.target.closest("[data-device-revoke]")?.dataset.deviceRevoke;
@@ -7729,7 +9274,20 @@ function bindEvents() {
     const rejectId = event.target.closest("[data-enrollment-reject]")?.dataset.enrollmentReject;
     if (rejectId) decideEnrollmentRequest(rejectId, "reject").catch(error => toast(error.message, "error"));
   });
+  selectors.settingsContent.addEventListener("input", event => {
+    if (event.target.id === "settings-approval-autonomy") previewApprovalAutonomy(event.target.value);
+  });
   selectors.settingsContent.addEventListener("change", event => {
+    if (event.target.id === "settings-approval-autonomy") {
+      updateApprovalAutonomyLevel(event.target.value).catch(error => toast(error.message, "error"));
+      return;
+    }
+    const reauthenticationDeviceId = event.target.closest("[data-device-reauthentication]")?.dataset.deviceReauthentication;
+    if (reauthenticationDeviceId) {
+      updateDeviceReauthentication(reauthenticationDeviceId, event.target.value)
+        .catch(error => { toast(error.message, "error"); loadPairedDevices().then(() => state.lastStatus && renderSettings(state.lastStatus)); });
+      return;
+    }
     if (event.target.id === "settings-system-update-automatic") {
       const enabled = event.target.checked;
       setAutomaticSystemUpdates(enabled)
@@ -7761,16 +9319,18 @@ function bindEvents() {
     }
   });
 
-  document.querySelectorAll(".tab").forEach(button => button.addEventListener("click", () => {
-    document.querySelectorAll(".tab").forEach(item => item.classList.toggle("active", item === button));
-    document.querySelectorAll(".tab-panel").forEach(panel => panel.classList.toggle("active", panel.id === `tab-${button.dataset.tab}`));
-    if (button.dataset.tab === "terminal") openTerminal();
-    if (button.dataset.tab === "screen") refreshRemoteStatus();
+  document.querySelectorAll(".inspector .tab").forEach(button => button.addEventListener("click", () => {
+    claimAutoOpenedInspector();
+    selectInspectorTab(button.dataset.tab);
   }));
   document.querySelectorAll(".suggestion").forEach(button => button.addEventListener("click", () => {
     if (!state.activeProject) return toast("Selecione um projeto para usar esta opção.");
-    selectors.prompt.value = button.dataset.prompt; autoResizePrompt(); selectors.prompt.focus();
+    selectors.prompt.value = button.dataset.prompt;
+    selectors.prompt.dispatchEvent(new Event("input", {bubbles:true}));
+    selectors.prompt.focus();
   }));
+
+  window.addEventListener("beforeunload", persistComposerDraft);
   document.addEventListener("click", event => {
     if (state.projectMenu && !event.target.closest(".floating-row-menu") && !event.target.closest(".project-icon-menu")) closeProjectMenu();
     const approvalOrigin = event.target.closest("[data-open-approval-origin]");
@@ -7818,6 +9378,28 @@ function bindEvents() {
     }
   });
 }
+
+window.dexApi = api;
+window.dexToast = toast;
+window.dexWorkbenchContext = () => ({
+  project: state.activeProject ? {...state.activeProject} : null,
+  threadId: state.activeThreadId,
+  thread: state.activeThreadId ? state.threadDetails.get(state.activeThreadId) || null : null,
+  items: [...state.items.values()],
+  running: Boolean(state.activeTurnId || state.turnSubmissionPending),
+});
+window.dexSetPrompt = value => {
+  selectors.prompt.value = String(value || "").slice(0, 200000);
+  selectors.prompt.dispatchEvent(new Event("input", {bubbles:true}));
+  selectors.prompt.focus();
+};
+window.dexAddReference = reference => {
+  if (!reference?.id || !reference?.type) return false;
+  state.references ||= [];
+  if (!state.references.some(item => item.type === reference.type && item.id === reference.id)) state.references.push(reference);
+  window.renderOperationReferences?.();
+  return true;
+};
 
 bindEvents();
 restoreDesktopPanels();

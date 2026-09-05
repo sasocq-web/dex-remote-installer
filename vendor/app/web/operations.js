@@ -2,6 +2,8 @@
 (() => {
   Object.assign(state, {
     queue: [],
+    globalQueue: [],
+    queueLoadGeneration: 0,
     references: [],
     chatgptReferences: [],
     chatgptReferenceLoading: false,
@@ -36,8 +38,15 @@
   }
 
   function setInspectorTab(name) {
-    document.querySelectorAll(".inspector .tab").forEach(tab => tab.classList.toggle("active", tab.dataset.tab === name));
-    document.querySelectorAll(".inspector .tab-panel").forEach(panel => panel.classList.toggle("active", panel.id === `tab-${name}`));
+    const normalized = ({queue:"summary", tools:"execution"})[name] || name;
+    const focusSelector = name === "queue" ? "#summary-queue-section" : name === "tools" ? "#execution-advanced-section" : "";
+    if (name === "tools" && byId("execution-advanced-section")) byId("execution-advanced-section").open = true;
+    if (typeof window.selectInspectorTab === "function") {
+      window.selectInspectorTab(normalized, {open:true, focusSelector});
+      return;
+    }
+    document.querySelectorAll(".inspector .tab").forEach(tab => tab.classList.toggle("active", tab.dataset.tab === normalized));
+    document.querySelectorAll(".inspector .tab-panel").forEach(panel => panel.classList.toggle("active", panel.id === `tab-${normalized}`));
     setDesktopPanel("inspector", true);
   }
 
@@ -48,18 +57,19 @@
 
   async function loadOperationQueue() {
     const threadId = state.activeThreadId;
-    if (!threadId) {
-      state.queue = [];
-      renderOperationQueue();
-      return;
-    }
+    const generation = ++state.queueLoadGeneration;
     try {
-      const data = await api(`/api/threads/${encodeURIComponent(threadId)}/queue`);
-      if (state.activeThreadId !== threadId) return;
-      state.queue = data.items || [];
+      const [current, global] = await Promise.all([
+        threadId ? api(`/api/threads/${encodeURIComponent(threadId)}/queue`) : Promise.resolve({items:[]}),
+        api("/api/queue"),
+      ]);
+      if (generation !== state.queueLoadGeneration || state.activeThreadId !== threadId) return;
+      state.queue = current.items || [];
+      state.globalQueue = global.items || [];
     } catch (error) {
-      if (state.activeThreadId !== threadId) return;
+      if (generation !== state.queueLoadGeneration || state.activeThreadId !== threadId) return;
       state.queue = [];
+      state.globalQueue = [];
       toast(error.message, "error");
     }
     renderOperationQueue();
@@ -69,28 +79,48 @@
     return ({queued:"Na fila", steering:"Enviando orientação", steered:"Orientação enviada", running:"Executando", completed:"Concluído", cancelled:"Cancelado", failed:"Falhou"})[status] || status;
   }
 
+  function activeQueueItems(items) {
+    const positions = new Map();
+    return (items || [])
+      .filter(item => ["queued", "steering", "running"].includes(item.status))
+      .map(item => {
+        const threadId = item.thread_id || state.activeThreadId || "";
+        const position = (positions.get(threadId) || 0) + 1;
+        positions.set(threadId, position);
+        return {...item, position};
+      });
+  }
+
   function renderOperationQueue() {
     const list = byId("queue-list");
-    const contextualQueue = state.activeThreadId ? state.queue : [];
-    const pending = contextualQueue.filter(item => ["queued", "steering", "running"].includes(item.status));
+    const globalQueue = state.globalQueue || [];
+    const pending = activeQueueItems(globalQueue);
+    const composerPending = activeQueueItems(state.queue);
     ["queue-count", "rail-queue-count", "mobile-queue-count"].forEach(id => { if (byId(id)) byId(id).textContent = pending.length; });
-    renderComposerQueue(pending);
-    if (!list) return;
-    if (!state.activeThreadId) {
-      list.innerHTML = '<div class="panel-empty">Abra uma conversa para consultar a fila.</div>';
+    byId("summary-queue-section")?.classList.toggle("hidden", pending.length === 0);
+    renderComposerQueue(composerPending);
+    if (!list) {
+      if (typeof renderInspectorSummary === "function") renderInspectorSummary();
       return;
     }
-    if (!state.queue.length) {
-      list.innerHTML = '<div class="panel-empty">A fila desta conversa está vazia.</div>';
+    if (!pending.length) {
+      list.innerHTML = "";
+      if (typeof renderInspectorSummary === "function") renderInspectorSummary();
       return;
     }
-    list.innerHTML = state.queue.map((item, index) => `
-      <article class="queue-card ${escape(item.status)}" draggable="${item.status === "queued"}" data-queue-id="${escape(item.id)}">
-        <div class="queue-card-head"><span class="queue-index">${index + 1}</span><strong>${escape(queueStatusLabel(item.status))}</strong><span>${item.created_at ? new Date(item.created_at * 1000).toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"}) : ""}</span></div>
+    list.innerHTML = pending.map(item => `
+      <article class="queue-card ${escape(item.status)}" draggable="${item.status === "queued"}" data-queue-id="${escape(item.id)}" data-queue-thread="${escape(item.thread_id)}">
+        <div class="queue-origin">
+          <span class="queue-origin-mark" aria-hidden="true">${escape((item.project_name || "C").slice(0, 2).toUpperCase())}</span>
+          <div class="queue-origin-copy"><strong>${escape(item.thread_title || "Conversa")}</strong><small>${escape(item.project_name || "Sistema")}</small></div>
+          <button type="button" class="ghost-button" data-queue-open-thread="${escape(item.thread_id)}" data-queue-project="${escape(item.project_id)}">Abrir</button>
+        </div>
+        <div class="queue-card-head"><span class="queue-index">${Number(item.position) || 1}</span><strong>${escape(queueStatusLabel(item.status))}</strong><span>${item.created_at ? new Date(item.created_at * 1000).toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"}) : ""}</span></div>
         <p>${escape(item.message)}</p>
         ${item.references?.length ? `<small>${item.references.length} referência(s) anexada(s)</small>` : ""}
-        ${item.status === "queued" ? `<div class="queue-actions">${state.activeTurnId ? `<button class="secondary-button" data-queue-steer="${escape(item.id)}" title="Enviar esta direção ao turno em execução">Orientar agora</button>` : ""}<button class="ghost-button" data-queue-up="${escape(item.id)}" title="Mover para cima">↑</button><button class="ghost-button" data-queue-down="${escape(item.id)}" title="Mover para baixo">↓</button><button class="ghost-button" data-queue-edit="${escape(item.id)}">Editar</button><button class="danger-button" data-queue-delete="${escape(item.id)}">Excluir</button></div>` : ""}
+        ${item.status === "queued" ? `<div class="queue-actions">${state.activeTurnId && item.thread_id === state.activeThreadId ? `<button class="secondary-button" data-queue-steer="${escape(item.id)}" data-queue-thread="${escape(item.thread_id)}" title="Enviar esta direção ao turno em execução">Orientar agora</button>` : ""}<button class="ghost-button" data-queue-up="${escape(item.id)}" data-queue-thread="${escape(item.thread_id)}" title="Mover para cima nesta conversa">↑</button><button class="ghost-button" data-queue-down="${escape(item.id)}" data-queue-thread="${escape(item.thread_id)}" title="Mover para baixo nesta conversa">↓</button><button class="ghost-button" data-queue-edit="${escape(item.id)}" data-queue-thread="${escape(item.thread_id)}">Editar</button><button class="danger-button" data-queue-delete="${escape(item.id)}" data-queue-thread="${escape(item.thread_id)}">Excluir</button></div>` : ""}
       </article>`).join("");
+    if (typeof renderInspectorSummary === "function") renderInspectorSummary();
   }
 
   function queuePreview(item) {
@@ -122,6 +152,7 @@
     try {
       await api(`/api/threads/${encodeURIComponent(state.activeThreadId)}/queue`, {method:"POST", body:JSON.stringify(activePayload(message))});
       selectors.prompt.value = "";
+      clearComposerDraft();
       state.references = [];
       state.composerMode = null;
       renderOperationReferences();
@@ -129,14 +160,21 @@
       autoResizePrompt();
       await loadOperationQueue();
       toast("Comando adicionado à fila.", "success");
+      finishDeferredSystemUpdateReload();
     } catch (error) { toast(error.message, "error"); }
   }
 
-  async function mutateQueue(action, itemId) {
-    const index = state.queue.findIndex(item => item.id === itemId);
+  async function mutateQueue(action, itemId, requestedThreadId = "") {
+    const threadId = requestedThreadId || state.activeThreadId;
+    if (!threadId) return;
+    const sourceQueue = (threadId === state.activeThreadId
+      ? state.queue
+      : (state.globalQueue || []).filter(item => item.thread_id === threadId))
+      .filter(item => item.status === "queued");
+    const index = sourceQueue.findIndex(item => item.id === itemId);
     if (index < 0) return;
     if (action === "steer") {
-      const result = await api(`/api/threads/${encodeURIComponent(state.activeThreadId)}/queue/${encodeURIComponent(itemId)}/steer`, {method:"POST"});
+      const result = await api(`/api/threads/${encodeURIComponent(threadId)}/queue/${encodeURIComponent(itemId)}/steer`, {method:"POST"});
       await loadOperationQueue();
       const message = result.steered
         ? "Direção enviada ao turno em execução."
@@ -144,19 +182,25 @@
       toast(message, result.steered || result.started ? "success" : "error");
       return;
     } else if (action === "delete") {
-      await api(`/api/threads/${encodeURIComponent(state.activeThreadId)}/queue/${encodeURIComponent(itemId)}`, {method:"DELETE"});
+      await api(`/api/threads/${encodeURIComponent(threadId)}/queue/${encodeURIComponent(itemId)}`, {method:"DELETE"});
     } else if (action === "edit") {
-      const message = window.prompt("Editar comando da fila:", state.queue[index].message);
-      if (message?.trim()) await api(`/api/threads/${encodeURIComponent(state.activeThreadId)}/queue/${encodeURIComponent(itemId)}`, {method:"PATCH", body:JSON.stringify({message:message.trim()})});
+      const message = window.prompt("Editar comando da fila:", sourceQueue[index].message);
+      if (message?.trim()) await api(`/api/threads/${encodeURIComponent(threadId)}/queue/${encodeURIComponent(itemId)}`, {method:"PATCH", body:JSON.stringify({message:message.trim()})});
     } else {
       const offset = action === "up" ? -1 : 1;
       const next = index + offset;
-      if (next < 0 || next >= state.queue.length) return;
-      const ids = state.queue.map(item => item.id);
+      if (next < 0 || next >= sourceQueue.length) return;
+      const ids = sourceQueue.map(item => item.id);
       [ids[index], ids[next]] = [ids[next], ids[index]];
-      await api(`/api/threads/${encodeURIComponent(state.activeThreadId)}/queue/reorder`, {method:"POST", body:JSON.stringify({item_ids:ids})});
+      await api(`/api/threads/${encodeURIComponent(threadId)}/queue/reorder`, {method:"POST", body:JSON.stringify({item_ids:ids})});
     }
     await loadOperationQueue();
+  }
+
+  async function openQueueOrigin(threadId, projectId) {
+    if (!threadId || !projectId) return toast("A conversa de origem desta fila não está disponível.", "error");
+    if (state.activeProject?.id !== projectId) await selectProject(projectId);
+    await openThread(threadId);
   }
 
   function referenceCatalog() {
@@ -233,7 +277,7 @@
     renderOperationReferences();
     byId("mention-picker").classList.add("hidden");
     selectors.prompt.value = selectors.prompt.value.replace(/(?:^|\s)@[^@\n]*$/, match => match.startsWith(" ") ? " " : "");
-    autoResizePrompt();
+    selectors.prompt.dispatchEvent(new Event("input", {bubbles:true}));
     selectors.prompt.focus();
   }
 
@@ -353,6 +397,8 @@
               _projectKind:project.kind,
             };
           });
+          await enrichActiveThreadExecution(project, threads);
+          if (generation !== state.threadLoadGeneration) return;
           if (useCache) state.projectThreads.set(project.id, threads);
           results[index] = threads;
           state.projectActivity.set(project.id, threads.reduce((latest, thread) => Math.max(latest, threadActivityTimestamp(thread)), 0));
@@ -431,7 +477,10 @@
     if (view === "chat") return;
     if (view === "projects") return openProjectManager("manage").catch(error => toast(error.message, "error"));
     if (view === "queue") { setInspectorTab("queue"); return loadOperationQueue(); }
+    if (view === "automations") return window.openAutomationPage?.();
     if (view === "plugins") return openToolsDialog().then(() => { state.toolsTab = "plugins"; renderToolsDialog(); });
+    if (view === "workbench") return window.openDexWorkbench?.();
+    if (view === "sites") return window.openSiteAccessPage?.();
     if (view === "remote") { setInspectorTab("screen"); return refreshRemoteStatus(); }
     if (view === "codex") return openTerminal();
     if (view === "system") byId("open-system").click();
@@ -454,9 +503,11 @@
     if (reference) addReference(reference.dataset.referenceType, reference.dataset.referenceId);
     const remove = event.target.closest("[data-remove-reference]");
     if (remove) { state.references.splice(Number(remove.dataset.removeReference), 1); renderOperationReferences(); }
+    const queueOrigin = event.target.closest("[data-queue-open-thread]");
+    if (queueOrigin) openQueueOrigin(queueOrigin.dataset.queueOpenThread, queueOrigin.dataset.queueProject).catch(error => toast(error.message, "error"));
     for (const operation of ["steer", "up", "down", "edit", "delete"]) {
       const target = event.target.closest(`[data-queue-${operation}]`);
-      if (target) mutateQueue(operation, target.dataset[`queue${operation[0].toUpperCase()}${operation.slice(1)}`]).catch(error => toast(error.message, "error"));
+      if (target) mutateQueue(operation, target.dataset[`queue${operation[0].toUpperCase()}${operation.slice(1)}`], target.dataset.queueThread || state.activeThreadId).catch(error => toast(error.message, "error"));
     }
     if (!event.target.closest(".floating-row-menu") && !menu) document.querySelector(".floating-row-menu")?.remove();
     if (!event.target.closest("#mention-picker") && !event.target.closest("#mention-button")) byId("mention-picker")?.classList.add("hidden");
@@ -540,7 +591,10 @@
     event.preventDefault(); event.stopImmediatePropagation(); setInspectorTab("tools");
   }, true);
 
-  loadOperationMetadata().then(() => { renderProjects(); renderThreads(); });
+  (window.dexSessionReady || Promise.resolve()).then(() => {
+    loadOperationMetadata().then(() => { renderProjects(); renderThreads(); });
+    loadOperationQueue();
+  });
   renderOperationQueue();
   renderOperationReferences();
 })();

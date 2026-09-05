@@ -4,7 +4,9 @@ import base64
 import hmac
 import ipaddress
 import json
+import os
 import secrets
+import stat
 import threading
 import time
 from dataclasses import dataclass
@@ -23,6 +25,139 @@ from .config import Settings
 _CF_JWKS_LOCK = threading.RLock()
 _CF_JWKS_CACHE: dict[str, tuple[float, dict]] = {}
 _CF_JWKS_TTL_SECONDS = 3600
+PLAYWRIGHT_AUTOMATION_IDENTITY = "internal:playwright-read-only"
+PLAYWRIGHT_AUTOMATION_DEVICE_ID = "internal-playwright-read-only"
+PLAYWRIGHT_ACCESS_COOKIE = "clc_playwright_access"
+_PLAYWRIGHT_ACCESS_TOKEN = ""
+
+
+def _valid_playwright_token(value: str) -> bool:
+    return 48 <= len(value) <= 128 and all(character.isalnum() or character in {"-", "_"} for character in value)
+
+
+def _read_protected_token(path, *, expected_uid: int) -> str:
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != expected_uid or info.st_mode & 0o077:
+        raise RuntimeError("arquivo da identidade Playwright não está protegido por modo 0600")
+    value = path.read_text(encoding="utf-8").strip()
+    if not _valid_playwright_token(value):
+        raise RuntimeError("token da identidade Playwright é inválido")
+    return value
+
+
+def provision_playwright_internal_access(settings: Settings) -> bool:
+    """Provision a loopback-only, read-only browser identity without exposing its token."""
+
+    global _PLAYWRIGHT_ACCESS_TOKEN
+    if not settings.playwright_internal_access_enabled:
+        _PLAYWRIGHT_ACCESS_TOKEN = ""
+        return False
+    uid = os.getuid()
+    token_path = settings.resolved_playwright_access_token_file
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        token = _read_protected_token(token_path, expected_uid=uid)
+    except FileNotFoundError:
+        token = secrets.token_urlsafe(48)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(token_path, flags, 0o600)
+        try:
+            os.write(descriptor, (token + "\n").encode("ascii"))
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        token = _read_protected_token(token_path, expected_uid=uid)
+
+    state_path = settings.resolved_browser_storage_state_file
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state = {"cookies": [], "origins": []}
+    try:
+        info = state_path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != uid:
+            raise RuntimeError("estado protegido do navegador possui proprietário inválido")
+        loaded = json.loads(state_path.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict) and isinstance(loaded.get("cookies"), list) and isinstance(loaded.get("origins"), list):
+            state = loaded
+    except FileNotFoundError:
+        pass
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("estado protegido do navegador é inválido") from exc
+
+    cookie = {
+        "name": PLAYWRIGHT_ACCESS_COOKIE,
+        "value": token,
+        "domain": "127.0.0.1",
+        "path": "/",
+        "expires": int(time.time()) + 10 * 365 * 24 * 60 * 60,
+        "httpOnly": True,
+        "secure": False,
+        "sameSite": "Strict",
+    }
+    cookies = [
+        item for item in state["cookies"]
+        if not (
+            isinstance(item, dict)
+            and item.get("name") == PLAYWRIGHT_ACCESS_COOKIE
+            and item.get("domain") == "127.0.0.1"
+            and item.get("path") == "/"
+        )
+    ]
+    cookies.append(cookie)
+    payload = json.dumps({"cookies": cookies, "origins": state["origins"]}, ensure_ascii=False, indent=2) + "\n"
+    temporary = state_path.with_name(f".{state_path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(temporary, flags, 0o600)
+    try:
+        os.write(descriptor, payload.encode("utf-8"))
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.replace(temporary, state_path)
+    os.chmod(state_path, 0o600)
+    _PLAYWRIGHT_ACCESS_TOKEN = token
+    return True
+
+
+def is_playwright_automation_request(headers: Mapping[str, str], client_host: str | None, settings: Settings) -> bool:
+    """Accept the protected cookie only on a direct loopback request, never through a proxy."""
+
+    if not settings.playwright_internal_access_enabled or not _is_loopback(client_host):
+        return False
+    if any(
+        headers.get(name)
+        for name in (
+            "cf-access-jwt-assertion", "cf-access-authenticated-user-email", "cf-connecting-ip",
+            "tailscale-user-login", "forwarded", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto",
+        )
+    ):
+        return False
+    try:
+        host = (urlparse("//" + headers.get("host", "")).hostname or "").casefold()
+    except ValueError:
+        return False
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        return False
+    raw = headers.get("cookie", "")
+    if not raw or len(raw) > 32_768:
+        return False
+    try:
+        cookies = SimpleCookie()
+        cookies.load(raw)
+    except CookieError:
+        return False
+    item = cookies.get(PLAYWRIGHT_ACCESS_COOKIE)
+    supplied = item.value.strip() if item is not None else ""
+    expected = _PLAYWRIGHT_ACCESS_TOKEN
+    if not expected:
+        try:
+            expected = _read_protected_token(settings.resolved_playwright_access_token_file, expected_uid=os.getuid())
+        except (FileNotFoundError, OSError, RuntimeError):
+            return False
+    return bool(supplied and hmac.compare_digest(supplied, expected))
 
 
 @dataclass
@@ -217,6 +352,36 @@ def _cloudflare_cookie_token(headers: Mapping[str, str]) -> str:
     return item.value.strip() if item is not None else ""
 
 
+def cloudflare_access_token_issued_at(headers: Mapping[str, str], settings: Settings) -> float:
+    """Return the issuance time of a fully validated Access application token.
+
+    This is used only after a browser has crossed its persisted reauthentication
+    gate. Requiring a token issued after that gate prevents an already-open
+    Access session from silently extending a stricter per-browser policy.
+    """
+
+    token = headers.get("cf-access-jwt-assertion", "").strip() or _cloudflare_cookie_token(headers)
+    if not token:
+        return 0.0
+    _verify_cloudflare_access(token, settings)
+    try:
+        _encoded_header, encoded_payload, _encoded_signature = token.split(".")
+        claims = json.loads(_b64url_decode(encoded_payload))
+        issued_at = float(claims.get("iat") or 0)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Token Cloudflare Access sem data de emissão válida",
+        ) from exc
+    now = time.time()
+    if issued_at <= 0 or issued_at > now + 30:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Data de emissão do Cloudflare Access inválida",
+        )
+    return issued_at
+
+
 def network_identity(
     headers: Mapping[str, str], client_host: str | None, settings: Settings
 ) -> str:
@@ -252,6 +417,9 @@ def network_identity(
         if not hmac.compare_digest(tailscale_login.casefold(), allowed):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Identidade não autorizada")
         return tailscale_login
+
+    if is_playwright_automation_request(headers, client_host, settings):
+        return PLAYWRIGHT_AUTOMATION_IDENTITY
 
     if settings.allow_localhost and _is_loopback(client_host):
         return "localhost"

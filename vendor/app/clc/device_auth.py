@@ -23,6 +23,15 @@ PAIRING_TTL_SECONDS = 10 * 60
 CHALLENGE_TTL_SECONDS = 90
 MAX_DEVICES = 6
 ENROLLMENT_REQUEST_TTL_SECONDS = 24 * 60 * 60
+DAILY_REAUTHENTICATION_SECONDS = 24 * 60 * 60
+WEEKLY_REAUTHENTICATION_SECONDS = 7 * DAILY_REAUTHENTICATION_SECONDS
+MONTHLY_REAUTHENTICATION_SECONDS = 30 * DAILY_REAUTHENTICATION_SECONDS
+DEFAULT_REAUTHENTICATION_SECONDS = MONTHLY_REAUTHENTICATION_SECONDS
+REAUTHENTICATION_INTERVALS = {
+    DAILY_REAUTHENTICATION_SECONDS,
+    WEEKLY_REAUTHENTICATION_SECONDS,
+    MONTHLY_REAUTHENTICATION_SECONDS,
+}
 
 
 def _b64url_decode(value: str) -> bytes:
@@ -99,8 +108,13 @@ class DeviceRecord:
     last_ip: str = ""
     revoked: bool = False
     access_history: list[Dict[str, Any]] = field(default_factory=list)
+    reauthentication_interval_seconds: int = DEFAULT_REAUTHENTICATION_SECONDS
+    last_reauthenticated_at: float = 0.0
+    reauthentication_required_at: float = 0.0
 
     def public_dict(self) -> Dict[str, Any]:
+        due_at = self.last_reauthenticated_at + self.reauthentication_interval_seconds
+        required = bool(self.reauthentication_required_at or time.time() >= due_at)
         return {
             "id": self.id,
             "identity": self.identity,
@@ -111,6 +125,10 @@ class DeviceRecord:
             "revoked": self.revoked,
             "fingerprint": device_fingerprint(self.public_jwk),
             "access_history": list(reversed(self.access_history[-50:])),
+            "reauthentication_interval_seconds": self.reauthentication_interval_seconds,
+            "last_reauthenticated_at": self.last_reauthenticated_at,
+            "reauthentication_due_at": due_at,
+            "reauthentication_required": required,
         }
 
 
@@ -214,6 +232,16 @@ class DeviceAuthStore:
                     last_ip=_safe_text(item.get("last_ip"), maximum=100),
                     revoked=bool(item.get("revoked", False)),
                     access_history=list(item.get("access_history") or [])[-100:],
+                    reauthentication_interval_seconds=self._normalized_reauthentication_interval(
+                        item.get("reauthentication_interval_seconds", DEFAULT_REAUTHENTICATION_SECONDS)
+                    ),
+                    last_reauthenticated_at=float(
+                        item.get("last_reauthenticated_at")
+                        or item.get("last_seen_at")
+                        or item.get("created_at")
+                        or time.time()
+                    ),
+                    reauthentication_required_at=float(item.get("reauthentication_required_at") or 0),
                 )
             except (KeyError, TypeError, ValueError):
                 continue
@@ -240,7 +268,7 @@ class DeviceAuthStore:
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         data = {
-            "version": 2,
+            "version": 3,
             "devices": [asdict(item) for item in self._devices.values()],
             "enrollment_requests": [asdict(item) for item in self._enrollment_requests.values()],
         }
@@ -277,6 +305,16 @@ class DeviceAuthStore:
 
     def active_count(self, identity: Optional[str] = None) -> int:
         return len(self.list_devices(identity))
+
+    @staticmethod
+    def _normalized_reauthentication_interval(value: Any) -> int:
+        try:
+            interval = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Prazo de reautenticação inválido") from exc
+        if interval not in REAUTHENTICATION_INTERVALS:
+            raise ValueError("Escolha reautenticação diária, semanal ou a cada 30 dias")
+        return interval
 
     @staticmethod
     def _record_event(
@@ -370,6 +408,7 @@ class DeviceAuthStore:
                 last_seen_at=now,
                 last_user_agent=_safe_text(user_agent, maximum=300),
                 last_ip=_safe_text(client_ip, maximum=100),
+                last_reauthenticated_at=now,
             )
             self._devices[record.id] = record
             self._record_event(record, "registered", user_agent=user_agent, client_ip=client_ip)
@@ -409,6 +448,7 @@ class DeviceAuthStore:
                 last_seen_at=now,
                 last_user_agent=_safe_text(user_agent, maximum=300),
                 last_ip=_safe_text(client_ip, maximum=100),
+                last_reauthenticated_at=now,
             )
             self._devices[record.id] = record
             self._record_event(record, "registered", user_agent=user_agent, client_ip=client_ip)
@@ -508,6 +548,75 @@ class DeviceAuthStore:
                 return None
             return record
 
+    def set_reauthentication_interval(self, device_id: str, interval_seconds: int) -> DeviceRecord:
+        interval = self._normalized_reauthentication_interval(interval_seconds)
+        with self._lock:
+            record = self.get(device_id)
+            if not record:
+                raise ValueError("Dispositivo não encontrado ou revogado")
+            record.reauthentication_interval_seconds = interval
+            self._record_event(record, "reauthentication_policy")
+            self._save()
+            return record
+
+    def reauthentication_required(self, device_id: str, *, mark: bool = False) -> bool:
+        """Return whether this browser must establish a fresh identity session.
+
+        When the gate is first observed, persist an integer-second marker. A
+        Cloudflare token issued before (or during) that request cannot satisfy
+        the gate; the browser must pass through Access again afterwards.
+        """
+        with self._lock:
+            record = self.get(device_id)
+            if not record:
+                return True
+            now = time.time()
+            required = bool(
+                record.reauthentication_required_at
+                or now >= record.last_reauthenticated_at + record.reauthentication_interval_seconds
+            )
+            if required and mark and not record.reauthentication_required_at:
+                record.reauthentication_required_at = float(int(now))
+                self._record_event(record, "reauthentication_required")
+                self._save()
+            return required
+
+    def complete_reauthentication(self, device_id: str, token_issued_at: float = 0.0) -> bool:
+        """Accept a new Cloudflare Access token after the per-browser gate.
+
+        Tailscale-only installations do not have an Access token; for those,
+        the already verified device-key challenge is the available identity
+        boundary and its completion renews the device policy.
+        """
+        with self._lock:
+            record = self.get(device_id)
+            if not record:
+                raise ValueError("Dispositivo não encontrado ou revogado")
+            now = time.time()
+            due = bool(
+                record.reauthentication_required_at
+                or now >= record.last_reauthenticated_at + record.reauthentication_interval_seconds
+            )
+            if not due:
+                return True
+            if not record.reauthentication_required_at:
+                record.reauthentication_required_at = float(int(now))
+                self._record_event(record, "reauthentication_required")
+                self._save()
+                return False
+            issued_at = float(token_issued_at or 0)
+            if record.identity.casefold().startswith("cloudflare:"):
+                if issued_at <= record.reauthentication_required_at:
+                    return False
+                completed_at = max(issued_at, now)
+            else:
+                completed_at = now
+            record.last_reauthenticated_at = completed_at
+            record.reauthentication_required_at = 0.0
+            self._record_event(record, "reauthenticated")
+            self._save()
+            return True
+
     def create_challenge(self, *, device_id: str, identity: str, origin: str) -> DeviceChallenge:
         with self._lock:
             self.cleanup()
@@ -597,10 +706,15 @@ def pairing_qr_png(value: str) -> bytes:
 
 __all__ = [
     "CHALLENGE_TTL_SECONDS",
+    "DAILY_REAUTHENTICATION_SECONDS",
+    "DEFAULT_REAUTHENTICATION_SECONDS",
     "DeviceAuthStore",
     "DeviceChallenge",
     "DeviceRecord",
     "PAIRING_TTL_SECONDS",
+    "REAUTHENTICATION_INTERVALS",
+    "WEEKLY_REAUTHENTICATION_SECONDS",
+    "MONTHLY_REAUTHENTICATION_SECONDS",
     "device_fingerprint",
     "pairing_qr_png",
 ]

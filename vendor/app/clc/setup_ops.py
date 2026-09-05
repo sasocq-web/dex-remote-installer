@@ -431,7 +431,13 @@ async def install_codex(record: SetupTask, settings: Settings) -> Dict[str, Any]
     detected = detect_codex()
     if not detected.get("installed"):
         raise RuntimeError("A instalação terminou, mas o executável do Codex não foi localizado")
-    command = shlex.join([detected["path"], "app-server"])
+    detected_path = Path(str(detected["path"])).expanduser()
+    stable_launcher = settings.home / ".local" / "bin" / "codex"
+    # Persist the official stable launcher, not its current versioned target.
+    # This lets the next safely rolled backend use Codex updates without being
+    # stranded on the release that happened to be current during setup.
+    launcher = stable_launcher if stable_launcher.exists() and os.access(stable_launcher, os.X_OK) else detected_path
+    command = shlex.join([str(launcher), "app-server"])
     persist_settings(settings, codex_command=command)
     record.set_message("Codex instalado e pronto para autenticação.")
     return detected

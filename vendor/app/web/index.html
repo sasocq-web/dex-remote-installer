@@ -10,14 +10,18 @@
   <link rel="manifest" href="/manifest.webmanifest">
   <link rel="icon" href="/icons/codex-remoto-192.png" type="image/png">
   <link rel="apple-touch-icon" href="/icons/codex-remoto-192.png">
-  <link rel="stylesheet" href="/styles.css?v=approval-card-compact-20260822-223-portable">
+  <link rel="stylesheet" href="/styles.css?v=secure-payment-card-20260902-294-portable">
+  <link rel="stylesheet" href="/workbench.css?v=modern-workbench-20260830-4">
 </head>
 <body>
   <div id="app" class="app-shell inspector-collapsed">
     <nav id="operation-rail" class="operation-rail" aria-label="Áreas do Codex Operations">
       <button class="rail-button" data-operation-view="projects" title="Projetos"><span>◇</span><small>Projetos</small></button>
       <button class="rail-button" data-operation-view="queue" title="Fila"><span>☷</span><small>Fila</small><b id="rail-queue-count" class="rail-badge">0</b></button>
+      <button class="rail-button" data-operation-view="automations" title="Agendamentos"><span>◷</span><small>Agenda</small></button>
       <button class="rail-button" data-operation-view="plugins" title="Plugins e ferramentas"><span>⬡</span><small>Plugins</small></button>
+      <button class="rail-button" data-operation-view="workbench" title="Central de produção"><span>◫</span><small>Central</small></button>
+      <button class="rail-button" data-operation-view="sites" title="Sites acessados"><span>◎</span><small>Sites</small></button>
       <button class="rail-button" data-operation-view="remote" title="Acesso remoto"><span>▣</span><small>Remoto</small></button>
       <button id="rail-open-codex" class="rail-button codex-rail-button" data-operation-view="codex" title="Abrir Codex Sistema conectado"><span>›_</span><small>Codex</small></button>
       <button class="rail-button" data-operation-view="system" title="Sistema"><span>◉</span><small>Sistema</small></button>
@@ -63,7 +67,9 @@
         <nav class="mobile-sidebar-navigation" aria-label="Navegação do aplicativo">
           <button class="mobile-sidebar-action" data-operation-view="projects"><span aria-hidden="true">◇</span><span>Projetos</span></button>
           <button class="mobile-sidebar-action" data-operation-view="queue"><span aria-hidden="true">☷</span><span>Fila</span></button>
+          <button class="mobile-sidebar-action" data-operation-view="automations"><span aria-hidden="true">◷</span><span>Agendamentos</span></button>
           <button class="mobile-sidebar-action" data-operation-view="plugins"><span aria-hidden="true">⬡</span><span>Plugins</span></button>
+          <button class="mobile-sidebar-action" data-operation-view="sites"><span aria-hidden="true">◎</span><span>Sites acessados</span></button>
           <button class="mobile-sidebar-action" data-operation-view="remote"><span aria-hidden="true">▣</span><span>Acesso remoto</span></button>
           <button id="sidebar-open-codex" class="mobile-sidebar-action" data-operation-view="codex"><span aria-hidden="true">›_</span><span>Codex Sistema</span></button>
           <button id="open-settings" class="mobile-sidebar-action"><span aria-hidden="true">⚙</span><span>Configurações</span></button>
@@ -98,7 +104,7 @@
           <button id="open-tools" class="secondary-button compact-button context-shortcut" title="Abrir ferramentas no painel contextual">Ferramentas <span id="tool-count" class="badge">0</span></button>
           <button id="rename-thread" class="icon-button" title="Renomear conversa" disabled>✎</button>
           <button id="archive-thread" class="icon-button" title="Arquivar conversa" disabled>▣</button>
-          <button id="open-inspector" class="icon-button mobile-only" aria-label="Mostrar ou recolher painel direito" aria-pressed="true" title="Mostrar ou recolher painel direito">☷</button>
+          <button id="open-inspector" class="icon-button mobile-only inspector-toggle" aria-label="Mostrar ou recolher painel direito" aria-pressed="true" title="Mostrar ou recolher painel direito">☷<span id="inspector-attention-sources" class="inspector-attention-sources hidden" aria-hidden="true"></span><span id="inspector-attention-count" class="inspector-attention-badge hidden" aria-label="0 aprovações pendentes">0</span></button>
         </div>
       </header>
 
@@ -153,8 +159,12 @@
             </div>
           </details>
           <button id="composer-tools" class="tool-profile-chip" title="Ferramentas associadas à conversa">Sem ferramentas</button>
+          <button id="workbench-mobile-launch" class="tool-profile-chip workbench-mobile-launch" type="button" title="Abrir Central de produção">◫ Central</button>
+          <button id="workbench-voice" class="tool-profile-chip" type="button" title="Ditar usando o reconhecimento de voz deste navegador">🎙 Voz</button>
+          <button id="workbench-appshot" class="tool-profile-chip" type="button" title="Capturar a tela Linux atual e anexar à conversa">▧ Tela</button>
           <button id="composer-mode" class="composer-mode-chip hidden" type="button" title="Desativar modo especial"></button>
         </div>
+        <div id="model-lifecycle-warning" class="model-lifecycle-warning hidden" role="status"></div>
         <div class="composer">
           <button id="add-button" class="icon-button composer-icon" type="button" aria-label="Adicionar" title="Adicionar arquivos, imagens, meta, planejamento ou plugins">＋</button>
           <button id="mention-button" class="icon-button composer-icon" aria-label="Mencionar" title="Referenciar projeto, pasta, conversa, skill, plugin, Chrome ou servidor">@</button>
@@ -178,30 +188,67 @@
         </div>
         <div id="mention-picker" class="mention-picker hidden" role="listbox" aria-label="Adicionar referência"></div>
         <div id="reference-chips" class="reference-chips" aria-live="polite"></div>
-        <small class="composer-hint">Enter quebra a linha • envie somente pelo botão ↑ • operações sensíveis pedem aprovação</small>
+        <small class="composer-hint">Teclado físico: Enter envia • Shift+Enter pula linha • teclado digital: Enter pula linha</small>
       </footer>
 
     </main>
 
     <aside id="inspector" class="inspector">
       <div class="inspector-header">
-        <div class="tabs">
-          <button class="tab" data-tab="queue">Fila <span id="queue-count" class="badge">0</span></button>
-          <button class="tab active" data-tab="approvals">Aprovações <span id="approval-count" class="badge">0</span></button>
-          <button class="tab" data-tab="diff">Alterações</button>
-          <button class="tab" data-tab="activity">Atividade</button>
-          <button class="tab" data-tab="terminal">Terminal</button>
-          <button class="tab" data-tab="tools">Ferramentas</button>
-          <button class="tab" data-tab="screen">Tela</button>
+        <div class="tabs inspector-tabs" role="tablist" aria-label="Painel contextual da conversa">
+          <button class="tab active" data-tab="summary" role="tab" aria-selected="true">Resumo <span id="inspector-summary-count" class="badge hidden">0</span></button>
+          <button class="tab" data-tab="execution" role="tab" aria-selected="false">Execução <span id="execution-event-count" class="badge hidden">0</span></button>
+          <button class="tab" data-tab="screen" role="tab" aria-selected="false">Tela</button>
         </div>
         <button id="close-inspector" class="icon-button mobile-only" aria-label="Recolher painel direito" title="Recolher painel direito">×</button>
       </div>
-      <div id="tab-queue" class="tab-panel"><div id="queue-list" class="panel-content"></div></div>
-      <div id="tab-approvals" class="tab-panel active"><div id="approval-list" class="panel-content"></div></div>
-      <div id="tab-diff" class="tab-panel"><pre id="diff-view" class="diff-view">Nenhuma alteração registrada nesta conversa.</pre></div>
-      <div id="tab-activity" class="tab-panel"><div id="activity-list" class="panel-content"></div></div>
-      <div id="tab-terminal" class="tab-panel"><div class="context-launch-panel"><h3>Codex Sistema</h3><p id="context-terminal-copy">Converse em linguagem simples para verificar, operar ou reparar o mini PC e seus serviços.</p><div class="card-actions"><button id="context-open-terminal" class="primary-button">Entrar no Codex conectado</button><button id="context-open-shell" class="secondary-button">Abrir shell avançado</button></div></div></div>
-      <div id="tab-tools" class="tab-panel"><div class="context-launch-panel"><h3>Ferramentas da conversa</h3><p>Skills, apps, plugins, MCPs, navegador e desktop associados ao contexto atual.</p><button id="context-open-tools" class="primary-button">Gerenciar ferramentas</button></div></div>
+      <div id="tab-summary" class="tab-panel active" role="tabpanel">
+        <div class="panel-content inspector-summary">
+          <section id="inspector-summary-status" class="inspector-status-card" aria-live="polite">
+            <span id="inspector-status-icon" class="inspector-status-icon" aria-hidden="true">✓</span>
+            <div>
+              <strong id="inspector-status-title">Conversa pronta</strong>
+              <p id="inspector-status-copy">Selecione uma conversa para acompanhar a execução.</p>
+              <small id="inspector-status-meta">Sem atividade em andamento.</small>
+            </div>
+          </section>
+          <section id="summary-approvals-section" class="inspector-section hidden" aria-labelledby="summary-approvals-title">
+            <div class="inspector-section-heading"><div><span class="inspector-section-icon" aria-hidden="true">!</span><h3 id="summary-approvals-title">Aprovações</h3></div><span id="approval-count" class="badge">0</span></div>
+            <div id="approval-list" class="inspector-section-content"></div>
+          </section>
+          <section id="summary-queue-section" class="inspector-section hidden" aria-labelledby="summary-queue-title">
+            <div class="inspector-section-heading"><div><span class="inspector-section-icon" aria-hidden="true">☷</span><h3 id="summary-queue-title">Filas de todas as conversas</h3></div><span id="queue-count" class="badge">0</span></div>
+            <div id="queue-list" class="inspector-section-content"></div>
+          </section>
+          <div id="inspector-summary-empty" class="inspector-calm-state"><span aria-hidden="true">✓</span><strong>Nenhuma pendência</strong><small>Aprovações e itens da fila aparecerão aqui quando exigirem atenção.</small></div>
+        </div>
+      </div>
+      <div id="tab-execution" class="tab-panel" role="tabpanel">
+        <div class="panel-content inspector-execution">
+          <section id="execution-activity-section" class="inspector-section hidden" aria-labelledby="execution-activity-title">
+            <div class="inspector-section-heading"><div><span class="inspector-section-icon" aria-hidden="true">◷</span><h3 id="execution-activity-title">Progresso da execução</h3></div></div>
+            <div id="activity-list" class="inspector-section-content activity-timeline"></div>
+          </section>
+          <details id="execution-diff-section" class="inspector-disclosure hidden">
+            <summary><span><span class="inspector-section-icon" aria-hidden="true">±</span><strong>Alterações</strong></span><span id="execution-diff-count" class="badge">0</span></summary>
+            <pre id="diff-view" class="diff-view">Nenhuma alteração registrada nesta conversa.</pre>
+          </details>
+          <div id="inspector-execution-empty" class="inspector-calm-state"><span aria-hidden="true">◷</span><strong>Aguardando atividade</strong><small>Marcos importantes e alterações aparecerão aqui; detalhes técnicos ficam agrupados.</small></div>
+          <details id="execution-advanced-section" class="inspector-disclosure inspector-advanced">
+            <summary><span><span class="inspector-section-icon" aria-hidden="true">◇</span><strong>Recursos avançados</strong></span><span aria-hidden="true">›</span></summary>
+            <div class="inspector-advanced-grid">
+              <article class="inspector-advanced-card">
+                <span aria-hidden="true">›_</span><div><strong>Codex Sistema</strong><p id="context-terminal-copy">Verifique, opere ou repare o mini PC pelo ambiente auditável.</p></div>
+                <div class="card-actions"><button id="context-open-terminal" class="primary-button">Entrar no Codex</button><button id="context-open-shell" class="secondary-button">Shell avançado</button></div>
+              </article>
+              <article class="inspector-advanced-card">
+                <span aria-hidden="true">⬡</span><div><strong>Ferramentas da conversa</strong><p>Skills, apps, plugins, MCPs, navegador e desktop associados ao contexto atual.</p></div>
+                <button id="context-open-tools" class="secondary-button full-width">Gerenciar ferramentas</button>
+              </article>
+            </div>
+          </details>
+        </div>
+      </div>
       <div id="tab-screen" class="tab-panel">
         <div class="remote-summary-panel">
           <div class="remote-summary-icon" aria-hidden="true">▣</div>
@@ -542,10 +589,20 @@
       <div><h2 id="pc-data-title">Dados do PC</h2><small id="pc-data-updated">Consultando o mini PC…</small></div>
       <button id="close-pc-data" class="icon-button" aria-label="Fechar dados do PC">×</button>
     </div>
-    <div id="pc-data-content" class="pc-data-content" aria-live="polite">
-      <div class="panel-empty">Carregando CPU, memória e SSD…</div>
+    <div class="pc-data-scroll">
+      <div id="pc-data-content" class="pc-data-content" aria-live="polite">
+        <div class="panel-empty">Carregando CPU, memória e SSD…</div>
+      </div>
+      <div class="pc-data-tabs" role="tablist" aria-label="Gerenciadores do PC">
+        <button class="active" type="button" role="tab" aria-selected="true" data-pc-tab="overview">Visão geral</button>
+        <button type="button" role="tab" aria-selected="false" data-pc-tab="storage">Armazenamento</button>
+        <button type="button" role="tab" aria-selected="false" data-pc-tab="activities">Atividades</button>
+      </div>
+      <section id="pc-data-panel" class="pc-data-panel" role="tabpanel" aria-live="polite">
+        <div class="pc-overview-intro"><strong>Tudo funcionando em um só lugar</strong><span>Abra Armazenamento para descobrir o que ocupa o SSD ou Atividades para acompanhar CPU e memória em tempo real.</span></div>
+      </section>
     </div>
-    <div class="dialog-actions">
+    <div class="dialog-actions sticky-actions">
       <button id="refresh-pc-data" class="secondary-button">Atualizar agora</button>
       <button id="pc-data-system-details" class="primary-button">Ver sistema completo</button>
     </div>
@@ -588,6 +645,50 @@
     <div class="dialog-actions"><button id="task-done" class="primary-button" disabled>Concluir</button></div>
   </dialog>
 
+  <dialog id="site-access-dialog" class="site-access-dialog" aria-labelledby="site-access-title">
+    <div class="site-access-page">
+      <header class="site-access-header">
+        <div>
+          <span class="site-access-eyebrow">Privacidade e automação</span>
+          <h1 id="site-access-title">Sites acessados</h1>
+          <p>Veja onde o Codex navegou, em quais conversas e como novos acessos serão tratados.</p>
+        </div>
+        <button id="site-access-close" class="icon-button site-access-close" type="button" aria-label="Fechar sites acessados">×</button>
+      </header>
+      <section id="site-access-totals" class="site-access-totals" aria-label="Resumo do histórico"></section>
+      <div class="site-access-toolbar">
+        <label class="site-access-search"><span aria-hidden="true">⌕</span><input id="site-access-search" type="search" placeholder="Buscar domínio ou conversa" autocomplete="off"></label>
+        <label class="site-access-filter">Permissão<select id="site-access-filter"><option value="all">Todas</option><option value="auto">Automático</option><option value="ask">Perguntar</option><option value="block">Bloqueado</option></select></label>
+        <button id="site-access-refresh" class="secondary-button" type="button">Revisar histórico</button>
+      </div>
+      <div id="site-access-progress" class="site-access-progress hidden" role="status"></div>
+      <div id="site-access-list" class="site-access-list"></div>
+      <footer id="site-access-privacy" class="site-access-privacy"></footer>
+    </div>
+  </dialog>
+
+  <dialog id="automation-dialog" class="site-access-dialog automation-dialog" aria-labelledby="automation-title">
+    <div class="site-access-page automation-page">
+      <header class="site-access-header automation-header">
+        <div>
+          <span class="site-access-eyebrow">Execuções recorrentes</span>
+          <h1 id="automation-title">Agendamentos</h1>
+          <p>Todos os trabalhos recorrentes do Dex, reunidos por projeto, conversa e próxima execução.</p>
+        </div>
+        <button id="automation-close" class="icon-button site-access-close" type="button" aria-label="Fechar agendamentos">×</button>
+      </header>
+      <section id="automation-totals" class="site-access-totals automation-totals" aria-label="Resumo dos agendamentos"></section>
+      <div class="site-access-toolbar automation-toolbar">
+        <label class="site-access-search"><span aria-hidden="true">⌕</span><input id="automation-search" type="search" placeholder="Buscar nome, instrução ou projeto" autocomplete="off"></label>
+        <label class="site-access-filter">Estado<select id="automation-status-filter"><option value="all">Todos</option><option value="ACTIVE">Ativos</option><option value="PAUSED">Pausados</option></select></label>
+        <label class="site-access-filter">Projeto<select id="automation-project-filter"><option value="all">Todos os projetos</option></select></label>
+        <button id="automation-refresh" class="secondary-button" type="button">Atualizar</button>
+      </div>
+      <div id="automation-list" class="automation-list"></div>
+      <footer id="automation-timezone" class="site-access-privacy"></footer>
+    </div>
+  </dialog>
+
   <dialog id="system-update-dialog" class="dialog task-dialog system-update-dialog" aria-labelledby="system-update-progress-title">
     <div class="dialog-header"><h2 id="system-update-progress-title">Atualização do sistema</h2><button id="system-update-progress-close" class="icon-button" aria-label="Fechar">×</button></div>
     <div class="task-status-row"><span class="spinner"></span><strong id="system-update-progress-message">Preparando a atualização do sistema…</strong></div>
@@ -605,9 +706,30 @@
     <small class="system-update-blockers-note">A release permanece apenas preparada. Nenhuma etapa da atualização será iniciada enquanto esta lista não estiver vazia.</small>
   </dialog>
 
-  <div id="other-conversation-approval-popups" class="other-conversation-approval-popups" aria-live="assertive" aria-label="Solicitações de outras conversas"></div>
+  <dialog id="workbench-dialog" class="workbench-dialog" aria-labelledby="workbench-title">
+    <div class="workbench-shell">
+      <header class="workbench-header">
+        <div><span class="workbench-eyebrow">Produção local SASOCQ</span><h1 id="workbench-title">Central de produção</h1><p id="workbench-subtitle">Artefatos, Git, agentes, memória e rotinas do projeto.</p></div>
+        <button id="workbench-close" class="icon-button" type="button" aria-label="Fechar central">×</button>
+      </header>
+      <nav class="workbench-tabs" aria-label="Áreas da central">
+        <button class="active" data-workbench-tab="overview">Visão geral</button>
+        <button data-workbench-tab="artifacts">Artefatos</button>
+        <button data-workbench-tab="git">Git e revisão</button>
+        <button data-workbench-tab="worktrees">Worktrees</button>
+        <button data-workbench-tab="agents">Agentes</button>
+        <button data-workbench-tab="memory">Memória</button>
+        <button data-workbench-tab="playbooks">Rotinas</button>
+      </nav>
+      <main id="workbench-content" class="workbench-content"><div class="panel-empty">Selecione um projeto para abrir a central.</div></main>
+    </div>
+  </dialog>
+
   <div id="toast-container" class="toast-container" aria-live="assertive"></div>
-  <script src="/app.js?v=automatic-approval-silent-20260822-224-portable" defer></script>
-  <script src="/operations.js?v=project-conversations-fix175" defer></script>
+  <script src="/app.js?v=draft-recovery-20260903-295-gnome-codex3-portable" defer></script>
+  <script src="/sites.js?v=dex-fast-open-20260902-290" defer></script>
+  <script src="/automations.js?v=pc-managers-20260824-229b" defer></script>
+  <script src="/operations.js?v=draft-recovery-20260903-295" defer></script>
+  <script src="/workbench.js?v=modern-workbench-20260830-4" defer></script>
 </body>
 </html>

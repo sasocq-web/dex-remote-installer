@@ -4,7 +4,7 @@ import asyncio
 import hashlib
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from .codex_bridge import CodexBridge
 from .config import Settings
@@ -21,9 +21,15 @@ def safe_project_unit(project_id: str) -> str:
 class ProjectBridgePool:
     """One independent Codex app-server per project."""
 
-    def __init__(self, settings: Settings, events: EventHub) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        events: EventHub,
+        server_request_handler: Callable[[str, dict[str, Any]], Awaitable[dict[str, Any] | None]] | None = None,
+    ) -> None:
         self.settings = settings
         self.events = events
+        self.server_request_handler = server_request_handler
         self._bridges: dict[str, CodexBridge] = {}
         self._paths: dict[str, str] = {}
         self._names: dict[str, str] = {}
@@ -46,6 +52,7 @@ class ProjectBridgePool:
                 label=f"project:{project_id}",
                 command=self.settings.project_codex_args,
                 environment=environment,
+                server_request_handler=self.server_request_handler,
             )
             self._bridges[project_id] = bridge
         if path:

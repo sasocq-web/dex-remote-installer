@@ -57,6 +57,7 @@ PERSISTENT_FIELDS = {
     "cloudflare_access_team_domain",
     "cloudflare_access_audience",
     "cloudflare_access_allowed_identities",
+    "approval_autonomy_level",
 }
 
 _CONFIG_LOCK = RLock()
@@ -89,7 +90,7 @@ class Settings:
     config_dir: str = ""
     config_file: str = ""
     projects_file: str = ""
-    session_ttl_seconds: int = 43_200
+    session_ttl_seconds: int = 2_592_000
     csrf_header_name: str = "X-CLC-CSRF"
     experimental_api: bool = False
     log_level: str = "INFO"
@@ -101,6 +102,9 @@ class Settings:
     full_experience_installed: bool = False
     desktop_control_enabled: bool = False
     browser_control_enabled: bool = False
+    playwright_internal_access_enabled: bool = True
+    playwright_access_token_file: str = ""
+    browser_storage_state_file: str = ""
     remote_desktop_enabled: bool = True
     device_auth_required: bool = True
     package_mode: bool = False
@@ -112,7 +116,7 @@ class Settings:
     cloud_remote_name: str = ""
     cloud_remote_path: str = "Codex Linux Control/Projetos"
     cloud_local_path: str = ""
-    cloud_sync_interval_minutes: int = 5
+    cloud_sync_interval_minutes: int = 360
     cloud_filter_profile: str = "source"
     cloud_sync_service_name: str = "codex-linux-control-sync.service"
     cloud_sync_timer_name: str = "codex-linux-control-sync.timer"
@@ -131,6 +135,7 @@ class Settings:
     cloudflare_access_team_domain: str = ""
     cloudflare_access_audience: str = ""
     cloudflare_access_allowed_identities: str = ""
+    approval_autonomy_level: int = 7
 
     @property
     def home(self) -> Path:
@@ -169,6 +174,18 @@ class Settings:
     @property
     def resolved_browser_output_dir(self) -> Path:
         return (self.home / ".local" / "share" / "codex-linux-control" / "browser-output").resolve()
+
+    @property
+    def resolved_playwright_access_token_file(self) -> Path:
+        if self.playwright_access_token_file:
+            return Path(os.path.expanduser(self.playwright_access_token_file)).resolve()
+        return (self.home / ".local" / "share" / "codex-linux-control" / "playwright-dex-access.token").resolve()
+
+    @property
+    def resolved_browser_storage_state_file(self) -> Path:
+        if self.browser_storage_state_file:
+            return Path(os.path.expanduser(self.browser_storage_state_file)).resolve()
+        return (self.home / ".local" / "share" / "codex-linux-control" / "browser-storage-state.json").resolve()
 
     @property
     def resolved_devices_file(self) -> Path:
@@ -244,6 +261,20 @@ class Settings:
         args = shlex.split(os.path.expandvars(os.path.expanduser(self.codex_command)))
         if not args:
             raise ValueError("O comando do Codex não pode estar vazio")
+        # The official installer keeps a stable launcher at ~/.local/bin/codex.
+        # Older setup versions persisted the versioned release target instead,
+        # leaving a long-lived Dex backend pinned after Codex was updated.  Only
+        # migrate commands that clearly point inside the official standalone
+        # releases tree; custom operator commands remain untouched.
+        stable = self.home / ".local" / "bin" / "codex"
+        releases = (self.home / ".codex" / "packages" / "standalone" / "releases").resolve()
+        configured = Path(args[0]).expanduser()
+        try:
+            version_pinned = configured.resolve().is_relative_to(releases)
+        except (OSError, RuntimeError):
+            version_pinned = False
+        if configured != stable and version_pinned and stable.exists() and os.access(stable, os.X_OK):
+            args[0] = str(stable)
         return args
 
     @property
