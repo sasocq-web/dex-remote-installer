@@ -24,6 +24,7 @@ install -d "$STAGE/DEBIAN" \
 
 cp -a "$ROOT/vendor/app" "$STAGE/opt/dex-remote/app"
 install -m 0644 "$ROOT/CODEX_CLI_VERSION" "$STAGE/opt/dex-remote/CODEX_CLI_VERSION"
+install -m 0644 "$ROOT/CONTROL_PLANE_VERSION" "$STAGE/opt/dex-remote/CONTROL_PLANE_VERSION"
 find "$STAGE/opt/dex-remote/app" -type f -name '*.pyc' -delete
 find "$STAGE/opt/dex-remote/app" -type d -name '__pycache__' -empty -delete
 cp -a "$ROOT/vendor/helpers/." "$STAGE/usr/lib/dex-remote/"

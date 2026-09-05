@@ -19,7 +19,7 @@ usage() {
   cat <<'EOF'
 Uso: dex-remote-setup [opções]
 
-  --mode projects|full   Somente Projetos ou Sistema + Projetos
+  --mode projects|full|sasocq  Projetos, Sistema portátil ou Control Plane SASOCQ
   --install-codex        Instala/atualiza o Codex CLI nas contas do Dex
   --skip-codex           Não acessa a rede durante a configuração
   --no-start             Não inicia o serviço ao final
@@ -46,8 +46,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ "$MODE" == "projects" || "$MODE" == "full" ]] || {
-  echo "Modo inválido: use projects ou full" >&2
+[[ "$MODE" == "projects" || "$MODE" == "full" || "$MODE" == "sasocq" ]] || {
+  echo "Modo inválido: use projects, full ou sasocq" >&2
   exit 64
 }
 
@@ -62,7 +62,7 @@ root_path() {
 
 CONTROLLER_USER="codex-worker"
 PROJECT_USER="codex-worker"
-if [[ "$MODE" == "full" ]]; then
+if [[ "$MODE" != "projects" ]]; then
   CONTROLLER_USER="codex"
 fi
 
@@ -98,12 +98,12 @@ write_file() {
 }
 
 ensure_user "$PROJECT_USER"
-if [[ "$MODE" == "full" ]]; then
+if [[ "$MODE" != "projects" ]]; then
   ensure_user "$CONTROLLER_USER"
 fi
 
 SUDOERS="$(root_path /etc/sudoers.d/dex-remote-system)"
-if [[ "$MODE" == "full" ]]; then
+if [[ "$MODE" != "projects" ]]; then
   if [[ -z "$STATE_ROOT" ]]; then
     usermod --append --groups sudo "$CONTROLLER_USER"
   fi
@@ -124,29 +124,55 @@ fi
 CONTROLLER_HOME="$(user_home "$CONTROLLER_USER")"
 PROJECT_HOME="$(user_home "$PROJECT_USER")"
 PROJECT_ROOT="$PROJECT_HOME/CodexProjects"
+[[ "$MODE" != "sasocq" ]] || PROJECT_ROOT="$(root_path /srv/sasocq/projects)"
 SYSTEM_ROOT="$CONTROLLER_HOME/SystemWorkspace"
 CONFIG_DIR="$CONTROLLER_HOME/.config/codex-linux-control"
 CONFIG_FILE="$CONFIG_DIR/config.json"
 
 install -d -m 0700 "$CONFIG_DIR" "$CONTROLLER_HOME/.codex"
 install -d -m 0750 "$PROJECT_ROOT" "$PROJECT_HOME/.codex"
-if [[ "$MODE" == "full" ]]; then
+if [[ "$MODE" != "projects" ]]; then
   install -d -m 0750 "$SYSTEM_ROOT"
 fi
 
 if [[ -z "$STATE_ROOT" ]]; then
   chown -R "$CONTROLLER_USER:$CONTROLLER_USER" "$CONFIG_DIR" "$CONTROLLER_HOME/.codex"
   chown -R "$PROJECT_USER:$PROJECT_USER" "$PROJECT_ROOT" "$PROJECT_HOME/.codex"
-  [[ "$MODE" != "full" ]] || chown -R "$CONTROLLER_USER:$CONTROLLER_USER" "$SYSTEM_ROOT"
+  [[ "$MODE" == "projects" ]] || chown -R "$CONTROLLER_USER:$CONTROLLER_USER" "$SYSTEM_ROOT"
 fi
 
-if [[ "$MODE" == "full" ]]; then
+if [[ "$MODE" != "projects" ]]; then
   PROJECT_COMMAND="/usr/bin/sudo -n -u $PROJECT_USER -- /usr/lib/dex-remote/run-project-app-server"
   CODEX_COMMAND="$CONTROLLER_HOME/.local/bin/codex app-server"
 else
   PROJECT_COMMAND="/usr/lib/dex-remote/run-project-app-server"
   CODEX_COMMAND="$PROJECT_HOME/.local/bin/codex app-server"
   SYSTEM_ROOT="$PROJECT_HOME/.local/share/dex-remote/internal"
+fi
+
+REMOTE_ENABLED=false
+FULL_EXPERIENCE=false
+DESKTOP_CONTROL=false
+BROWSER_CONTROL=false
+REMOTE_DESKTOP=false
+CONTROL_PLANE=false
+ENTRA_ENABLED=false
+CLOUDFLARE_ACCESS=false
+EXTERNAL_URL=""
+REQUIRE_PAIRED_LOCAL=false
+PLAYWRIGHT_INTERNAL=false
+if [[ "$MODE" == "sasocq" ]]; then
+  REMOTE_ENABLED=true
+  FULL_EXPERIENCE=true
+  DESKTOP_CONTROL=true
+  BROWSER_CONTROL=true
+  REMOTE_DESKTOP=true
+  CONTROL_PLANE=true
+  ENTRA_ENABLED=true
+  CLOUDFLARE_ACCESS=true
+  EXTERNAL_URL="https://dex.sasocq.com"
+  REQUIRE_PAIRED_LOCAL=true
+  PLAYWRIGHT_INTERNAL=true
 fi
 
 write_file "$CONFIG_FILE" 0600 <<EOF
@@ -162,17 +188,18 @@ write_file "$CONFIG_FILE" 0600 <<EOF
   "allowed_project_roots": "$PROJECT_ROOT",
   "projects_file": "$CONFIG_DIR/projects.json",
   "allow_localhost": true,
-  "require_paired_local": false,
-  "remote_enabled": false,
-  "full_experience_installed": false,
-  "desktop_control_enabled": false,
-  "browser_control_enabled": false,
-  "playwright_internal_access_enabled": false,
-  "remote_desktop_enabled": false,
+  "require_paired_local": $REQUIRE_PAIRED_LOCAL,
+  "remote_enabled": $REMOTE_ENABLED,
+  "external_url": "$EXTERNAL_URL",
+  "full_experience_installed": $FULL_EXPERIENCE,
+  "desktop_control_enabled": $DESKTOP_CONTROL,
+  "browser_control_enabled": $BROWSER_CONTROL,
+  "playwright_internal_access_enabled": $PLAYWRIGHT_INTERNAL,
+  "remote_desktop_enabled": $REMOTE_DESKTOP,
   "device_auth_required": true,
-  "control_plane_enabled": false,
-  "entra_enabled": false,
-  "cloudflare_access_enabled": false,
+  "control_plane_enabled": $CONTROL_PLANE,
+  "entra_enabled": $ENTRA_ENABLED,
+  "cloudflare_access_enabled": $CLOUDFLARE_ACCESS,
   "privileged_helper": "/usr/lib/dex-remote/clc-admin",
   "service_name": "dex-remote@$CONTROLLER_USER.service"
 }
@@ -187,7 +214,7 @@ write_file "$PROJECT_ROOT/AGENTS.md" 0644 <<'EOF'
 - Serviços publicados por esta distribuição usam endereços do domínio sasocq.com.
 EOF
 
-if [[ "$MODE" == "full" ]]; then
+if [[ "$MODE" != "projects" ]]; then
   write_file "$SYSTEM_ROOT/AGENTS.md" 0644 <<'EOF'
 # Preferências locais do Codex do Sistema
 
@@ -202,7 +229,7 @@ fi
 if [[ -z "$STATE_ROOT" ]]; then
   chown "$CONTROLLER_USER:$CONTROLLER_USER" "$CONFIG_FILE"
   chown -R "$PROJECT_USER:$PROJECT_USER" "$PROJECT_ROOT"
-  [[ "$MODE" != "full" ]] || chown -R "$CONTROLLER_USER:$CONTROLLER_USER" "$SYSTEM_ROOT"
+  [[ "$MODE" == "projects" ]] || chown -R "$CONTROLLER_USER:$CONTROLLER_USER" "$SYSTEM_ROOT"
 fi
 
 install_codex_for() {
@@ -234,7 +261,7 @@ install -d -m 0755 "$(dirname "$PENDING")"
 if [[ "$INSTALL_CODEX" == "yes" && -z "$STATE_ROOT" ]]; then
   FAILED="no"
   install_codex_for "$PROJECT_USER" "$PROJECT_HOME" || FAILED="yes"
-  if [[ "$MODE" == "full" ]]; then
+  if [[ "$MODE" != "projects" ]]; then
     install_codex_for "$CONTROLLER_USER" "$CONTROLLER_HOME" || FAILED="yes"
   fi
   if [[ "$FAILED" == "yes" ]]; then
@@ -285,7 +312,7 @@ fi
 
 echo "Dex Remoto configurado no perfil $MODE com Codex CLI $CODEX_CLI_VERSION."
 echo "Abra http://127.0.0.1:8787 neste computador para autenticar as contas OpenAI."
-if [[ "$MODE" == "full" ]]; then
+if [[ "$MODE" != "projects" ]]; then
   echo "Atenção: o usuário $CONTROLLER_USER possui sudo integral sem senha."
 fi
 echo "Para acesso privado remoto: sudo dex-remote-setup --mode $MODE --skip-codex --enable-tailscale"

@@ -6,10 +6,21 @@ VERSION="$(tr -d '[:space:]' <"$ROOT/PACKAGE_VERSION")"
 DESTINATION="${1:-$ROOT/recovery/dex-current}"
 DEB="$ROOT/dist/dex-remote-installer_${VERSION}_all.deb"
 SHA="$DEB.sha256"
-[[ -f "$DEB" && -f "$SHA" ]] || { echo "Compile o pacote antes de gerar o bundle." >&2; exit 66; }
+CONTROL_VERSION="$(tr -d '[:space:]' <"$ROOT/CONTROL_PLANE_VERSION")"
+CONTROL_DEB="$ROOT/dist/sasocq-control-plane_${CONTROL_VERSION}_all.deb"
+CONTROL_SHA="$CONTROL_DEB.sha256"
+[[ -f "$DEB" && -f "$SHA" && -f "$CONTROL_DEB" && -f "$CONTROL_SHA" ]] || { echo "Baixe os pacotes verificados antes de gerar o bundle." >&2; exit 66; }
+[[ "$DESTINATION" == /* && "$DESTINATION" != "/" ]] || { echo "Destino do bundle inválido." >&2; exit 64; }
 
 install -d -m 0755 "$DESTINATION"
-install -m 0644 "$DEB" "$SHA" "$ROOT/CODEX_CLI_VERSION" "$DESTINATION/"
+# O diretório representa sempre uma única release. Remova somente artefatos
+# versionados antigos para que o reinstalador local nunca encontre dois pacotes.
+find "$DESTINATION" -maxdepth 1 -type f \
+  \( -name 'dex-remote-installer_*_all.deb' -o \
+     -name 'dex-remote-installer_*_all.deb.sha256' -o \
+     -name 'sasocq-control-plane_*_all.deb' -o \
+     -name 'sasocq-control-plane_*_all.deb.sha256' \) -delete
+install -m 0644 "$DEB" "$SHA" "$CONTROL_DEB" "$CONTROL_SHA" "$ROOT/CODEX_CLI_VERSION" "$ROOT/CONTROL_PLANE_VERSION" "$DESTINATION/"
 install -m 0755 "$ROOT/install.sh" "$DESTINATION/install-core"
 install -m 0755 "$ROOT/scripts/reinstall-from-bundle" "$DESTINATION/reinstall"
 python3 - "$ROOT" "$DESTINATION/manifest.json" <<'PY'
@@ -17,14 +28,19 @@ import hashlib, json, pathlib, sys, time
 root, destination = map(pathlib.Path, sys.argv[1:])
 version = (root / "PACKAGE_VERSION").read_text().strip()
 deb = root / "dist" / f"dex-remote-installer_{version}_all.deb"
+control_version = (root / "CONTROL_PLANE_VERSION").read_text().strip()
+control_deb = root / "dist" / f"sasocq-control-plane_{control_version}_all.deb"
 manifest = {
     "format": 1,
     "created_at": time.time(),
     "package_version": version,
     "codex_cli_version": (root / "CODEX_CLI_VERSION").read_text().strip(),
+    "control_plane_version": control_version,
     "dex_release": (root / ".dex-upstream-release").read_text().strip(),
     "package": deb.name,
     "sha256": hashlib.sha256(deb.read_bytes()).hexdigest(),
+    "control_plane_package": control_deb.name,
+    "control_plane_sha256": hashlib.sha256(control_deb.read_bytes()).hexdigest(),
     "contains_secrets": False,
 }
 destination.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")

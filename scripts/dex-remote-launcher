@@ -13,7 +13,9 @@ fi
 
 tries=0
 while [ "$tries" -lt 80 ]; do
-  if curl -fsS "$URL/api/session" >/dev/null 2>&1; then
+  # O perfil SASOCQ exige um navegador pareado até no loopback. A saúde é
+  # pública e não cria sessão; o próprio navegador conduz o pareamento.
+  if curl -fsS "$URL/api/health" >/dev/null 2>&1; then
     exec xdg-open "$URL"
   fi
   tries=$((tries + 1))

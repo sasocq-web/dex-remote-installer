@@ -1,12 +1,14 @@
 # Dex Remote Installer
 
 Instalador Debian/Ubuntu reutilizável e sem dados pessoais para executar dois
-Codex remotos em qualquer computador Linux compatível. O `.deb` oferece dois
+Codex remotos em qualquer computador Linux compatível. O reinstalador oferece três
 perfis independentes:
 
 - `projects`: somente o Codex de Projetos, executado como `codex-worker`, sem sudo;
 - `full`: Codex do Sistema como `codex`, com `sudo NOPASSWD: ALL`, e Codex de
-  Projetos separado como `codex-worker`.
+  Projetos separado como `codex-worker`;
+- `sasocq`: reproduz também o Control Plane deste mini PC, incluindo broker,
+  KVM, recursos, backups, sessões e Steam.
 
 O pacote não contém tokens OpenAI, cookies, conversas, chaves SSH, contas de
 nuvem, identificadores OAuth ou configurações do servidor de origem. Cada conta
@@ -25,15 +27,15 @@ outras famílias precisam de outro formato de pacote.
 
 ## Instalação
 
-Para reinstalar a release verificada mais recente no perfil completo, use um
+Para reinstalar a release verificada mais recente no perfil SASOCQ, use um
 único comando em uma instalação nova do Ubuntu/Debian:
 
 ```bash
-curl -fsSLo /tmp/dex-reinstall https://raw.githubusercontent.com/sasocq-web/dex-remote-installer/main/install.sh && sudo bash /tmp/dex-reinstall --mode full
+curl -fsSLo /tmp/dex-reinstall https://raw.githubusercontent.com/sasocq-web/dex-remote-installer/main/install.sh && sudo bash /tmp/dex-reinstall --mode sasocq
 ```
 
-O reinstalador baixa o `.deb` e seu checksum da GitHub Release, valida o
-SHA-256 antes de instalar e usa a versão do Codex CLI fixada no pacote. Ele
+O reinstalador baixa os pacotes do Dex e do Control Plane com seus checksums,
+valida os SHA-256 antes de instalar e usa as versões fixadas no manifesto. Ele
 recusa substituir um Control Plane SASOCQ que esteja ativo.
 
 Para recuperar também o estado privado, restaure primeiro o snapshot Restic em
@@ -50,6 +52,7 @@ O Debconf pergunta qual perfil instalar. Para reconfigurar depois:
 ```bash
 sudo dex-remote-setup --mode projects --install-codex
 sudo dex-remote-setup --mode full --install-codex
+sudo dex-remote-setup --mode sasocq --install-codex
 ```
 
 Abra `http://127.0.0.1:8787` ou o ícone **Dex Remoto** e autentique a conta
@@ -84,7 +87,7 @@ sha256sum --check dex-remote-installer_*.deb.sha256
 O código-fonte, o histórico e os artefatos de cada versão são publicados no
 GitHub. No servidor mantenedor, uma rotina executada depois de cada backup
 diário verifica se existe uma release nova do Dex. Ela só publica um novo
-pacote depois de mesclar as adaptações portáveis e concluir os testes dos dois
+pacote depois de mesclar as adaptações portáveis e concluir os testes dos três
 perfis; falhas ou conflitos nunca substituem a última release válida.
 
 Para compilar e testar localmente:

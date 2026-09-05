@@ -32,7 +32,9 @@ refresh_local_bundle() {
   git -C "$ROOT" pull --ff-only origin main
   gh release download "$TAG" --repo "$REPOSITORY" --dir "$ROOT/dist" --clobber \
     --pattern "dex-remote-installer_${VERSION}_all.deb" \
-    --pattern "dex-remote-installer_${VERSION}_all.deb.sha256"
+    --pattern "dex-remote-installer_${VERSION}_all.deb.sha256" \
+    --pattern "sasocq-control-plane_*_all.deb" \
+    --pattern "sasocq-control-plane_*_all.deb.sha256"
   "$ROOT/tests/test-package.sh"
   "$ROOT/scripts/create-recovery-bundle"
 }
@@ -55,9 +57,16 @@ if [[ $MERGE_STATUS -eq 3 ]] && gh release view "$TAG" --repo "$REPOSITORY" >/de
 fi
 
 "$WORK/build.sh"
-"$WORK/tests/test-package.sh"
 DEB="$WORK/dist/dex-remote-installer_${VERSION}_all.deb"
 SHA="$DEB.sha256"
+CONTROL_VERSION="$(tr -d '[:space:]' <"$WORK/CONTROL_PLANE_VERSION")"
+CONTROL_SOURCE="$ROOT/../sasocq-control-plane_${CONTROL_VERSION}_all.deb"
+CONTROL_DEB="$WORK/dist/sasocq-control-plane_${CONTROL_VERSION}_all.deb"
+CONTROL_SHA="$CONTROL_DEB.sha256"
+[[ -f "$CONTROL_SOURCE" ]] || { echo "Pacote do Control Plane SASOCQ ausente: $CONTROL_SOURCE" >&2; exit 66; }
+install -m 0644 "$CONTROL_SOURCE" "$CONTROL_DEB"
+(cd "$WORK/dist" && sha256sum "$(basename "$CONTROL_DEB")" >"$(basename "$CONTROL_SHA")")
+"$WORK/tests/test-package.sh"
 
 if [[ $MERGE_STATUS -eq 0 ]]; then
   git -C "$WORK" add --all
@@ -67,10 +76,10 @@ fi
 
 if ! gh release view "$TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
   RELEASE_ID="$(tr -d '[:space:]' <"$WORK/.dex-upstream-release")"
-  gh release create "$TAG" "$DEB" "$SHA" \
+  gh release create "$TAG" "$DEB" "$SHA" "$CONTROL_DEB" "$CONTROL_SHA" \
     --repo "$REPOSITORY" \
     --title "Dex Remote Installer $VERSION" \
-    --notes "Pacote portátil sincronizado com a release Dex ${RELEASE_ID}. Inclui os perfis Projetos e Sistema + Projetos. O SHA-256 acompanha o download." \
+    --notes "Pacote sincronizado com a release Dex ${RELEASE_ID}. Inclui os perfis Projetos, Sistema portátil e Control Plane SASOCQ. Os SHA-256 acompanham os downloads." \
     --latest
 fi
 
