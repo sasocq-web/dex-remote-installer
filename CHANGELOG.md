@@ -10,6 +10,8 @@
 - Acrescenta o perfil `sasocq`, com o pacote fixado do Control Plane para
   recuperar broker, KVM, recursos, backups, sessões e Steam.
 - Corrige nomes de assets com `+` codificado nas URLs de download do GitHub.
+- Torna o manifesto do bundle determinístico para que a verificação pós-backup
+  não gere uma falsa alteração no conteúdo recuperável.
 
 ## 1.0.0+20260822.193121 — 2026-08-22
 

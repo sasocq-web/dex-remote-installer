@@ -210,6 +210,9 @@ if [[ -f "$CONTROL_DEB" && -f "$CONTROL_SHA" ]]; then
     "$BUNDLE_ROOT/dex-remote-installer_0.0.0_all.deb.sha256"
   "$ROOT/scripts/create-recovery-bundle" "$BUNDLE_ROOT" >/dev/null
   [[ ! -e "$BUNDLE_ROOT/dex-remote-installer_0.0.0_all.deb" ]]
+  MANIFEST_FIRST="$(sha256sum "$BUNDLE_ROOT/manifest.json" | awk '{print $1}')"
+  "$ROOT/scripts/create-recovery-bundle" "$BUNDLE_ROOT" >/dev/null
+  [[ "$(sha256sum "$BUNDLE_ROOT/manifest.json" | awk '{print $1}')" == "$MANIFEST_FIRST" ]]
   "$BUNDLE_ROOT/reinstall" --mode sasocq --verify-only >/dev/null
   python3 - "$BUNDLE_ROOT/manifest.json" "$DEB" "$CONTROL_DEB" <<'PY'
 import hashlib, json, pathlib, sys

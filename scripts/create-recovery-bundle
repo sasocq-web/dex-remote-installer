@@ -24,19 +24,21 @@ install -m 0644 "$DEB" "$SHA" "$CONTROL_DEB" "$CONTROL_SHA" "$ROOT/CODEX_CLI_VER
 install -m 0755 "$ROOT/install.sh" "$DESTINATION/install-core"
 install -m 0755 "$ROOT/scripts/reinstall-from-bundle" "$DESTINATION/reinstall"
 python3 - "$ROOT" "$DESTINATION/manifest.json" <<'PY'
-import hashlib, json, pathlib, sys, time
+import hashlib, json, pathlib, sys
 root, destination = map(pathlib.Path, sys.argv[1:])
 version = (root / "PACKAGE_VERSION").read_text().strip()
 deb = root / "dist" / f"dex-remote-installer_{version}_all.deb"
 control_version = (root / "CONTROL_PLANE_VERSION").read_text().strip()
 control_deb = root / "dist" / f"sasocq-control-plane_{control_version}_all.deb"
+dex_release = (root / ".dex-upstream-release").read_text().strip()
+release_epoch = int(dex_release.rsplit("-", 1)[-1])
 manifest = {
     "format": 1,
-    "created_at": time.time(),
+    "created_at": release_epoch,
     "package_version": version,
     "codex_cli_version": (root / "CODEX_CLI_VERSION").read_text().strip(),
     "control_plane_version": control_version,
-    "dex_release": (root / ".dex-upstream-release").read_text().strip(),
+    "dex_release": dex_release,
     "package": deb.name,
     "sha256": hashlib.sha256(deb.read_bytes()).hexdigest(),
     "control_plane_package": control_deb.name,
