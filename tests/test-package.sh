@@ -199,6 +199,16 @@ PY
 
 runtime_check projects "$PROJECTS_ROOT" "$PROJECTS_ROOT/home/codex-worker" 18787 no
 runtime_check full "$FULL_ROOT" "$FULL_ROOT/home/codex" 18788 yes
+# A configuração SASOCQ completa foi validada acima. No teste isolado do
+# backend, não tente abrir TigerVNC/desktop reais do host mantenedor.
+python3 - "$SASOCQ_ROOT/home/codex/.config/codex-linux-control/config.json" <<'PY'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+config = json.loads(path.read_text(encoding="utf-8"))
+for key in ("desktop_control_enabled", "browser_control_enabled", "remote_desktop_enabled"):
+    config[key] = False
+path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+PY
 runtime_check sasocq "$SASOCQ_ROOT" "$SASOCQ_ROOT/home/codex" 18789 yes
 
 CONTROL_VERSION="$(tr -d '[:space:]' <"$ROOT/CONTROL_PLANE_VERSION")"
