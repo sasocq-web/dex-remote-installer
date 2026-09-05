@@ -45,6 +45,23 @@ dpkg-deb -x "$DEB" "$EXTRACT"
 [[ -f "$EXTRACT/opt/dex-remote/app/clc/workbench.py" ]]
 [[ -f "$EXTRACT/opt/dex-remote/app/web/automations.js" ]]
 [[ -f "$EXTRACT/opt/dex-remote/app/web/workbench.js" ]]
+[[ -x "$EXTRACT/opt/dex-remote/app/scripts/run-playwright-mcp" ]]
+cmp "$ROOT/vendor/app/system/playwright/playwright_mcp_proxy.py" \
+  "$EXTRACT/opt/dex-remote/app/system/playwright/playwright_mcp_proxy.py"
+python3 - "$EXTRACT/opt/dex-remote/app/system/playwright/playwright_mcp_proxy.py" <<'PY'
+import importlib.util, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("packaged_browser_proxy", sys.argv[1])
+proxy = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(proxy)
+posted = []
+proxy._post = posted.append
+proxy.workspace_root = Path("/srv/sasocq/projects/WhatsApp-business")
+proxy.forward({"id": 1, "method": "initialize", "params": {"capabilities": {}}})
+proxy._deliver({"id": 8, "method": "roots/list"})
+assert posted[0]["params"]["capabilities"]["roots"] == {"listChanged": False}
+assert posted[1]["result"]["roots"][0]["uri"] == proxy.workspace_root.as_uri()
+PY
 [[ "$(cat "$EXTRACT/opt/dex-remote/CODEX_CLI_VERSION")" == "$(cat "$ROOT/CODEX_CLI_VERSION")" ]]
 [[ "$(cat "$EXTRACT/opt/dex-remote/CONTROL_PLANE_VERSION")" == "$(cat "$ROOT/CONTROL_PLANE_VERSION")" ]]
 [[ -x "$EXTRACT/usr/sbin/dex-remote-setup" ]]

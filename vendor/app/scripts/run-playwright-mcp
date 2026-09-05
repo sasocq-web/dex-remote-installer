@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -gt 0 ]; then
+  exec /usr/lib/codex-linux-control/run-playwright-mcp "$@"
+fi
+
+APP_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+exec /usr/bin/python3 "$APP_DIR/system/playwright/playwright_mcp_proxy.py"

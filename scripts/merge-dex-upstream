@@ -25,7 +25,10 @@ LOCAL_ROOT = ROOT / "vendor/app"
 SYSTEM_FILES = {
     "system/browser-editable-at-point.cjs",
     "system/set-browser-layout.cjs",
+    "scripts/run-playwright-mcp",
+    "system/playwright/playwright_mcp_proxy.py",
 }
+REQUIRED_BROWSER_FILES = {"scripts/run-playwright-mcp", "system/playwright/playwright_mcp_proxy.py"}
 IGNORED_NAMES = (
     ".bak",
     ".before-",
@@ -231,7 +234,7 @@ def write_tree(files: dict[str, bytes], destination: Path) -> None:
         target = destination / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(content)
-        target.chmod(0o644)
+        target.chmod(0o755 if relative == "scripts/run-playwright-mcp" else 0o644)
 
 
 def main() -> int:
@@ -240,7 +243,7 @@ def main() -> int:
     release_pattern = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}")
     if not release_pattern.fullmatch(base_id) or not release_pattern.fullmatch(remote_id):
         raise RuntimeError("identificador de release inválido")
-    if base_id == remote_id:
+    if base_id == remote_id and all((LOCAL_ROOT / name).is_file() for name in REQUIRED_BROWSER_FILES):
         print(json.dumps({"changed": False, "release": remote_id}, ensure_ascii=False))
         return 3
 
@@ -250,11 +253,20 @@ def main() -> int:
     base = collect(base_root)
     local = collect(LOCAL_ROOT)
     remote = collect(remote_root)
+    local_digest = digest(local)
+    # These runtime files were absent from the old export allowlist, not
+    # intentionally deleted by the portable package. Restore them once and
+    # merge future upstream updates normally.
+    for relative in REQUIRED_BROWSER_FILES:
+        if relative not in remote:
+            raise RuntimeError(f"runtime obrigatório ausente na release: {relative}")
+        if relative not in local and relative in base:
+            local[relative] = base[relative]
     merged = merge_maps(base, local, remote)
 
     upstream_version = remote.get("VERSION", b"0.0.0").decode("utf-8", errors="replace").strip()
     merged["VERSION"] = f"{upstream_version}-portable+{remote_id}\n".encode()
-    if digest(merged) == digest(local):
+    if digest(merged) == local_digest:
         BASE_FILE.write_text(remote_id + "\n", encoding="utf-8")
         print(json.dumps({"changed": True, "release": remote_id, "source_changed": False}, ensure_ascii=False))
         return 0
@@ -270,6 +282,10 @@ def main() -> int:
         shutil.rmtree(previous)
 
     version = package_version(remote_id, remote_root)
+    if base_id == remote_id:
+        # A repaired export of the same upstream release is a new immutable
+        # package, never an overwrite of the GitHub asset already published.
+        version = "1.0.0+" + datetime.now().strftime("%Y%m%d.%H%M%S")
     VERSION_FILE.write_text(version + "\n", encoding="utf-8")
     BASE_FILE.write_text(remote_id + "\n", encoding="utf-8")
     print(json.dumps({"changed": True, "release": remote_id, "version": version}, ensure_ascii=False))

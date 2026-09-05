@@ -62,6 +62,7 @@ EOF
 
 find "$STAGE/opt/dex-remote/app" -type d -exec chmod 0755 {} +
 find "$STAGE/opt/dex-remote/app" -type f -exec chmod 0644 {} +
+chmod 0755 "$STAGE/opt/dex-remote/app/scripts/run-playwright-mcp"
 find "$STAGE/usr/lib/dex-remote" -type f -exec chmod 0755 {} +
 
 install -d "$OUTPUT_DIR"
