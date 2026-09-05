@@ -1,0 +1,25 @@
+[Unit]
+Description=Sincronização verificável do reinstalador Dex no GitHub e backup
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=2h
+StartLimitBurst=4
+
+[Service]
+Type=oneshot
+User=codex
+Group=codex
+ExecStart=/home/codex/SystemWorkspace/dex-remote-installer/scripts/publish-after-backup --trigger-backup-on-change
+TimeoutStartSec=30min
+Restart=on-failure
+RestartSec=15min
+Nice=10
+IOSchedulingClass=idle
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/codex/SystemWorkspace/dex-remote-installer
+ReadWritePaths=/home/codex/.local/state
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

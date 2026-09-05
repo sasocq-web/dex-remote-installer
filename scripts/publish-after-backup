@@ -3,12 +3,65 @@ set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOCK_FILE="${XDG_RUNTIME_DIR:-/tmp}/dex-remote-installer-publish.lock"
+TRIGGER_BACKUP="no"
+CONFIRM_BACKUP="no"
+WORK_ROOT=""
+SYNC_PERFORMED="no"
+BACKUP_MARKER="${XDG_STATE_HOME:-$HOME/.local/state}/dex-remote-installer/backup-required"
+
+usage() {
+  cat <<'EOF'
+Uso: publish-after-backup [--trigger-backup-on-change] [--confirm-backed-up]
+
+Sincroniza a release Dex mais recente com o GitHub e com o bundle local.
+Quando solicitado, dispara pelo broker um backup auditável se o bundle mudou.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --trigger-backup-on-change) TRIGGER_BACKUP="yes"; shift ;;
+    --confirm-backed-up) CONFIRM_BACKUP="yes"; shift ;;
+    --help|-h) usage; exit 0 ;;
+    *) echo "Opção desconhecida: $1" >&2; usage >&2; exit 64 ;;
+  esac
+done
+
+bundle_digest() {
+  [[ -f "$ROOT/recovery/dex-current/manifest.json" ]] || return 0
+  sha256sum "$ROOT/recovery/dex-current/manifest.json" | awk '{print $1}'
+}
+
+INITIAL_BUNDLE_DIGEST="$(bundle_digest)"
+cleanup() {
+  local rc=$? final_digest changed="no"
+  trap - EXIT
+  [[ -z "$WORK_ROOT" ]] || rm -rf -- "$WORK_ROOT"
+  final_digest="$(bundle_digest)"
+  [[ -z "$final_digest" || "$final_digest" == "$INITIAL_BUNDLE_DIGEST" ]] || changed="yes"
+  if [[ $rc -eq 0 && "$SYNC_PERFORMED" == "yes" && "$changed" == "yes" && "$TRIGGER_BACKUP" == "yes" ]]; then
+    install -d -m 0700 "$(dirname "$BACKUP_MARKER")"
+    printf '%s\n' "$final_digest" >"$BACKUP_MARKER"
+    chmod 0600 "$BACKUP_MARKER"
+  elif [[ $rc -eq 0 && "$SYNC_PERFORMED" == "yes" && "$changed" == "no" && "$CONFIRM_BACKUP" == "yes" ]]; then
+    rm -f -- "$BACKUP_MARKER"
+  fi
+  if [[ $rc -eq 0 && "$TRIGGER_BACKUP" == "yes" && -f "$BACKUP_MARKER" ]]; then
+    if ! sasocq-brokerctl backup '{"operation":"run"}' >/dev/null; then
+      echo "O bundle mudou, mas o backup auditável não pôde ser iniciado." >&2
+      rc=1
+    fi
+  fi
+  exit "$rc"
+}
+trap cleanup EXIT
 
 exec 9>"$LOCK_FILE"
 if ! flock -n 9; then
   echo "A publicação do Dex Remote Installer já está em execução."
   exit 0
 fi
+SYNC_PERFORMED="yes"
 
 command -v gh >/dev/null || { echo "Cliente gh não instalado; publicação adiada." >&2; exit 69; }
 gh auth status --hostname github.com >/dev/null 2>&1 || {
@@ -21,7 +74,6 @@ ORIGIN="$(git -C "$ROOT" remote get-url origin)"
 [[ -n "$ORIGIN" ]] || { echo "Remote origin ausente." >&2; exit 69; }
 REPOSITORY="$(gh repo view "$ORIGIN" --json nameWithOwner --jq .nameWithOwner)"
 WORK_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/dex-publish.XXXXXX")"
-trap 'rm -rf -- "$WORK_ROOT"' EXIT
 
 git clone --quiet "$ORIGIN" "$WORK_ROOT/repo"
 WORK="$WORK_ROOT/repo"

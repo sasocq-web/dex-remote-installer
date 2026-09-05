@@ -101,6 +101,11 @@ Depois dos testes, `scripts/create-recovery-bundle` cria em `recovery/` uma
 cópia autocontida do pacote, checksum, reinstalador e manifesto. Essa pasta é
 ignorada pelo Git e preservada pelo backup criptografado SASOCQ.
 
+No mini PC mantenedor, a sincronização é verificada a cada três horas, depois
+da atualização do Codex e antes e depois de cada backup. Quando uma release
+muda fora da janela diária, a rotina solicita imediatamente um backup pelo
+broker auditável e mantém uma pendência até a confirmação do snapshot.
+
 Veja [docs/AUTOMATION.md](docs/AUTOMATION.md) para o fluxo de atualização e
 [SECURITY.md](SECURITY.md) para relatar vulnerabilidades.
 

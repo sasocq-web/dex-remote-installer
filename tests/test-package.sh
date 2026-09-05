@@ -23,8 +23,9 @@ node --check "$ROOT/vendor/app/web/sw.js"
 bash -n "$ROOT/build.sh" "$ROOT/install.sh" "$ROOT/scripts/dex-remote-configure" \
   "$ROOT/scripts/dex-remote-restore" "$ROOT/scripts/create-recovery-bundle" \
   "$ROOT/scripts/reinstall-from-bundle" \
-  "$ROOT/scripts/publish-after-backup"
+  "$ROOT/scripts/publish-after-backup" "$ROOT/scripts/deploy-maintainer-automation"
 "$ROOT/install.sh" --help >/dev/null
+"$ROOT/scripts/publish-after-backup" --help >/dev/null
 [[ "$(cat "$ROOT/CONTROL_PLANE_VERSION")" =~ ^[0-9][0-9A-Za-z.+:~-]*$ ]]
 for script in "$ROOT/scripts/dex-remote-launcher" "$ROOT/packaging/config" \
   "$ROOT/packaging/postinst" "$ROOT/packaging/prerm" "$ROOT/packaging/postrm"; do
