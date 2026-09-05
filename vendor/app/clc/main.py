@@ -636,16 +636,25 @@ def _system_project() -> Project:
     return Project(SYSTEM_PROJECT_ID, SYSTEM_WORKSPACE_NAME, str(path), "system")
 
 
-def _thread_approval_policy(_project: Project) -> str:
-    """Run in-scope work without redundant app-server command prompts.
+def _thread_approval_policy(_project: Project) -> Dict[str, Any]:
+    """Keep command autonomy while allowing explicitly prompted MCP tools.
 
-    This does not widen host authority: privileged operations still cross the
-    audited Control Plane broker, destructive host operations keep their strong
-    operator confirmation, and external MCP/app actions retain their own
-    approval policies.
+    ``never`` rejects MCP tools configured as ``prompt`` before Dex can show
+    their approval card. Granular policy allows that card without enabling
+    sandbox escalation, exec-policy, permission or skill-script prompts.
+    Tool approval modes and the audited broker's authority remain unchanged.
+    Applied on every turn, including resumed conversations and automations.
     """
 
-    return "never"
+    return {
+        "granular": {
+            "sandbox_approval": False,
+            "rules": False,
+            "mcp_elicitations": True,
+            "request_permissions": False,
+            "skill_approval": False,
+        },
+    }
 
 
 def _all_projects() -> list[Project]:
