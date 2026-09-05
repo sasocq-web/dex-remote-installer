@@ -12,6 +12,8 @@
 - Corrige nomes de assets com `+` codificado nas URLs de download do GitHub.
 - Torna o manifesto do bundle determinístico para que a verificação pós-backup
   não gere uma falsa alteração no conteúdo recuperável.
+- Aceita identificadores de release descritivos, sem pressupor um epoch no
+  último segmento do nome.
 
 ## 1.0.0+20260822.193121 — 2026-08-22
 

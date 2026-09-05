@@ -24,14 +24,23 @@ install -m 0644 "$DEB" "$SHA" "$CONTROL_DEB" "$CONTROL_SHA" "$ROOT/CODEX_CLI_VER
 install -m 0755 "$ROOT/install.sh" "$DESTINATION/install-core"
 install -m 0755 "$ROOT/scripts/reinstall-from-bundle" "$DESTINATION/reinstall"
 python3 - "$ROOT" "$DESTINATION/manifest.json" <<'PY'
-import hashlib, json, pathlib, sys
+import hashlib, json, pathlib, re, sys
+from datetime import datetime
+from zoneinfo import ZoneInfo
 root, destination = map(pathlib.Path, sys.argv[1:])
 version = (root / "PACKAGE_VERSION").read_text().strip()
 deb = root / "dist" / f"dex-remote-installer_{version}_all.deb"
 control_version = (root / "CONTROL_PLANE_VERSION").read_text().strip()
 control_deb = root / "dist" / f"sasocq-control-plane_{control_version}_all.deb"
 dex_release = (root / ".dex-upstream-release").read_text().strip()
-release_epoch = int(dex_release.rsplit("-", 1)[-1])
+stamp_match = re.search(r"\+(\d{8}\.\d{6})$", version)
+if not stamp_match:
+    raise SystemExit("a versão do pacote não contém uma data determinística")
+release_epoch = int(
+    datetime.strptime(stamp_match.group(1), "%Y%m%d.%H%M%S")
+    .replace(tzinfo=ZoneInfo("America/Sao_Paulo"))
+    .timestamp()
+)
 manifest = {
     "format": 1,
     "created_at": release_epoch,
