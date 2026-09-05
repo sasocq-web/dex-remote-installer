@@ -2,12 +2,13 @@
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LOCK_FILE="${XDG_RUNTIME_DIR:-/tmp}/dex-remote-installer-publish.lock"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/dex-remote-installer"
+LOCK_FILE="$STATE_DIR/publish.lock"
 TRIGGER_BACKUP="no"
 CONFIRM_BACKUP="no"
 WORK_ROOT=""
 SYNC_PERFORMED="no"
-BACKUP_MARKER="${XDG_STATE_HOME:-$HOME/.local/state}/dex-remote-installer/backup-required"
+BACKUP_MARKER="$STATE_DIR/backup-required"
 
 usage() {
   cat <<'EOF'
@@ -32,34 +33,42 @@ bundle_digest() {
   sha256sum "$ROOT/recovery/dex-current/manifest.json" | awk '{print $1}'
 }
 
-INITIAL_BUNDLE_DIGEST="$(bundle_digest)"
 cleanup() {
-  local rc=$? final_digest changed="no"
+  local rc=$? final_digest proof
   trap - EXIT
   [[ -z "$WORK_ROOT" ]] || rm -rf -- "$WORK_ROOT"
   final_digest="$(bundle_digest)"
-  [[ -z "$final_digest" || "$final_digest" == "$INITIAL_BUNDLE_DIGEST" ]] || changed="yes"
-  if [[ $rc -eq 0 && "$SYNC_PERFORMED" == "yes" && "$changed" == "yes" && "$TRIGGER_BACKUP" == "yes" ]]; then
-    install -d -m 0700 "$(dirname "$BACKUP_MARKER")"
-    printf '%s\n' "$final_digest" >"$BACKUP_MARKER"
-    chmod 0600 "$BACKUP_MARKER"
-  elif [[ $rc -eq 0 && "$SYNC_PERFORMED" == "yes" && "$changed" == "no" && "$CONFIRM_BACKUP" == "yes" ]]; then
-    rm -f -- "$BACKUP_MARKER"
-  fi
-  if [[ $rc -eq 0 && "$TRIGGER_BACKUP" == "yes" && -f "$BACKUP_MARKER" ]]; then
-    if ! sasocq-brokerctl backup '{"operation":"run"}' >/dev/null; then
-      echo "O bundle mudou, mas o backup auditável não pôde ser iniciado." >&2
-      rc=1
+  if [[ $rc -eq 0 && "$SYNC_PERFORMED" == "yes" ]] && \
+     [[ "$TRIGGER_BACKUP" == "yes" || "$CONFIRM_BACKUP" == "yes" ]]; then
+    proof="$(mktemp "$STATE_DIR/verification.XXXXXX")"
+    if sasocq-brokerctl host-admin '{"operation":"exec","argv":["/usr/lib/sasocq-control/verify-dex-recovery"],"timeout":120}' >"$proof"; then
+      mv -f -- "$proof" "$STATE_DIR/backup-confirmed.json"
+      rm -f -- "$BACKUP_MARKER"
+      echo "Conteúdo do reinstalador conferido no snapshot remoto."
+    else
+      mv -f -- "$proof" "$STATE_DIR/backup-verification-failed.json"
+      printf '%s\n' "${final_digest:-unverified}" >"$BACKUP_MARKER"
+      chmod 0600 "$BACKUP_MARKER"
+      echo "Snapshot remoto ainda não corresponde ao reinstalador atual; pendência preservada." >&2
+      # ExecStartPost still belongs to the running backup unit: starting that
+      # unit here coalesces with the old job. The persistent retry timer handles
+      # this case after it has finished, without silently losing the request.
+      if [[ "$CONFIRM_BACKUP" == "yes" ]]; then
+        rc=1
+      elif ! sasocq-brokerctl backup '{"operation":"run"}' >/dev/null; then
+        rc=1
+      fi
     fi
   fi
   exit "$rc"
 }
 trap cleanup EXIT
 
+install -d -m 0700 "$STATE_DIR"
 exec 9>"$LOCK_FILE"
-if ! flock -n 9; then
+if ! flock -w 120 9; then
   echo "A publicação do Dex Remote Installer já está em execução."
-  exit 0
+  exit 75
 fi
 SYNC_PERFORMED="yes"
 
@@ -104,7 +113,7 @@ VERSION="$(tr -d '[:space:]' <"$WORK/PACKAGE_VERSION")"
 TAG="v$VERSION"
 if [[ $MERGE_STATUS -eq 3 ]] && gh release view "$TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
   refresh_local_bundle
-  echo "Dex $TAG já está publicado; verificação pós-backup concluída."
+  echo "Dex $TAG já está publicado; artefatos locais verificados."
   exit 0
 fi
 
@@ -136,4 +145,4 @@ if ! gh release view "$TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
 fi
 
 refresh_local_bundle
-echo "Dex Remote Installer $VERSION publicado e verificado após o backup."
+echo "Dex Remote Installer $VERSION publicado; artefatos locais verificados."

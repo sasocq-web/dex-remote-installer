@@ -1,0 +1,10 @@
+[Unit]
+Description=Retentativa persistente das pendências de backup do Dex
+
+[Timer]
+OnCalendar=*:0/15
+Persistent=true
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target

@@ -2,6 +2,7 @@
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/tests/test-backup-verification.py"
 VERSION="$(tr -d '[:space:]' <"$ROOT/PACKAGE_VERSION")"
 DEB="$ROOT/dist/dex-remote-installer_${VERSION}_all.deb"
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/dex-remote-test.XXXXXX")"

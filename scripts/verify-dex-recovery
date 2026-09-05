@@ -1,0 +1,20 @@
+#!/bin/bash
+# Root-owned, fixed-target, read-only Restic verification. Run via the broker.
+set -Eeuo pipefail
+[[ "$#" -eq 0 && "$(id -u)" -eq 0 ]] || exit 77
+source /etc/sasocq-control/backup.env
+export RESTIC_REPOSITORY RESTIC_PASSWORD_FILE RCLONE_CONFIG RCLONE_PASSWORD_COMMAND
+recovery_repo=/home/codex/SystemWorkspace/dex-remote-installer
+recovery_stage="$(mktemp -d /var/lib/sasocq-control/dex-recovery-check.XXXXXX)"
+trap 'rm -rf -- "$recovery_stage"' EXIT
+# Resolve once: never mix content from two different snapshots.
+restic snapshots --latest 1 --json >"$recovery_stage/snapshot.json"
+snapshot_id="$(python3 -c 'import json,sys; print(max(json.load(open(sys.argv[1])), key=lambda s:s["time"])["id"])' "$recovery_stage/snapshot.json")"
+[[ "$snapshot_id" =~ ^[0-9a-f]{64}$ ]] || exit 65
+restic restore "$snapshot_id" --target "$recovery_stage/restored" \
+  --include "$recovery_repo/recovery/dex-current" \
+  --include "$recovery_repo/.git/refs/heads/main" \
+  --include "$recovery_repo/scripts" \
+  --include "$recovery_repo/systemd" >/dev/null
+python3 /usr/lib/sasocq-control/verify-dex-recovery.py \
+  "$recovery_repo" "$recovery_stage/restored$recovery_repo" "$snapshot_id"

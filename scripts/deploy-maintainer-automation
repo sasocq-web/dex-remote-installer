@@ -7,6 +7,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 install -d -m 0755 /etc/systemd/system/sasocq-backup.service.d
 install -d -m 0755 /etc/systemd/system/sasocq-codex-auto-update.service.d
 install -d -m 0700 -o codex -g codex /home/codex/.local/state/dex-remote-installer
+install -m 0755 "$ROOT/scripts/verify-dex-recovery" /usr/lib/sasocq-control/verify-dex-recovery
+install -m 0644 "$ROOT/scripts/verify-dex-recovery.py" /usr/lib/sasocq-control/verify-dex-recovery.py
+install -m 0644 "$ROOT/systemd/sasocq-dex-recovery-retry.service" /etc/systemd/system/sasocq-dex-recovery-retry.service
+install -m 0644 "$ROOT/systemd/sasocq-dex-recovery-retry.timer" /etc/systemd/system/sasocq-dex-recovery-retry.timer
 
 install -m 0644 "$ROOT/systemd/sasocq-dex-recovery-sync.service" \
   /etc/systemd/system/sasocq-dex-recovery-sync.service
@@ -21,7 +25,8 @@ install -m 0644 "$ROOT/systemd/90-dex-recovery-sync.conf" \
 
 systemctl daemon-reload
 systemctl enable --now sasocq-dex-recovery-sync.timer
-systemctl start sasocq-dex-recovery-sync.service
+systemctl enable --now sasocq-dex-recovery-retry.timer
+systemctl start --no-block sasocq-dex-recovery-sync.service
 systemctl show sasocq-dex-recovery-sync.service \
   --property=ActiveState,SubState,Result,ExecMainStatus --no-pager
 systemctl show sasocq-dex-recovery-sync.timer \

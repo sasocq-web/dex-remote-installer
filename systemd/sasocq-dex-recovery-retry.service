@@ -1,0 +1,7 @@
+[Unit]
+Description=Retenta pendência comprovada do backup do reinstalador Dex
+ConditionPathExists=/home/codex/.local/state/dex-remote-installer/backup-required
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl start --no-block sasocq-dex-recovery-sync.service
