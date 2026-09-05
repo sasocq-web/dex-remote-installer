@@ -80,9 +80,13 @@ if mode == "sasocq" and (len(control_deb) != 1 or len(control_sha) != 1):
 pathlib.Path(output).write_text(
     json.dumps({
         "deb": deb[0]["browser_download_url"],
+        "deb_name": deb[0]["name"],
         "sha": sha[0]["browser_download_url"],
+        "sha_name": sha[0]["name"],
         "control_deb": control_deb[0]["browser_download_url"] if control_deb else "",
+        "control_deb_name": control_deb[0]["name"] if control_deb else "",
         "control_sha": control_sha[0]["browser_download_url"] if control_sha else "",
+        "control_sha_name": control_sha[0]["name"] if control_sha else "",
     }),
     encoding="utf-8",
 )
@@ -90,8 +94,8 @@ PY
 
   DEB_URL="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["deb"])' "$WORK/assets")"
   SHA_URL="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["sha"])' "$WORK/assets")"
-  DEB="$WORK/$(basename "$DEB_URL")"
-  SHA="$WORK/$(basename "$SHA_URL")"
+  DEB="$WORK/$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["deb_name"])' "$WORK/assets")"
+  SHA="$WORK/$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["sha_name"])' "$WORK/assets")"
   curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 "$DEB_URL" --output "$DEB"
   curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 "$SHA_URL" --output "$SHA"
   CONTROL_DEB=""
@@ -99,8 +103,8 @@ PY
   if [[ "$MODE" == "sasocq" ]]; then
     CONTROL_DEB_URL="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["control_deb"])' "$WORK/assets")"
     CONTROL_SHA_URL="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["control_sha"])' "$WORK/assets")"
-    CONTROL_DEB="$WORK/$(basename "$CONTROL_DEB_URL")"
-    CONTROL_SHA="$WORK/$(basename "$CONTROL_SHA_URL")"
+    CONTROL_DEB="$WORK/$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["control_deb_name"])' "$WORK/assets")"
+    CONTROL_SHA="$WORK/$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["control_sha_name"])' "$WORK/assets")"
     curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 "$CONTROL_DEB_URL" --output "$CONTROL_DEB"
     curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 "$CONTROL_SHA_URL" --output "$CONTROL_SHA"
   fi

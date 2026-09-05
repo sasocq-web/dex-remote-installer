@@ -1,6 +1,6 @@
 # Histórico de versões
 
-## 1.0.0+20260905.144652 — 2026-09-05
+## 1.0.0+20260905.145536 — 2026-09-05
 
 - Sincroniza integralmente o runtime do Dex ativo de 05/09/2026.
 - Inclui Workbench, Automações, Sites e insights do PC.
@@ -9,6 +9,7 @@
   local preservado pelo backup criptografado.
 - Acrescenta o perfil `sasocq`, com o pacote fixado do Control Plane para
   recuperar broker, KVM, recursos, backups, sessões e Steam.
+- Corrige nomes de assets com `+` codificado nas URLs de download do GitHub.
 
 ## 1.0.0+20260822.193121 — 2026-08-22
 
