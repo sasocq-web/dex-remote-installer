@@ -1,10 +1,10 @@
-const CACHE = "dex-remote-v1.0.0-0-modern-workbench0151-execution-progress275-steam-remote-recovery284-secure-payment-card294-gnome-codex3-draft-recovery295";
+const CACHE = "dex-remote-v1.0.0-0-modern-workbench0151-execution-progress275-steam-remote-recovery284-secure-payment-card294-gnome-codex3-draft-recovery295-quota-primary-summary298";
 const ASSETS = [
   "/",
   "/index.html",
   "/styles.css?v=secure-payment-card-20260902-294-portable",
   "/workbench.css?v=modern-workbench-20260830-4",
-  "/app.js?v=draft-recovery-20260903-295-portable",
+  "/app.js?v=quota-primary-summary-20260905-298-portable",
   "/sites.js?v=dex-fast-open-20260902-290",
   "/automations.js?v=pc-managers-20260824-229b",
   "/release-status.json",
