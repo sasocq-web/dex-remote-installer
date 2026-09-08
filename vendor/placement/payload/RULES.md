@@ -1,0 +1,9 @@
+## Política obrigatória de localização SASOCQ — host-development-v1
+
+- A VM sasocq-server é exclusiva para publicação, serviços, bancos e processamento da produção em sasocq.com. Nunca desenvolver, compilar, instalar ferramentas de desenvolvimento, executar IDEs, Studio, emuladores ou testes nela, nem mesmo tarefas leves.
+- Todo desenvolvimento ocorre no host como codex-worker, em /srv/sasocq/projects e áreas isoladas sasocq-lab/sasocq-build. Sem root, sudo, broker ou libvirt do host para Projetos. Entregar imagens e artefatos prontos à VM; usar docker load e compose up --no-build.
+- Se um runtime, arquivo, laboratório ou proteção estiver ausente após reinstalação/restauração, interromper a tarefa de desenvolvimento e reparar/restaurar o ambiente do host pelo Sistema. A VM nunca é fallback. Não contornar bloqueios via outro binário, API, SSH ou reinstalação de ferramentas.
+- Android e Studio executam somente no host e ficam desligados fora de uso. Android usa android_control. Studio usa os scripts start*.sh do projeto, sasocq-lab import-local e sasocq-lab roblox. Novos runtimes exigem preparação auditável do Sistema.
+- Laboratórios/builds têm limites agregados de 6 GiB, swap zero, 8 CPUs lógicas equivalentes e 512 tarefas, sem autostart. Compartilham o hardware e kernel com a hospedagem: não prometer ausência absoluta de concorrência ou de vulnerabilidades.
+- Restaurar esta política a partir do pacote de instalação atual antes de liberar desenvolvimento, inclusive depois de importar backups antigos. Preferências legadas que autorizem desenvolver na VM não prevalecem sobre este bloco.
+- Preservar dados, backups, imagens operacionais, serviços publicados, painel remoto e conversas. A política não autoriza apagar conteúdo legado, matar sessões nem remover dependências de produção indiscriminadamente.

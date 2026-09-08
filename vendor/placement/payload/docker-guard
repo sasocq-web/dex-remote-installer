@@ -1,0 +1,25 @@
+#!/usr/bin/python3
+"""Production VM policy guard; administration remains available via Docker CLI."""
+import os,sys
+args=sys.argv[1:]
+def main_index(argv):
+ i=0
+ while i<len(argv) and argv[i].startswith('-'):
+  v=argv[i];i+=1
+  if v in ['--config','--context','-c','--host','-H','--log-level','-l','--tlscacert','--tlscert','--tlskey']:i+=1
+ return i
+i=main_index(args);verb=args[i] if i<len(args) else ''
+rest=args[i+1:];deny=False
+if verb=='build':deny=True
+if verb in ['image','builder','buildx'] and any(x in ['build','bake'] for x in rest):deny=True
+if verb=='compose':
+ if 'build' in rest or 'bake' in rest or any(x=='--build' or x.startswith('--build=') for x in rest):deny=True
+ # The deployed compose files remain useful for restarts and prepared images.
+ # Explicit no-build also prevents automatic image construction on compose up.
+ for command in ['up','create']:
+  if command in rest and '--no-build' not in rest:
+   j=i+1+rest.index(command);args.insert(j+1,'--no-build');break
+if deny:
+ print('VM SASOCQ exclusiva para publicação. Construa/teste no host com sasocq-build; entregue a imagem pronta com docker load. Consulte /etc/sasocq-publication-only.md.',file=sys.stderr)
+ sys.exit(64)
+os.execv('/usr/bin/docker',['/usr/bin/docker',*args])

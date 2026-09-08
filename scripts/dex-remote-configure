@@ -97,13 +97,13 @@ write_file() {
   mv -f "$temporary" "$destination"
 }
 
-ensure_user "$PROJECT_USER"
 if [[ "$MODE" != "projects" ]]; then
   ensure_user "$CONTROLLER_USER"
 fi
+ensure_user "$PROJECT_USER"
 
 SUDOERS="$(root_path /etc/sudoers.d/dex-remote-system)"
-if [[ "$MODE" != "projects" ]]; then
+if [[ "$MODE" == "full" ]]; then
   if [[ -z "$STATE_ROOT" ]]; then
     usermod --append --groups sudo "$CONTROLLER_USER"
   fi
@@ -119,6 +119,14 @@ else
   if [[ -z "$STATE_ROOT" ]] && id -nG "$CONTROLLER_USER" | tr ' ' '\n' | grep -qx sudo; then
     echo "Aviso: $CONTROLLER_USER já pertencia ao grupo sudo; o instalador não remove privilégios preexistentes." >&2
   fi
+fi
+
+if [[ "$MODE" == "sasocq" ]]; then
+  write_file "$(root_path /etc/sudoers.d/dex-remote-project)" 0440 <<'EOF'
+Defaults!/usr/lib/dex-remote/run-project-app-server env_keep += "CLC_PROJECT_ID CLC_PROJECT_PATH CLC_PROJECT_UNIT"
+codex ALL=(codex-worker) NOPASSWD: /usr/lib/dex-remote/run-project-app-server ""
+EOF
+  [[ -n "$STATE_ROOT" ]] || visudo -cf /etc/sudoers.d/dex-remote-project >/dev/null
 fi
 
 CONTROLLER_HOME="$(user_home "$CONTROLLER_USER")"
@@ -205,7 +213,7 @@ write_file "$CONFIG_FILE" 0600 <<EOF
 }
 EOF
 
-write_file "$PROJECT_ROOT/AGENTS.md" 0644 <<'EOF'
+[[ -f "$PROJECT_ROOT/AGENTS.md" ]] || write_file "$PROJECT_ROOT/AGENTS.md" 0644 <<'EOF'
 # Preferências locais do Codex de Projetos
 
 - Trabalhe somente nas pastas de projetos autorizadas.
@@ -215,10 +223,10 @@ write_file "$PROJECT_ROOT/AGENTS.md" 0644 <<'EOF'
 EOF
 
 if [[ "$MODE" != "projects" ]]; then
-  write_file "$SYSTEM_ROOT/AGENTS.md" 0644 <<'EOF'
+  [[ -f "$SYSTEM_ROOT/AGENTS.md" ]] || write_file "$SYSTEM_ROOT/AGENTS.md" 0644 <<'EOF'
 # Preferências locais do Codex do Sistema
 
-- Esta identidade possui sudo integral sem senha por escolha feita na instalação.
+- Respeite as permissões escolhidas na instalação: SASOCQ usa broker auditável; somente o perfil portátil full concede sudo integral.
 - Leia estado e logs antes de alterar serviços; preserve dados e backups.
 - Peça confirmação antes de apagar dados, formatar discos, reiniciar ou desligar.
 - Valide o fluxo real depois de cada mudança.
@@ -230,6 +238,13 @@ if [[ -z "$STATE_ROOT" ]]; then
   chown "$CONTROLLER_USER:$CONTROLLER_USER" "$CONFIG_FILE"
   chown -R "$PROJECT_USER:$PROJECT_USER" "$PROJECT_ROOT"
   [[ "$MODE" == "projects" ]] || chown -R "$CONTROLLER_USER:$CONTROLLER_USER" "$SYSTEM_ROOT"
+fi
+
+# Apply mandatory placement AFTER restoring/generating local instructions.
+# Missing or corrupt policy must fail the SASOCQ installation, never fall back.
+if [[ "$MODE" == "sasocq" ]]; then
+  placement_root="${PACKAGE_ROOT}/opt/dex-remote/placement"
+  python3 "$placement_root/placement_policy.py" host --root "${STATE_ROOT:-/}" --bundle "$placement_root/payload"
 fi
 
 install_codex_for() {
@@ -312,7 +327,7 @@ fi
 
 echo "Dex Remoto configurado no perfil $MODE com Codex CLI $CODEX_CLI_VERSION."
 echo "Abra http://127.0.0.1:8787 neste computador para autenticar as contas OpenAI."
-if [[ "$MODE" != "projects" ]]; then
+if [[ "$MODE" == "full" ]]; then
   echo "Atenção: o usuário $CONTROLLER_USER possui sudo integral sem senha."
 fi
 echo "Para acesso privado remoto: sudo dex-remote-setup --mode $MODE --skip-codex --enable-tailscale"

@@ -20,6 +20,26 @@ DOMAIN_RE = re.compile(
 POLICY_MODES = {"auto", "ask", "block"}
 FREQUENT_ACCESS_THRESHOLD = 3
 BROWSER_SERVERS = {"browser", "chrome", "playwright", "web"}
+CODE_LIKE_RE = re.compile(
+    r"(?:\b(?:await|function|return|const|let|var|async)\b|[{}();]|(?:page|browser|context|locator)\.)",
+    re.IGNORECASE,
+)
+FALSE_DOMAIN_TAIL_RE = re.compile(
+    r"^(?:getby.+|queryselector(?:all)?|locator|waitfor.+|(?:get|set|remove)item|"
+    r"stringify|contentdocument|clientwidth|scrollwidth|viewportsize|addinit.+|"
+    r"setdefaulttimeout|setextrahttpheaders|unroute(?:all)?|png|jpe?g|webp|svg|json|css|js)$",
+    re.IGNORECASE,
+)
+CODE_DOMAIN_ROOTS = {"page", "document", "window", "localstorage", "json"}
+
+
+def false_code_domain(value: Any) -> bool:
+    labels = str(value or "").casefold().split(".")
+    if len(labels) < 2:
+        return False
+    if FALSE_DOMAIN_TAIL_RE.fullmatch(labels[-1]):
+        return True
+    return labels[0] in CODE_DOMAIN_ROOTS and labels[-1] not in {"com", "org", "net", "gov", "edu", "io", "dev", "app"}
 
 
 def normalize_domain(value: Any) -> str:
@@ -40,13 +60,17 @@ def normalize_domain(value: Any) -> str:
         return ""
     if not all(re.fullmatch(r"[a-z0-9-]+", label) for label in labels):
         return ""
+    if false_code_domain(hostname):
+        return ""
     return hostname
 
 
 def domains_from_text(value: Any, *, allow_plain: bool = False) -> set[str]:
     text = str(value or "")
     candidates = [match.group(0).rstrip(".,);]}>") for match in URL_RE.finditer(text)]
-    if allow_plain:
+    # JavaScript member access such as ``page.getByRole`` is not a domain.
+    # URLs inside code remain discoverable through URL_RE above.
+    if allow_plain and not CODE_LIKE_RE.search(text):
         candidates.extend(match.group(0) for match in DOMAIN_RE.finditer(text))
     return {domain for candidate in candidates if (domain := normalize_domain(candidate))}
 
@@ -188,6 +212,36 @@ class SiteAccessStore:
         self.path = path
         self._lock = threading.RLock()
         self._data = self._load()
+
+    def discard_legacy_false_domains(self) -> int:
+        """Remove historical JavaScript member names that were stored as sites."""
+        with self._lock:
+            removed = self._discard_legacy_false_domains()
+            if removed:
+                self._save()
+            return removed
+
+    def _discard_legacy_false_domains(self) -> int:
+        invalid = {
+            str(domain)
+            for group in (self._data.get("sites") or {}, self._data.get("policies") or {})
+            for domain in group
+            if false_code_domain(domain)
+        }
+        if not invalid:
+            return 0
+        for group_name in ("sites", "policies"):
+            group = self._data.get(group_name)
+            if isinstance(group, dict):
+                for domain in invalid:
+                    group.pop(domain, None)
+        seen = self._data.get("seen")
+        if isinstance(seen, list):
+            self._data["seen"] = [
+                value for value in seen
+                if not any(str(value).endswith(f":{domain}") for domain in invalid)
+            ]
+        return len(invalid)
 
     def _empty(self) -> dict[str, Any]:
         return {"version": self.VERSION, "sites": {}, "policies": {}, "seen": []}

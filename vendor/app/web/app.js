@@ -630,7 +630,75 @@ function creditsSummaryHTML(credits) {
   return '<span class="quota-muted">Disponível, sem saldo numérico informado.</span>';
 }
 
-function codexUsageHTML(accountData, limitsData) {
+function quotaResetStorageKey(account) {
+  return account?.email ? `sasocq-quota-reset:${encodeURIComponent(account.email)}` : null;
+}
+
+function quotaResetControlHTML(accountData, count, workspace) {
+  const storageKey = quotaResetStorageKey(accountData?.account);
+  let pending = false;
+  try { pending = Boolean(storageKey && localStorage.getItem(storageKey)); } catch { /* Report storage failure before submitting. */ }
+  const readOnly = Boolean(state.session?.read_only_automation);
+  const disabled = state.quotaResetBusy || readOnly || !storageKey || (!pending && !(Number(count) > 0));
+  const label = state.quotaResetBusy ? "Redefinindo…" : pending ? "Retomar redefinição" : "Redefinir cota";
+  const help = readOnly ? "Disponível na sua sessão autenticada do Dex."
+    : pending ? "Há uma tentativa pendente. Retome para confirmar o resultado sem duplicar o consumo."
+    : Number(count) > 0 ? "Usa 1 redefinição disponível, após sua confirmação." : "Nenhuma redefinição disponível. Atualize para consultar.";
+  return `<button type="button" class="secondary-button quota-reset-button" data-quota-reset="${escapeHTML(workspace)}" ${disabled ? "disabled" : ""}>${label}</button><small>${help}</small>`;
+}
+
+async function resetCodexQuota(workspace = "system") {
+  if (state.quotaResetBusy || state.session?.read_only_automation) return;
+  const account = state.accounts[workspaceGroup(workspace)]?.account;
+  const storageKey = quotaResetStorageKey(account);
+  if (!storageKey) throw new Error("Atualize a conta do Codex antes de redefinir a cota.");
+  // Freeze both the account and the project routing before asynchronous work.
+  const query = workspaceQuery(workspace);
+  let key;
+  try { key = localStorage.getItem(storageKey); }
+  catch { throw new Error("Permita o armazenamento deste site para proteger a redefinição contra consumo duplicado."); }
+  const prompt = key
+    ? "Retomar a redefinição pendente? A mesma tentativa será consultada ou concluída, sem consumir uma segunda redefinição."
+    : "Redefinir a cota do Codex agora? Isso consome 1 redefinição disponível para restaurar as janelas elegíveis da sua conta, compartilhada entre Sistema e Projetos. O crédito utilizado não pode ser recuperado.";
+  if (!window.confirm(prompt)) return;
+  key ||= crypto.randomUUID();
+  // Persist before sending, including across reloads or a lost response.
+  try { localStorage.setItem(storageKey, key); }
+  catch { throw new Error("Não foi possível guardar a tentativa. Nenhuma redefinição foi enviada."); }
+  state.quotaResetBusy = true;
+  const render = () => {
+    renderHomeCodexUsage();
+    if (state.lastStatus && !state.setup.active) renderSettings(state.lastStatus);
+  };
+  render();
+  try {
+    const result = await api(`/api/account/rate-limits/reset?${query}`, {
+      method:"POST",
+      body:JSON.stringify({idempotency_key:key, confirmed:true, expected_account:account.email}),
+    });
+    const messages = {
+      reset:"Cota redefinida. Uma redefinição foi utilizada.",
+      alreadyRedeemed:"Esta tentativa já foi concluída. Nenhuma redefinição adicional foi utilizada.",
+      nothingToReset:"Não há uma janela de cota elegível para redefinir. Nenhum crédito foi utilizado.",
+      noCredit:"Não há redefinições disponíveis nesta conta.",
+    };
+    if (!messages[result.outcome]) throw new Error("O serviço retornou um resultado desconhecido.");
+    // Keep the key if removing it fails: replaying an acknowledged attempt is safe.
+    try { if (localStorage.getItem(storageKey) === key) localStorage.removeItem(storageKey); } catch { /* Keep for idempotent replay. */ }
+    const refreshed = await Promise.all([
+      loadRateLimits("system", {render:false}), loadRateLimits("projects", {render:false}),
+    ]);
+    const suffix = refreshed.some(value => !value) ? " Não foi possível atualizar todas as cotas; use Atualizar para consultar." : "";
+    toast(messages[result.outcome] + suffix, ["reset", "alreadyRedeemed"].includes(result.outcome) ? "success" : "warning");
+  } catch (error) {
+    toast(`Não foi possível confirmar a redefinição: ${error.message} Use Retomar redefinição para repetir a mesma tentativa com segurança.`, "error");
+  } finally {
+    state.quotaResetBusy = false;
+    render();
+  }
+}
+
+function codexUsageHTML(accountData, limitsData, workspace = "system") {
   if (!accountData?.account) return '<article class="maintenance-card quota-card"><h3>Plano e cotas</h3><p>Entre na conta do Codex para consultar o uso.</p></article>';
   if (!limitsData) return '<article class="maintenance-card quota-card"><h3>Plano e cotas</h3><p>Os detalhes de uso ainda não foram retornados para esta conta.</p><span class="value">Atualize o painel para tentar novamente.</span></article>';
   const bucketsObject = limitsData.rateLimitsByLimitId || {};
@@ -649,7 +717,7 @@ function codexUsageHTML(accountData, limitsData) {
   return `<article class="maintenance-card quota-card">
     <div class="quota-card-heading"><div><h3>Plano e cotas do Codex</h3><p>Plano ChatGPT ${escapeHTML(formatPlanName(plan))}</p></div><button class="secondary-button" data-settings-action="refresh-codex-usage">Atualizar</button></div>
     <div class="quota-grid">${windowRows || '<span class="quota-muted">Nenhuma janela de uso foi informada.</span>'}</div>
-    <div class="quota-extras"><div><span>Créditos adicionais</span>${creditsSummaryHTML(limitsData.credits ?? defaultBucket.credits)}</div><div><span>Redefinições de cota</span><strong>${resetCount == null ? "Não informado" : escapeHTML(resetCount)}</strong><small>${escapeHTML(resetExpiry.replace(/^ • /, ""))}</small></div></div>
+    <div class="quota-extras"><div><span>Créditos adicionais</span>${creditsSummaryHTML(limitsData.credits ?? defaultBucket.credits)}</div><div><span>Redefinições de cota</span><strong>${resetCount == null ? "Não informado" : escapeHTML(resetCount)}</strong><small>${escapeHTML(resetExpiry.replace(/^ • /, ""))}</small>${quotaResetControlHTML(accountData, resetCount, workspace)}</div></div>
     <p class="quota-footnote">As datas acima são de reposição das cotas. A data de cobrança ou renovação da assinatura não é fornecida pelo Codex App Server e deve ser consultada no gerenciamento do plano ChatGPT.</p>
   </article>`;
 }
@@ -658,11 +726,13 @@ function renderHomeCodexUsage() {
   if (!selectors.homeCodexUsage) return;
   const workspace = workspaceGroup(activeWorkspace());
   const fallback = workspace === "system" ? "projects" : "system";
-  const account = state.accounts[workspace] || state.accounts[fallback];
-  const limits = state.rateLimits[workspace] || state.rateLimits[fallback];
+  const source = state.accounts[workspace]?.account && state.rateLimits[workspace] ? workspace : fallback;
+  const account = state.accounts[source];
+  const limits = state.rateLimits[source];
   selectors.homeCodexUsage.innerHTML = codexUsageHTML(
     account,
     limits,
+    source,
   );
   if (selectors.codexUsageSummary) {
     const weekly = weeklyQuotaWindow(limits);
@@ -3547,6 +3617,7 @@ function isBrowserToolItem(item) {
 }
 
 function isAndroidToolItem(item) {
+  if (item?.type === "dynamicToolCall" && item.tool === "android_control") return true;
   if (item?.type === "mcpToolCall") {
     const server = String(item.server || "").toLowerCase();
     const tool = String(item.tool || "").toLowerCase();
@@ -4256,12 +4327,14 @@ function armBrowserSessionPreviews() {
 function androidActivityGroupCard(item) {
   const activities = item.items || [];
   const active = activities.some(activity => (activity.status || "inProgress") === "inProgress");
-  const failed = activities.some(activity => activity.status === "failed");
+  const failed = activities.some(activity => activity.status === "failed" || activity.success === false);
   const status = active ? "inProgress" : failed ? "failed" : "completed";
-  const statusLabel = active ? "Automatizando agora" : failed ? "O aplicativo precisa de atenção" : "Android pronto";
+  const statusLabel = active ? "Automatizando agora" : failed ? "O aplicativo precisa de atenção" : "Operação concluída";
   const latestTool = String(activities[0]?.tool || commandText(activities[0]?.command) || "");
   const detail = /install|play/i.test(latestTool) ? "Aplicativo preparado" : /ui|source|snapshot/i.test(latestTool) ? "Interface estruturada lida" : "Sessão Android";
-  const details = activities.map(activity => activity.type === "mcpToolCall"
+  const details = activities.map(activity => activity.type === "dynamicToolCall"
+    ? `${activity.tool || ""}: ${activity.arguments?.operation || ""}`
+    : activity.type === "mcpToolCall"
     ? `${activity.server || "MCP"}/${activity.tool || ""}`
     : commandText(activity.command)).join("\n");
   return `<article class="message-card tool browser-session-card android-session-card" data-item-id="${escapeHTML(item.id || "")}" data-browser-status="${status}">
@@ -5792,6 +5865,10 @@ async function respondApproval(key, action, options = {}) {
     payload.result = {answers};
   }
   else payload.decision = action;
+  const approvalRuleKey = conversationApprovalRuleKey(approval);
+  const rememberConversation = ["grant-all", "acceptForSession", "accept-all-elicitation"].includes(action)
+    || Boolean(options.automatic && approvalRuleKey && state.conversationApprovalRules.has(approvalRuleKey));
+  if (rememberConversation) payload.remember_conversation = true;
   let serializedPayload = "";
   if (isCredentialElicitation(approval)) {
     serializedPayload = JSON.stringify(payload);
@@ -5799,9 +5876,9 @@ async function respondApproval(key, action, options = {}) {
     if (payload.result?.content) payload.result.content = {};
   }
   try {
-    if (["grant-all", "acceptForSession", "accept-all-elicitation"].includes(action)) rememberConversationApprovalRule(approval);
     const endpoint = ["browser/credentials/request", "browser/payment-card/request"].includes(approval.method) ? "/api/browser-credentials/respond" : "/api/approvals/respond";
     await api(endpoint, {method:"POST", body:serializedPayload || JSON.stringify(payload)});
+    if (rememberConversation) rememberConversationApprovalRule(approval);
     approval.resolved = true;
     const requestThreadId = String(approval.params?.threadId || "");
     syncThreadWaitingStatus(requestThreadId);
@@ -6057,7 +6134,7 @@ function renderSettings(data) {
     {level:12, name:"Controle por coordenadas", risk:"Muito alto", summary:"Libera cliques físicos em posições da tela, com menor contexto semântico.", automatic:"browser_mouse_click_xy, browser_mouse_down e browser_mouse_up.", still_prompts:"Arraste por elemento/coordenadas, dados externos e arquivos."},
     {level:13, name:"Arraste avançado", risk:"Muito alto", summary:"Permite mover elementos e executar gestos de arraste na página.", automatic:"browser_drag e browser_mouse_drag_xy.", still_prompts:"Dados arrastados de fora da página e uploads de arquivos."},
     {level:14, name:"Dados externos", risk:"Crítico", summary:"Permite soltar dados ou caminhos externos sobre a página.", automatic:"browser_drop.", still_prompts:"Seleção e upload explícito de arquivos locais."},
-    {level:15, name:"Autonomia máxima", risk:"Crítico", summary:"Libera todas as ferramentas normais do navegador, inclusive arquivos locais.", automatic:"browser_file_upload, além de tudo dos níveis anteriores.", still_prompts:"browser_run_code_unsafe e confirmações críticas externas protegidas por política."},
+    {level:15, name:"Autonomia máxima", risk:"Crítico", summary:"Libera todas as ferramentas do navegador, inclusive código avançado e arquivos locais.", automatic:"browser_file_upload e browser_run_code_unsafe, além de tudo dos níveis anteriores.", still_prompts:"Confirmações críticas externas protegidas por política."},
   ];
   const approvalLevels = Array.isArray(approvalAutonomy.levels) && approvalAutonomy.levels.length >= 10 ? approvalAutonomy.levels : fallbackApprovalLevels;
   const approvalMax = approvalLevelMaximum(approvalLevels);
@@ -6210,7 +6287,7 @@ function renderSettings(data) {
         <article class="maintenance-card"><h3>Codex / Upstream</h3><p>${upstream.last_checked_at ? `Verificado em ${escapeHTML(formatTime(upstream.last_checked_at))}` : "Primeira verificação ainda não executada"}</p><span class="value">${escapeHTML(upstreamCurrent.codex_version || codex.version || "Codex detectado")} • schema ${upstreamSchema.ok ? escapeHTML(String(upstreamSchema.hash || "").slice(0, 12)) : "pendente"} • ${upstreamChangeCount} mudança(s)</span><div class="card-actions"><button class="primary-button" data-settings-action="check-codex-upstream">Verificar agora</button><a class="secondary-button" href="https://learn.chatgpt.com/docs/changelog" target="_blank" rel="noopener">Changelog oficial</a></div></article>
         <article class="maintenance-card"><h3>Capacidades descobertas</h3><p>${upstreamCapabilityCount} item(ns) em modelos, recursos experimentais, permissões, modos, skills e hooks.</p><span class="value">${upstreamSchema.methods?.length || 0} método(s) no protocolo • promoção automática desativada</span></article>
         <article class="maintenance-card"><h3>ChatGPT Desktop oficial</h3><p>${upstreamDesktop.installed ? `Instalado • ${escapeHTML(upstreamDesktop.version || "versão detectada")}` : "Não instalado neste mini PC"}</p><span class="value">Interface oficial usa os mesmos projetos e arquivos; recursos internos sem API continuam exclusivos do Desktop.</span><div class="card-actions"><button class="secondary-button" data-settings-action="open-chatgpt-desktop" ${!remoteDesktop.available ? "disabled" : ""}>Abrir sessão gráfica</button></div></article>
-        ${codexUsageHTML(systemAccount || projectsAccount, state.rateLimits.system || state.rateLimits.projects)}
+        ${systemAccount?.account ? codexUsageHTML(systemAccount, state.rateLimits.system, "system") : codexUsageHTML(projectsAccount, state.rateLimits.projects, "projects")}
       </div>
     </section>
 
@@ -6258,7 +6335,7 @@ function renderSettings(data) {
           <div class="approval-level-buttons" role="list" aria-label="Selecionar nível de autonomia">${approvalLevelButtons}</div>
           <div id="approval-autonomy-summary" class="approval-level-summary">${approvalLevelSummaryMarkup(approvalLevel, selectedApprovalLevel)}</div>
           <details class="approval-level-details"><summary>Comparar os ${approvalMax} níveis</summary><ol>${approvalLevelRows}</ol></details>
-          <div class="inline-notice approval-protection-note"><strong>Proteções que não mudam com o nível</strong><span><code>browser_run_code_unsafe</code>, operações destrutivas ou privilegiadas do host e confirmações fortes do Control Plane continuam exigindo avaliação explícita.</span><span>Compras, pagamentos, mensagens, publicações, permissões, login/MFA e ações irreversíveis também continuam exigindo confirmação específica.</span></div>
+          <div class="inline-notice approval-protection-note"><strong>Proteções que não mudam com o nível</strong><span>Operações destrutivas ou privilegiadas do host e confirmações fortes do Control Plane continuam exigindo avaliação explícita.</span><span>Compras, pagamentos, mensagens, publicações, permissões, login/MFA e ações irreversíveis também continuam exigindo confirmação específica.</span></div>
         </article>
         <article class="maintenance-card"><h3>${cloudflareIdentity ? "Cloudflare Access ativo" : tailscale.installed ? "Tailscale instalado" : "Rede privada não configurada"}</h3><p>${cloudflareIdentity ? "Identidade Cloudflare verificada" : escapeHTML(tailscale.version || "Acesso somente local")}</p><span class="value">${cloudflareIdentity ? escapeHTML(state.identity) : tailscale.connected ? `Conectado: ${escapeHTML(tailscale.login || tailscale.dns_name || "sim")}` : "Desconectado"}</span>${local ? `<div class="card-actions">${!tailscale.installed ? '<button class="secondary-button" data-settings-action="install-tailscale">Instalar Tailscale opcional</button>' : ""}${tailscale.installed && !tailscale.connected ? '<button class="secondary-button" data-settings-action="connect-tailscale">Conectar Tailscale</button>' : ""}</div>` : ""}</article>
         <article class="maintenance-card"><h3>${security.remote_enabled ? "HTTPS privado ativo" : "Acesso remoto desativado"}</h3><p>${escapeHTML(security.external_url || "Somente localhost")}</p><span class="value">${escapeHTML(security.allowed_tailscale_login || "Nenhuma identidade externa liberada")}</span>${local ? `<div class="card-actions">${tailscale.connected && !security.remote_enabled ? '<button class="primary-button" data-settings-action="enable-remote">Ativar</button>' : ""}${security.remote_enabled ? '<button class="danger-button" data-settings-action="disable-remote">Desativar</button>' : ""}</div>` : ""}</article>
@@ -7523,7 +7600,7 @@ async function openRemoteDesktop(options = {}) {
     const payload = {
       ...remoteDeviceInfo(),
       target:remoteTarget,
-      thread_id:liveBrowser ? String(options.threadId || state.activeThreadId || "") : "",
+      thread_id:(liveBrowser || liveAndroid) ? String(options.threadId || state.activeThreadId || "") : "",
     };
     const status = await api("/api/remote-desktop/start", {method:"POST", body:JSON.stringify(payload)});
     const viewerUrl = String(
@@ -8975,6 +9052,11 @@ function bindEvents() {
     if (path) loadBackupFolders(path).catch(error => toast(error.message, "error"));
   });
   selectors.composerTools.addEventListener("click", openToolsDialog);
+  document.addEventListener("click", event => {
+    const button = event.target.closest("[data-quota-reset]");
+    if (!button || button.disabled) return;
+    resetCodexQuota(button.dataset.quotaReset).catch(error => toast(error.message, "error"));
+  });
   selectors.homeCodexUsage?.addEventListener("click", event => {
     if (!event.target.closest('[data-settings-action="refresh-codex-usage"]')) return;
     loadRateLimits(activeWorkspace(), {announce:true}).catch(error => toast(error.message, "error"));

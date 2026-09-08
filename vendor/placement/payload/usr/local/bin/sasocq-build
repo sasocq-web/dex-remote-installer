@@ -1,0 +1,37 @@
+#!/usr/bin/python3
+import argparse,json,os,pathlib,pwd,re,subprocess,sys,time
+ROOT=pathlib.Path('/srv/sasocq/development')
+def name(s):
+ if not re.fullmatch('[a-z][a-z0-9-]{0,39}',s):raise argparse.ArgumentTypeError('Nome inválido')
+ return s
+if os.getuid()!=pwd.getpwnam('codex-worker').pw_uid:sys.exit('Execute como codex-worker; Sistema usa runuser pelo broker.')
+os.environ['XDG_RUNTIME_DIR']='/run/user/1001';os.environ['DBUS_SESSION_BUS_ADDRESS']='unix:path=/run/user/1001/bus'
+p=argparse.ArgumentParser(description='Build e execução de teste em containers sem root do host. Nunca usa a VM.')
+sub=p.add_subparsers(dest='op',required=True)
+b=sub.add_parser('build');b.add_argument('name',type=name);b.add_argument('--context',type=pathlib.Path,required=True);b.add_argument('--file',default='Dockerfile');b.add_argument('--tag',required=True);b.add_argument('--target');b.add_argument('--minutes',type=int,choices=range(1,121),default=30)
+r=sub.add_parser('run');r.add_argument('name',type=name);r.add_argument('--image',required=True);r.add_argument('--minutes',type=int,choices=range(1,121),default=30)
+for op in ['status','stop']:sub.add_parser(op).add_argument('name',type=name)
+args=sys.argv[1:];extra=[]
+if '--' in args:
+ cut=args.index('--');extra=args[cut+1:];args=args[:cut]
+a=p.parse_args(args);job=ROOT/'jobs'/a.name;unit='sasocq-build-'+a.name+'.service'
+if a.op=='status':
+ f=job/'status.json';print(f.read_text() if f.exists() else '{}');subprocess.run(['systemctl','--user','show',unit,'-p','ActiveState,Result,MemoryCurrent,TasksCurrent,ControlGroup']);sys.exit(0)
+if a.op=='stop':sys.exit(subprocess.run(['systemctl','--user','stop',unit]).returncode)
+if subprocess.run(['systemctl','--user','is-active','--quiet',unit]).returncode==0:sys.exit('Tarefa já ativa')
+data=vars(a).copy()
+if a.op=='build':
+ ctx=a.context.resolve(strict=True)
+ if not ctx.is_dir() or not any(ctx.is_relative_to(pathlib.Path(x)) for x in ['/srv/sasocq/projects','/srv/sasocq/development','/srv/sasocq/lab']):sys.exit('Contexto deve estar em uma área de projetos/desenvolvimento')
+ file=pathlib.Path(a.file)
+ if file.is_absolute() or '..' in file.parts or not (ctx/file).is_file():sys.exit('Dockerfile inválido')
+ data['context']=str(ctx)
+else:
+ data['argv']=extra
+ if not data['argv']:data['argv']=[]
+if job.is_symlink():sys.exit('Pasta da tarefa inválida')
+job.mkdir(mode=0o700,parents=True,exist_ok=True)
+(job/'request.json').write_text(json.dumps(data))
+cmd=['systemd-run','--user','--collect','--service-type=exec','--unit='+unit,'--slice=codex-workers-lab.slice','-p','Delegate=yes','-p','DelegateSubgroup=supervisor','-p','MemoryMax=6G','-p','MemorySwapMax=0','-p','TasksMax=512','-p','CPUQuota=800%','-p','KillMode=control-group','-p','TimeoutStopSec=15','-p','RuntimeMaxSec='+str(a.minutes*60),'-p','UMask=0077','/usr/local/lib/sasocq-lab/build-runner.py',a.name]
+subprocess.run(cmd,check=True)
+print(json.dumps({'started':True,'name':a.name,'status_command':'sasocq-build status '+a.name,'log':str(job/'build.log'),'vm_used':False},ensure_ascii=False))

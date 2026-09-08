@@ -1,0 +1,7 @@
+#!/usr/bin/python3
+import json,os,pathlib,sys,urllib.parse
+url=sys.argv[-1]
+parsed=urllib.parse.urlparse(url)
+if parsed.scheme!='https' or not (parsed.hostname=='roblox.com' or (parsed.hostname or '').endswith('.roblox.com')):sys.exit('Somente login oficial Roblox é permitido')
+os.umask(0o077)
+path=pathlib.Path('/control/browser-request.json');path.write_text(json.dumps({'url':url}));path.chmod(0o600)

@@ -30,6 +30,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .automations import AUTOMATION_TOOL_SPEC, AutomationManager, migrate_thread_dynamic_tools
+from .android_lifecycle import ANDROID_TOOL_SPEC, AndroidLifecycle, migrate_android_tools
 from .codex_bridge import CodexBridge, CodexRPCError
 from .conversation_search import (
     broken_generated_title,
@@ -42,6 +43,7 @@ from .conversation_search import (
 )
 from .cloud_sync import CloudSyncManager
 from .config import Settings, get_settings, load_settings, persist_settings
+from .conversation_approvals import ConversationApprovalRules
 from .control_plane import ControlPlaneError, request as control_request, status as control_plane_status
 from .events import EventHub
 from .entra_auth import EntraAuthManager
@@ -142,16 +144,33 @@ backup_settings = replace(
 backup_cloud = CloudSyncManager(backup_settings)
 tool_profiles = ToolProfileStore(settings.resolved_tool_profiles_file)
 automations = AutomationManager(settings.resolved_config_dir / "automations.sqlite3")
+android_lifecycle = AndroidLifecycle(settings.resolved_config_dir / "android-owned.marker")
+android_worker_task = None
+conversation_approvals = ConversationApprovalRules(
+    settings.resolved_config_dir / "conversation-approval-rules.sqlite3"
+)
+
+
+async def _handle_codex_server_request(workspace: str, message: dict[str, Any]) -> dict[str, Any] | None:
+    result = await android_lifecycle.handle_server_request(workspace, message)
+    if result is not None:
+        return result
+    result = await automations.handle_server_request(workspace, message)
+    if result is not None:
+        return result
+    return await conversation_approvals.handle_server_request(workspace, message)
+
+
 system_bridge = CodexBridge(
     settings,
     events,
     label="system",
-    server_request_handler=automations.handle_server_request,
+    server_request_handler=_handle_codex_server_request,
 )
 project_bridges = ProjectBridgePool(
     settings,
     events,
-    server_request_handler=automations.handle_server_request,
+    server_request_handler=_handle_codex_server_request,
 )
 # Compatibility alias for the permanent system/control workspace.
 bridge = system_bridge
@@ -161,6 +180,7 @@ entra_auth = EntraAuthManager(settings, sessions)
 remote_desktop = RemoteDesktopManager(settings)
 operations = OperationsStore(settings.resolved_config_dir / "operations.json")
 site_access = SiteAccessStore(settings.resolved_config_dir / "site-access.json")
+conversation_approvals.site_policy = site_access.policy
 upstream_registry = UpstreamRegistry(settings)
 queue_worker_task: asyncio.Task | None = None
 push_worker_task: asyncio.Task | None = None
@@ -377,6 +397,12 @@ class PluginInstallRequest(BaseModel):
     remote_marketplace_name: Optional[str] = Field(default=None, max_length=300)
 
 
+class QuotaResetRequest(BaseModel):
+    idempotency_key: uuid.UUID
+    confirmed: bool = Field(strict=True)
+    expected_account: str = Field(min_length=1, max_length=320)
+
+
 class QueueReorder(BaseModel):
     item_ids: list[str] = Field(default_factory=list, max_length=500)
 
@@ -412,6 +438,7 @@ class ApprovalResponse(BaseModel):
     workspace: str = Field(default="system", max_length=MAX_WORKSPACE_SELECTOR_LENGTH)
     decision: Optional[Any] = None
     result: Optional[Dict[str, Any]] = None
+    remember_conversation: bool = False
 
 
 class BrowserCredentialBridgeRequest(BaseModel):
@@ -1399,9 +1426,9 @@ APPROVAL_AUTONOMY_LEVELS: tuple[Dict[str, Any], ...] = (
         "level": 15,
         "name": "Autonomia máxima",
         "risk": "Crítico",
-        "summary": "Libera todas as ferramentas normais do navegador, inclusive arquivos locais.",
-        "automatic": "browser_file_upload, além de tudo dos níveis anteriores.",
-        "still_prompts": "browser_run_code_unsafe e confirmações críticas externas protegidas por política.",
+        "summary": "Libera todas as ferramentas do navegador, inclusive código avançado e arquivos locais.",
+        "automatic": "browser_file_upload e browser_run_code_unsafe, além de tudo dos níveis anteriores.",
+        "still_prompts": "Confirmações críticas externas protegidas por política.",
     },
 )
 
@@ -1476,9 +1503,12 @@ PLAYWRIGHT_TOOL_MIN_LEVEL: Dict[str, int] = {
     # Dropped data and uploads can disclose local content.
     "browser_drop": 14,
     "browser_file_upload": 15,
+    # Arbitrary Playwright code is RCE-equivalent, so only the explicit
+    # maximum-autonomy level may run it without a redundant MCP prompt.
+    "browser_run_code_unsafe": 15,
 }
 
-PLAYWRIGHT_ALWAYS_PROMPT = ("browser_run_code_unsafe",)
+PLAYWRIGHT_ALWAYS_PROMPT: tuple[str, ...] = ()
 
 # Settings can be changed from more than one open Dex tab.  Keep persistence
 # and live bridge updates ordered so an older request cannot finish after and
@@ -1500,7 +1530,6 @@ def _approval_autonomy_payload(value: Any = None) -> Dict[str, Any]:
         "levels": [dict(item) for item in APPROVAL_AUTONOMY_LEVELS],
         "scope": "playwright",
         "always_requires_approval": [
-            "Código arbitrário no processo do servidor Playwright",
             "Operações destrutivas ou privilegiadas do host",
             "Confirmações fortes exigidas pelo Control Plane",
             "Compras, pagamentos, mensagens, publicações, permissões e ações irreversíveis",
@@ -2456,7 +2485,7 @@ async def _thread_start_canary() -> str:
             "approvalPolicy": _thread_approval_policy(project),
             "sandbox": "danger-full-access",
             "serviceName": "codex_linux_control_system_canary",
-            "dynamicTools": [AUTOMATION_TOOL_SPEC],
+            "dynamicTools": [AUTOMATION_TOOL_SPEC, ANDROID_TOOL_SPEC],
         },
         target=system_bridge,
     )
@@ -2469,12 +2498,20 @@ async def _thread_start_canary() -> str:
 
 @app.on_event("startup")
 async def startup_event() -> None:
+    global android_worker_task
     global queue_worker_task, push_worker_task, upstream_worker_task, playwright_conversation_task, site_access_worker_task, automation_worker_task
     global _startup_canary_error, _startup_canary_checked_at
     projects.ensure_default()
     if not settings.projects_only:
         _system_project()
+        removed_false_sites = site_access.discard_legacy_false_domains()
+        if removed_false_sites:
+            LOGGER.info("Removidos %s falsos domínios legados derivados de código", removed_false_sites)
         await _start_browser_credential_server()
+        try:
+            await asyncio.to_thread(migrate_android_tools, _system_codex_state_database())
+        except Exception:
+            LOGGER.exception("Não foi possível vincular Android às conversas existentes")
         try:
             migrated = await asyncio.to_thread(
                 migrate_thread_dynamic_tools, _system_codex_state_database()
@@ -2518,6 +2555,9 @@ async def startup_event() -> None:
         except Exception as exc:
             LOGGER.warning("Codex de Projetos iniciou degradado: %s", exc)
     queue_worker_task = asyncio.create_task(_queue_event_worker(), name="clc-persistent-command-queue")
+    android_worker_task = asyncio.create_task(
+        android_lifecycle.worker(events, lambda: set(_active_turns)), name="clc-android-lifecycle"
+    )
     push_worker_task = asyncio.create_task(_push_event_worker(), name="clc-web-push")
     upstream_worker_task = asyncio.create_task(_upstream_event_worker(), name="clc-codex-upstream-watcher")
     playwright_conversation_task = asyncio.create_task(
@@ -2533,6 +2573,16 @@ async def startup_event() -> None:
 
 @app.on_event("shutdown")
 async def shutdown_event() -> None:
+    global android_worker_task
+    if android_worker_task:
+        android_worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await android_worker_task
+        android_worker_task = None
+    try:
+        await android_lifecycle.recover()
+    except Exception:
+        LOGGER.exception("Encerramento Android pendente; marcador preservado para recuperação")
     global queue_worker_task, push_worker_task, upstream_worker_task, playwright_conversation_task, site_access_worker_task, site_access_refresh_task, automation_worker_task
     if automation_worker_task:
         automation_worker_task.cancel()
@@ -4819,6 +4869,34 @@ async def account_rate_limits(request: Request, workspace: str = "system", proje
     return await _rpc("account/rateLimits/read", target=_bridge_for_workspace(workspace, project_id))
 
 
+@app.post("/api/account/rate-limits/reset")
+async def account_rate_limits_reset(
+    request: Request, payload: QuotaResetRequest,
+    workspace: str = "system", project_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    session = _session(request, mutate=True)
+    if not payload.confirmed:
+        raise HTTPException(status_code=400, detail="Confirme o consumo de uma redefinição de cota.")
+    target = _bridge_for_workspace(workspace, project_id)
+    account = (await _rpc("account/read", {"refreshToken": False}, target=target)).get("account") or {}
+    if account.get("email") != payload.expected_account:
+        raise HTTPException(status_code=409, detail="A conta do Codex mudou. Atualize o painel antes de redefinir a cota.")
+    # The upstream idempotency key survives HTTP retries and app-server restarts.
+    # Do not preempt retries based on the current balance: a redeemed request
+    # must still reach the provider to return alreadyRedeemed.
+    result = await _rpc(
+        "account/rateLimitResetCredit/consume",
+        {"idempotencyKey": str(payload.idempotency_key)}, target=target,
+    )
+    if not isinstance(result, dict) or result.get("outcome") not in {
+        "reset", "alreadyRedeemed", "nothingToReset", "noCredit",
+    }:
+        raise HTTPException(status_code=502, detail="Resposta de redefinição não reconhecida. Consulte a mesma tentativa novamente.")
+    LOGGER.info("Redefinição manual de cota: operator=%s workspace=%s attempt=%s outcome=%s",
+                session.identity, target.label, payload.idempotency_key, result["outcome"])
+    return {"outcome": result["outcome"]}
+
+
 # ---------------------------------------------------------------------------
 # Skills, apps/connectors, MCP servers and per-conversation associations
 # ---------------------------------------------------------------------------
@@ -5413,10 +5491,17 @@ async def remote_desktop_start_api(request: Request, payload: RemoteDesktopReque
     if not settings.remote_desktop_enabled:
         raise HTTPException(status_code=403, detail="Área de trabalho remota desativada")
     if payload.target == "android":
-        result = _android_remote_status()
-        if not result["available"]:
-            raise HTTPException(status_code=503, detail=result["reason"])
-        return result
+        if not payload.thread_id:
+            raise HTTPException(status_code=400, detail="Selecione uma conversa para abrir o Android")
+        key = (_playwright_workspace_for_thread(payload.thread_id), payload.thread_id)
+        try:
+            lease = await android_lifecycle.execute(
+                *key, {"operation": "start"}, turn_active=key in _active_turns,
+                turn_id=str(_active_turns.get(key, {}).get("turn_id") or ""),
+            )
+        except (RuntimeError, ValueError, ControlPlaneError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {**_android_remote_status(), **lease}
     if payload.target == "playwright":
         if not payload.thread_id:
             raise HTTPException(status_code=400, detail="Selecione uma conversa para abrir seu navegador isolado")
@@ -5745,6 +5830,7 @@ async def remote_desktop_socket(websocket: WebSocket) -> None:
     thread_id = websocket.query_params.get("thread_id", "")
     requested_view_only = websocket.query_params.get("view_only", "") == "1"
     playwright_key: tuple[str, str] | None = None
+    android_key: tuple[str, str] | None = None
     read_only_transport = False
     try:
         session = websocket_session(websocket, settings, sessions)
@@ -5761,6 +5847,10 @@ async def remote_desktop_socket(websocket: WebSocket) -> None:
             raise HTTPException(status_code=403, detail="Área de trabalho remota desativada")
         if target not in {"codex", "desktop", "jogos", "playwright", "android"}:
             raise ValueError("alvo de tela remota inválido")
+        if target == "android":
+            android_key = android_lifecycle._key(_playwright_workspace_for_thread(thread_id), thread_id)
+            if android_lifecycle.owner != android_key:
+                raise ValueError("Esta conversa não possui a sessão Android")
         if target == "playwright":
             if not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", thread_id):
                 raise ValueError("conversa Playwright inválida")
@@ -5799,6 +5889,13 @@ async def remote_desktop_socket(websocket: WebSocket) -> None:
         await websocket.close(code=1011)
         return
 
+    if android_key:
+        try:
+            await android_lifecycle.viewer(android_key, websocket, True)
+        except ValueError:
+            writer.close()
+            await websocket.close(code=4409)
+            return
     interactive_playwright = bool(playwright_key and not read_only_transport)
     if interactive_playwright and playwright_key:
         await _claim_playwright_remote(playwright_key, websocket)
@@ -5883,6 +5980,8 @@ async def remote_desktop_socket(websocket: WebSocket) -> None:
             await _release_playwright_remote(playwright_key, websocket)
         if read_only_transport and playwright_key:
             await _release_playwright_read_only(playwright_key, websocket)
+        if android_key:
+            await android_lifecycle.viewer(android_key, websocket, False)
 
 
 @app.get("/api/desktop/screenshot")
@@ -6393,7 +6492,7 @@ async def create_thread(request: Request, payload: ThreadCreate) -> Dict[str, An
         "approvalPolicy": _thread_approval_policy(project),
         "sandbox": "danger-full-access" if project.kind == "system" else "workspace-write",
         "serviceName": "codex_linux_control_system" if project.kind == "system" else "codex_linux_control_projects",
-        "dynamicTools": [AUTOMATION_TOOL_SPEC],
+        "dynamicTools": [AUTOMATION_TOOL_SPEC, ANDROID_TOOL_SPEC],
     }
     if payload.model:
         params["model"] = payload.model
@@ -6679,7 +6778,7 @@ async def _run_automation(automation: Dict[str, Any]) -> str:
             "approvalPolicy": _thread_approval_policy(project),
             "sandbox": "danger-full-access" if project.kind == "system" else "workspace-write",
             "serviceName": "codex_linux_control_automations",
-            "dynamicTools": [AUTOMATION_TOOL_SPEC],
+            "dynamicTools": [AUTOMATION_TOOL_SPEC, ANDROID_TOOL_SPEC],
         }
         if automation.get("model"):
             params["model"] = automation["model"]
@@ -7173,6 +7272,7 @@ async def delete_thread(request: Request, thread_id: str) -> Dict[str, Any]:
     _session(request, mutate=True)
     result = await _rpc("thread/delete", {"threadId": thread_id}, target=_bridge_for_thread(thread_id))
     tool_profiles.remove_thread(thread_id)
+    conversation_approvals.forget_thread(thread_id)
     return result
 
 
@@ -7180,7 +7280,20 @@ async def delete_thread(request: Request, thread_id: str) -> Dict[str, Any]:
 async def respond_approval(request: Request, payload: ApprovalResponse) -> Dict[str, Any]:
     _session(request, mutate=True)
     result = payload.result if payload.result is not None else {"decision": payload.decision}
-    await _bridge_for_workspace(payload.workspace).respond(payload.request_id, result)
+    identity: tuple[str, str, str] | None = None
+    created = False
+    if payload.remember_conversation:
+        try:
+            identity, created = conversation_approvals.remember_pending(payload.workspace, payload.request_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+    try:
+        await _bridge_for_workspace(payload.workspace).respond(payload.request_id, result)
+    except Exception:
+        if identity is not None and created:
+            conversation_approvals.remove(identity)
+        raise
+    conversation_approvals.finish_pending(payload.workspace, payload.request_id)
     return {"ok": True}
 
 

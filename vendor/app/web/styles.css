@@ -1265,6 +1265,7 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 .quota-extras span, .quota-extras strong, .quota-extras small { display: block; }
 .quota-extras > div > span:first-child { margin-bottom: 4px; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
 .quota-extras strong { font-size: 15px; }
+.quota-reset-button { display: block; width: 100%; min-height: 44px; margin-top: 10px; white-space: normal; }
 .quota-extras small, .quota-muted { margin-top: 3px; color: var(--muted); font-size: 11px; }
 .maintenance-card .quota-footnote { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border); font-size: 11px; }
 .settings-project-list { display: flex; flex-direction: column; gap: 8px; }
@@ -2246,6 +2247,10 @@ body.remote-open { overflow: hidden; }
 .composer-queue-copy strong, .composer-queue-copy small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .composer-queue-copy small { margin-top: 2px; color: var(--muted); }
 .composer-queue-actions { display: flex; align-items: center; gap: 7px; }
+.composer-queue-move { width: 44px; min-width: 44px; height: 44px; padding: 0; border: 1px solid var(--border); border-radius: 8px; color: var(--text); background: var(--surface); font-size: 18px; touch-action: manipulation; }
+.composer-queue-move:hover:not(:disabled) { background: var(--surface-3); }
+.composer-queue-move:disabled { opacity: .35; cursor: default; }
+.composer-queue-move:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .composer-queue-steer, .composer-queue-edit { border: 0; color: var(--muted); background: transparent; white-space: nowrap; }
 .composer-queue-steer { min-height: 30px; color: var(--accent); font-weight: 700; }
 .composer-queue-steer:hover, .composer-queue-edit:hover { color: var(--text); }

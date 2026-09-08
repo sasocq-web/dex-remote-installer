@@ -59,6 +59,16 @@ copy_tree /home/codex/.local/share/codex-linux-control codex
 copy_tree /home/codex/SystemWorkspace codex
 copy_tree /home/codex-worker/.codex codex-worker
 copy_tree /srv/sasocq/projects codex-worker
+copy_tree /srv/sasocq/lab codex-worker
+copy_tree /srv/sasocq/development codex-worker
+copy_tree /var/lib/sasocq-lab root
+
+# Backups may predate the production-only rule: the current installer wins.
+restore_mode="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("install_mode",""))' "$(target /home/codex/.config/codex-linux-control/config.json)")"
+if [[ "$restore_mode" == "sasocq" ]]; then
+  placement_root="${DEX_REMOTE_PACKAGE_ROOT:-}/opt/dex-remote/placement"
+  python3 "$placement_root/placement_policy.py" host --root "${STATE_ROOT:-/}" --bundle "$placement_root/payload"
+fi
 
 if [[ -z "$STATE_ROOT" ]]; then
   for path in /home/codex/.codex /home/codex/.config/codex-linux-control /home/codex/.local/share/codex-linux-control /home/codex/SystemWorkspace; do

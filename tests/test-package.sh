@@ -119,7 +119,8 @@ assert config["full_experience_installed"] is True
 assert config["browser_control_enabled"] is True
 assert config["external_url"] == "https://dex.sasocq.com"
 assert config["allowed_project_roots"] == str(root / "srv/sasocq/projects")
-assert (root / "etc/sudoers.d/dex-remote-system").is_file()
+assert not (root / "etc/sudoers.d/dex-remote-system").exists()
+assert "host-development-v1" in (root / "srv/sasocq/projects/AGENTS.md").read_text()
 PY
 
 RESTORE_SOURCE="$TEST_ROOT/restore-source"
@@ -142,6 +143,18 @@ import json, sys
 config = json.load(open(sys.argv[1]))
 assert config["install_mode"] == "full"
 PY
+
+printf 'Instrução legada: desenvolver na VM.\n' >"$RESTORE_SOURCE/home/codex-worker/.codex/AGENTS.md"
+DEX_REMOTE_STATE_ROOT="$SASOCQ_ROOT" DEX_REMOTE_PACKAGE_ROOT="$EXTRACT" "$EXTRACT/usr/sbin/dex-remote-restore" --from "$RESTORE_SOURCE" --confirm
+python3 - "$SASOCQ_ROOT" <<'PYTEST'
+import pathlib,sys
+root=pathlib.Path(sys.argv[1])
+for name in ['home/codex-worker/.codex/AGENTS.md','home/codex/.codex/AGENTS.md','srv/sasocq/projects/AGENTS.md']:
+ s=(root/name).read_text();assert s.count('<!-- SASOCQ-PLACEMENT-BEGIN -->')==1;assert 'A VM nunca é fallback' in s
+assert 'Instrução legada' in (root/'home/codex-worker/.codex/AGENTS.md').read_text()
+assert (root/'srv/sasocq/projects/example/README.md').read_text().strip()=='project-fixture'
+assert not (root/'etc/sudoers.d/dex-remote-system').exists()
+PYTEST
 
 runtime_check() {
   local mode="$1" state_root="$2" home="$3" port="$4" expect_system="$5"

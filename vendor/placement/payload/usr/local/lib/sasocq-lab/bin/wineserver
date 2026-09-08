@@ -1,0 +1,2 @@
+#!/bin/sh
+exec /opt/wine/usr/lib/x86_64-linux-gnu/wine/wineserver "$@"

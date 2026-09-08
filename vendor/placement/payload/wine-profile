@@ -1,0 +1,23 @@
+abi <abi/4.0>,
+include <tunables/global>
+
+# Hosting VM: standard Wine remains usable for hosted services (e.g. MT5).
+# Roblox Studio is a workstation test program and belongs in the host lab.
+# Existing processes are not interrupted when this profile is loaded.
+profile sasocq-hosting-wine /usr/lib/x86_64-linux-gnu/wine/wine flags=(attach_disconnected) {
+    file,
+    /** ix,
+    capability,
+    network,
+    unix,
+    dbus,
+    signal,
+    ptrace,
+    mount,
+    umount,
+    pivot_root,
+    userns,
+    mqueue,
+    io_uring,
+    audit deny /**/[Rr]oblox[Ss]tudio*.exe mrwlkx,
+}

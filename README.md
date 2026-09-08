@@ -112,3 +112,5 @@ Veja [docs/AUTOMATION.md](docs/AUTOMATION.md) para o fluxo de atualização e
 ## Licença
 
 MIT. Consulte [LICENSE](LICENSE).
+
+A reinstalação SASOCQ preserva a separação entre desenvolvimento no host e produção na VM. Consulte [a política de recuperação](RECOVERY-PLACEMENT.md), incluindo os requisitos para restaurar backups antigos e a limitação de mídias antigas.

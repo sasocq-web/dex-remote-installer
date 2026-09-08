@@ -46,7 +46,15 @@ if [[ "$(id -u)" -ne 0 && "$VERIFY_ONLY" != "yes" ]]; then
   exec sudo -- "$0" "${elevated[@]}"
 fi
 
-if [[ "$VERIFY_ONLY" != "yes" ]] && systemctl is-active --quiet codex-linux-control.service 2>/dev/null; then
+active_control_plane() {
+  systemctl is-active --quiet codex-linux-control.service 2>/dev/null && return 0
+  if id codex >/dev/null 2>&1; then
+    local controller_uid; controller_uid="$(id -u codex)"
+    runuser -u codex -- env XDG_RUNTIME_DIR="/run/user/$controller_uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$controller_uid/bus" systemctl --user is-active --quiet codex-linux-control-backend.service 2>/dev/null && return 0
+  fi
+  return 1
+}
+if [[ "$VERIFY_ONLY" != "yes" ]] && active_control_plane; then
   echo "O Control Plane SASOCQ está ativo. Use este reinstalador somente numa instalação nova ou no ambiente de recuperação." >&2
   exit 78
 fi
@@ -132,7 +140,6 @@ if [[ "$VERIFY_ONLY" == "yes" ]]; then
 fi
 
 DEBCONF_MODE="$MODE"
-[[ "$DEBCONF_MODE" != "sasocq" ]] || DEBCONF_MODE=full
 printf 'dex-remote-installer dex-remote-installer/mode select %s\n' "$DEBCONF_MODE" | debconf-set-selections
 apt-get update
 if [[ "$MODE" == "sasocq" ]]; then

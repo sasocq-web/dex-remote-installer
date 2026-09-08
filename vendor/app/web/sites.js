@@ -15,6 +15,10 @@ function normalizeSiteDomain(value) {
     let domain = String(url.hostname || "").toLowerCase().replace(/\.$/, "");
     if (domain.startsWith("www.")) domain = domain.slice(4);
     if (!domain.includes(".") || ["localhost", "127.0.0.1"].includes(domain)) return "";
+    const labels = domain.split(".");
+    const falseTail = /^(?:getby.+|queryselector(?:all)?|locator|waitfor.+|(?:get|set|remove)item|stringify|contentdocument|clientwidth|scrollwidth|viewportsize|addinit.+|setdefaulttimeout|setextrahttpheaders|unroute(?:all)?|png|jpe?g|webp|svg|json|css|js)$/i;
+    const codeRoots = new Set(["page", "document", "window", "localstorage", "json"]);
+    if (falseTail.test(labels.at(-1)) || (codeRoots.has(labels[0]) && !["com", "org", "net", "gov", "edu", "io", "dev", "app"].includes(labels.at(-1)))) return "";
     return domain;
   } catch { return ""; }
 }
@@ -31,11 +35,13 @@ function approvalSiteDomains(approval) {
   const domains = new Set();
   const urlPattern = /https?:\/\/[^\s<>"'`]+/gi;
   const domainPattern = /(?:^|[^\w@])((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63})(?![\w-])/gi;
+  const codeLikePattern = /(?:\b(?:await|function|return|const|let|var|async)\b|[{}();]|(?:page|browser|context|locator)\.)/i;
   for (const text of stringsInSiteValue(approval?.params || {})) {
     for (const match of text.matchAll(urlPattern)) {
       const domain = normalizeSiteDomain(match[0]);
       if (domain) domains.add(domain);
     }
+    if (codeLikePattern.test(text)) continue;
     for (const match of text.matchAll(domainPattern)) {
       const domain = normalizeSiteDomain(match[1]);
       if (domain) domains.add(domain);

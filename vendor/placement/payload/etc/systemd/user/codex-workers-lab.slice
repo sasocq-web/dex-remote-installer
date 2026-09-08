@@ -1,0 +1,14 @@
+[Unit]
+Description=SASOCQ host laboratory - shared resource ceilings
+
+[Slice]
+CPUAccounting=yes
+MemoryAccounting=yes
+IOAccounting=yes
+CPUWeight=100
+CPUQuota=800%
+IOWeight=100
+MemoryHigh=4G
+MemoryMax=6G
+MemorySwapMax=0
+TasksMax=512

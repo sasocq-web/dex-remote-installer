@@ -1,7 +1,7 @@
 Template: dex-remote-installer/mode
 Type: select
-Choices-C: projects, full
-Choices: Somente Projetos, Sistema + Projetos
+Choices-C: projects, full, sasocq
+Choices: Somente Projetos, Sistema + Projetos, Control Plane SASOCQ (broker auditável)
 Default: projects
 _Description: Qual perfil do Dex Remoto deve ser instalado?
  Somente Projetos cria uma identidade isolada sem sudo.

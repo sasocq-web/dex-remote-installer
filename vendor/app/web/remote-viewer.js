@@ -65,7 +65,7 @@
     const scheme = location.protocol === "https:" ? "wss:" : "ws:";
     const params = new URLSearchParams();
     if (target !== "codex") params.set("target", target);
-    if (target === "playwright" && threadId) params.set("thread_id", threadId);
+    if (["playwright", "android"].includes(target) && threadId) params.set("thread_id", threadId);
     if (viewOnly) params.set("view_only", "1");
     const query = params.size ? `?${params.toString()}` : "";
     return `${scheme}//${location.host}/api/remote-desktop/ws${query}`;

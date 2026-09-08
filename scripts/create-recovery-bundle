@@ -42,7 +42,8 @@ release_epoch = int(
     .timestamp()
 )
 manifest = {
-    "format": 1,
+    "format": 2,
+    "placement_policy": "host-development-v1",
     "created_at": release_epoch,
     "package_version": version,
     "codex_cli_version": (root / "CODEX_CLI_VERSION").read_text().strip(),

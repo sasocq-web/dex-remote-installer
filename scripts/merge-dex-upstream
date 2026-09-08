@@ -23,6 +23,8 @@ BASE_FILE = ROOT / ".dex-upstream-release"
 VERSION_FILE = ROOT / "PACKAGE_VERSION"
 LOCAL_ROOT = ROOT / "vendor/app"
 SYSTEM_FILES = {
+    "system/android-host-adb.py",
+    "system/sasocq-android-adb-host.service",
     "system/browser-editable-at-point.cjs",
     "system/set-browser-layout.cjs",
     "scripts/run-playwright-mcp",

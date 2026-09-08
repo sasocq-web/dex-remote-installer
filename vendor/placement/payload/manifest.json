@@ -1,0 +1,107 @@
+{
+  "format": 1,
+  "policy": "host-development-v1",
+  "architecture": "x86_64",
+  "files": {
+    "/usr/local/bin/sasocq-lab": {
+      "sha256": "fd1050de669be7597b9f400cc9a615be48c9526da52c9641f60867efdcbc3251",
+      "mode": 493
+    },
+    "/usr/local/bin/sasocq-build": {
+      "sha256": "2e6f7d2fe8b81b634cc17dc75a48e257f00ec7f48006a9426cc7db840d3f11a2",
+      "mode": 493
+    },
+    "/etc/systemd/user/codex-workers-lab.slice": {
+      "sha256": "2001227b6327a2bb53f240b6f5575822f81e55f9173390daf138e8e509fc3b43",
+      "mode": 420
+    },
+    "/usr/local/share/doc/sasocq-lab/README.md": {
+      "sha256": "b0c9a1877880ba7d02bbdb663960b2c2437123004c95bc350876ca06d13bd7b4",
+      "mode": 420
+    },
+    "/usr/local/lib/sasocq-lab/supervisor.py": {
+      "sha256": "7cdda75730fe39d9a32b6206a9631c58775fc798fbc1e3599066953bc990465f",
+      "mode": 493
+    },
+    "/usr/local/lib/sasocq-lab/session.py": {
+      "sha256": "7e21200cdc6d765a3a7dd4a6bf85a52d82b05deadc12c999ca4f7ad9df7b4115",
+      "mode": 493
+    },
+    "/usr/local/lib/sasocq-lab/egress.py": {
+      "sha256": "8b9766249eef3604f411977dc88f179e742a34110cac8a61143ca26926e28cdc",
+      "mode": 493
+    },
+    "/usr/local/lib/sasocq-lab/migrate.py": {
+      "sha256": "2ac8cf4a2a2cfa4a5db8a0b5c0b71a934c7332ab3532cacdf087dff92e5722b8",
+      "mode": 493
+    },
+    "/usr/local/lib/sasocq-lab/build-runner.py": {
+      "sha256": "5413c4f362f2ec08019bc08ca8f15070abe0c2af7cd252a40bc7c5fec61d2b6c",
+      "mode": 493
+    },
+    "/usr/local/lib/sasocq-lab/containers.conf": {
+      "sha256": "ebd7ae4ceb9b8f6df5916b7af127ec0936330ce49f87cc779bce3b09f45218bb",
+      "mode": 420
+    },
+    "/usr/local/lib/sasocq-lab/slirp-public": {
+      "sha256": "5eb417c7f40a4b2e41e7ce47b5f7fb59f2d2d5a2ef26ceae3d5be5ccede0ee45",
+      "mode": 493
+    },
+    "/usr/local/lib/sasocq-lab/public-egress.so": {
+      "sha256": "a974cb6672c12d9efde8770b40897a7d97e4a9fee7faab61218f020178760069",
+      "mode": 420
+    },
+    "/usr/local/lib/sasocq-lab/android-host-adb.py": {
+      "sha256": "1aa43409f623ca30535014e0d8e6470922a8f5a10b2719ba8e574f6bd6e5db5e",
+      "mode": 493
+    },
+    "/usr/local/lib/sasocq-lab/bin/wine": {
+      "sha256": "9b944caf052355a8219a7600b826dd45d75de83f57dec04e466c6b8b9b0b51e5",
+      "mode": 493
+    },
+    "/usr/local/lib/sasocq-lab/bin/wineserver": {
+      "sha256": "ac76adbdfbd9432b448455a5d9c1fc3aa4bf6bfd39ee42a4cfd5010c3fb6e5dd",
+      "mode": 493
+    },
+    "/usr/local/lib/sasocq-lab/bin/roblox-studio": {
+      "sha256": "00fcb80dba41e93fd9bb03d1ba18c29175623e8ec909d85b8fac18f76830e5bc",
+      "mode": 493
+    },
+    "/usr/local/lib/sasocq-lab/bin/open-url": {
+      "sha256": "6a5e2e3e4f3121fb9c8dfac38e8025da7da6dca38e6105c89f523bd5406f4153",
+      "mode": 493
+    },
+    "/usr/local/lib/sasocq-lab/etc/hosts": {
+      "sha256": "69c68561b95b620ed9b319622a9aefeef6b59b9c5d4d45298f1ac4271fd4d95c",
+      "mode": 420
+    },
+    "/usr/local/lib/sasocq-lab/etc/nsswitch.conf": {
+      "sha256": "616c92fe38aee6d2c529e6e44c58f35e400f26e92860e626fc054cc4345b6d40",
+      "mode": 420
+    },
+    "/usr/local/lib/sasocq-lab/etc/net-resolv.conf": {
+      "sha256": "6c3193cb8055584bbbf8ff9940600142d7d29e4fd40a3ca28c5847f0d8a58747",
+      "mode": 420
+    },
+    "/usr/local/lib/sasocq-lab/etc/net-nsswitch.conf": {
+      "sha256": "80ae794d9936fbdbfad807312defe6fd163c165427ddb5fb6b20759149a2f375",
+      "mode": 420
+    },
+    "/usr/local/lib/sasocq-lab/etc/roblox-passwd": {
+      "sha256": "448b185bb58e665e27c568ec44df2151f33754dbd97fd62553df3a1d405c95ba",
+      "mode": 420
+    },
+    "/usr/local/lib/sasocq-lab/etc/passwd": {
+      "sha256": "fed3960fe4214ae80c0455a9af374d597f333f70ba3b94efe864ceb11d99814e",
+      "mode": 420
+    },
+    "/usr/local/lib/sasocq-lab/etc/group": {
+      "sha256": "0eaf3a26d52f3eefcaadcb884ccd40545808093de52472b0aa3325bec01ff363",
+      "mode": 420
+    },
+    "/etc/systemd/user/sasocq-android-adb-host.service": {
+      "sha256": "8bd3b00d917111caac4fd88f08e190c58e82c5b69efea1468dcb2ab1452ae2f3",
+      "mode": 420
+    }
+  }
+}

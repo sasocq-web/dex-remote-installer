@@ -6,6 +6,7 @@ MODE="projects"
 db_get dex-remote-installer/mode || true
 case "${RET:-}" in
   full) MODE="full" ;;
+  sasocq) MODE="sasocq" ;;
   projects) MODE="projects" ;;
 esac
 

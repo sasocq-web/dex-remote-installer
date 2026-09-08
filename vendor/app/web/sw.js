@@ -1,14 +1,14 @@
-const CACHE = "dex-remote-v1.0.0-0-modern-workbench0151-execution-progress275-steam-remote-recovery284-secure-payment-card294-gnome-codex3-draft-recovery295-quota-primary-summary298";
+const CACHE = "dex-remote-v1.0.0-0-modern-workbench0151-execution-progress275-steam-remote-recovery284-secure-payment-card294-gnome-codex3-draft-recovery295-conversation-approval300-android-lifecycle301-quota-manual-reset302-queue-reorder304";
 const ASSETS = [
   "/",
   "/index.html",
-  "/styles.css?v=secure-payment-card-20260902-294-portable",
+  "/styles.css?v=queue-reorder-20260908-304-portable",
   "/workbench.css?v=modern-workbench-20260830-4",
-  "/app.js?v=quota-primary-summary-20260905-298-portable",
-  "/sites.js?v=dex-fast-open-20260902-290",
+  "/app.js?v=quota-manual-reset-20260907-302-portable",
+  "/sites.js?v=conversation-approval-persistence-20260906-300",
   "/automations.js?v=pc-managers-20260824-229b",
   "/release-status.json",
-  "/operations.js?v=draft-recovery-20260903-295",
+  "/operations.js?v=queue-reorder-20260908-304",
   "/workbench.js?v=modern-workbench-20260830-4",
   "/manifest.webmanifest",
   "/icons/codex-remoto-192.png",

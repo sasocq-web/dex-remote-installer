@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+# A lock per Wine prefix prevents duplicate launches in a running laboratory.
+exec 8>/work/roblox-studio.lock
+flock -n 8 || { echo 'Roblox Studio já está aberto nesta área.' >&2; exit 75; }
+# Native isolated IPv4 network; never use the host/VM network namespace.
+wine reg add 'HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings' /v ProxyEnable /t REG_DWORD /d 0 /f >/dev/null
+wine reg add 'HKCU\Software\Wine\WineBrowser' /v Browsers /d /lab/bin/open-url /f >/dev/null
+exec wine /work/vm-import/test-client/studio-visual-bin/RobloxStudioBeta.exe "$@"

@@ -133,11 +133,13 @@
     if (!tray) return;
     const queued = pending.filter(item => item.status === "queued");
     tray.classList.toggle("hidden", !queued.length);
-    tray.innerHTML = queued.map(item => `
-      <div class="composer-queue-row" data-queue-id="${escape(item.id)}">
+    tray.innerHTML = queued.map((item, index) => `
+      <div class="composer-queue-row" data-queue-id="${escape(item.id)}" data-queue-thread="${escape(state.activeThreadId)}">
         <div class="composer-queue-preview">${queuePreview(item)}</div>
         <div class="composer-queue-copy"><strong>${escape(item.message)}</strong><small>${(item.references || []).length ? `${item.references.length} anexo(s) ou referência(s)` : "Aguardando a execução atual"}</small></div>
         <div class="composer-queue-actions">
+          <button type="button" class="composer-queue-move" data-queue-up="${escape(item.id)}" data-queue-thread="${escape(state.activeThreadId)}" aria-label="Mover orientação para cima" title="Mover para cima" ${index === 0 ? "disabled" : ""}>↑</button>
+          <button type="button" class="composer-queue-move" data-queue-down="${escape(item.id)}" data-queue-thread="${escape(state.activeThreadId)}" aria-label="Mover orientação para baixo" title="Mover para baixo" ${index === queued.length - 1 ? "disabled" : ""}>↓</button>
           ${state.activeTurnId ? `<button type="button" class="composer-queue-steer" data-queue-steer="${escape(item.id)}" aria-label="Enviar esta direção ao turno em execução" title="Orientar o turno agora">Orientar agora</button>` : ""}
           <button type="button" class="composer-queue-edit" data-queue-edit="${escape(item.id)}" aria-label="Editar item da fila" title="Editar">Editar</button>
           <button type="button" class="composer-queue-delete" data-queue-delete="${escape(item.id)}" aria-label="Excluir da fila">⌫</button>

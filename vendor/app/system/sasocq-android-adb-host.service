@@ -1,0 +1,15 @@
+[Unit]
+Description=SASOCQ Android private ADB on host, on demand
+
+[Service]
+Type=simple
+Slice=codex-workers-lab.slice
+ExecStart=/usr/bin/adb -L localfilesystem:/run/user/1001/sasocq-android-adb.sock server nodaemon
+ExecStopPost=-/usr/bin/rm -f /run/user/1001/sasocq-android-adb.sock
+Restart=no
+KillMode=control-group
+TimeoutStopSec=5
+MemoryMax=256M
+TasksMax=64
+CPUQuota=100%
+UMask=0077

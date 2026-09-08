@@ -23,6 +23,7 @@ install -d "$STAGE/DEBIAN" \
   "$STAGE/usr/share/icons/hicolor/scalable/apps"
 
 cp -a "$ROOT/vendor/app" "$STAGE/opt/dex-remote/app"
+cp -a "$ROOT/vendor/placement" "$STAGE/opt/dex-remote/placement"
 install -m 0644 "$ROOT/CODEX_CLI_VERSION" "$STAGE/opt/dex-remote/CODEX_CLI_VERSION"
 install -m 0644 "$ROOT/CONTROL_PLANE_VERSION" "$STAGE/opt/dex-remote/CONTROL_PLANE_VERSION"
 find "$STAGE/opt/dex-remote/app" -type f -name '*.pyc' -delete
@@ -35,6 +36,7 @@ install -m 0644 "$ROOT/packaging/dex-remote@.service" "$STAGE/usr/lib/systemd/sy
 install -m 0644 "$ROOT/packaging/dex-remote.desktop" "$STAGE/usr/share/applications/dex-remote.desktop"
 install -m 0644 "$ROOT/vendor/app/web/icons/icon.svg" "$STAGE/usr/share/icons/hicolor/scalable/apps/dex-remote.svg"
 install -m 0644 "$ROOT/README.md" "$STAGE/usr/share/doc/$PACKAGE/README.md"
+install -m 0644 "$ROOT/RECOVERY-PLACEMENT.md" "$STAGE/usr/share/doc/$PACKAGE/RECOVERY-PLACEMENT.md"
 install -m 0644 "$ROOT/LICENSE" "$STAGE/usr/share/doc/$PACKAGE/copyright"
 
 install -m 0755 "$ROOT/packaging/config" "$STAGE/DEBIAN/config"
