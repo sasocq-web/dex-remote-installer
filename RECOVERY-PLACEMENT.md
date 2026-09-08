@@ -1,6 +1,6 @@
 # Recuperação com a VM exclusiva para produção
 
-A partir de `1.0.0+20260908.120500` e Control Plane `0.4.0+ubuntu26.04.27`, o perfil SASOCQ inclui obrigatoriamente a política `host-development-v1`.
+A partir de `1.0.0+20260908.120700` e Control Plane `0.4.0+ubuntu26.04.28`, o perfil SASOCQ inclui obrigatoriamente a política `host-development-v1`.
 
 O instalador reinstala os helpers e limites do laboratório no host e reaplica a regra às instruções de Sistema e Projetos. A importação de um backup antigo preserva os arquivos, mas reaplica o bloco atual por último. A criação de uma VM nova inclui os bloqueios no cloud-init; a recuperação de um disco antigo aplica os bloqueios ao disco desligado antes de iniciá-lo. Falhas impedem considerar a recuperação concluída. Não há alternativa automática que transfira desenvolvimento para a VM.
 

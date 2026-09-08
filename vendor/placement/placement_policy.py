@@ -7,7 +7,9 @@ START='<!-- SASOCQ-PLACEMENT-BEGIN -->';END='<!-- SASOCQ-PLACEMENT-END -->'
 def put(root,path,data,mode=0o644):
  p=root/path.lstrip('/')
  if any(x.is_symlink() for x in [p,*p.parents] if x!=root):raise RuntimeError('Refusing symlink target: '+path)
+ missing=[x for x in [p.parent,*p.parent.parents] if x!=root and not x.exists()]
  p.parent.mkdir(parents=True,exist_ok=True)
+ for x in missing:x.chmod(0o700 if '/.codex' in str(x) else 0o755)
  if p.exists() and p.read_bytes()==data and p.stat().st_mode&0o777==mode:return
  if p.exists():
   old=p.read_bytes();b=root/'var/backups/sasocq-placement'/hashlib.sha256(old).hexdigest()/path.lstrip('/')
@@ -46,7 +48,7 @@ def host(root=pathlib.Path('/'),bundle=BUNDLE):
   for name in ['/srv/sasocq/lab','/srv/sasocq/development']:
    p=pathlib.Path(name);p.mkdir(mode=0o700,parents=True,exist_ok=True);os.chown(p,worker.pw_uid,worker.pw_gid);p.chmod(0o700)
   for user in ['codex','codex-worker']:
-   who=pwd.getpwnam(user);p=pathlib.Path(who.pw_dir)/'.codex/AGENTS.md';os.chown(p,who.pw_uid,who.pw_gid)
+   who=pwd.getpwnam(user);p=pathlib.Path(who.pw_dir)/'.codex/AGENTS.md';os.chown(p.parent,who.pw_uid,who.pw_gid);p.parent.chmod(0o700);os.chown(p,who.pw_uid,who.pw_gid)
   subprocess.run(['loginctl','enable-linger','codex-worker'],check=True)
   subprocess.run(['systemctl','start','user@1001.service'],check=True)
   subprocess.run(['runuser','-u','codex-worker','--','env','XDG_RUNTIME_DIR=/run/user/1001','DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1001/bus','systemctl','--user','daemon-reload'],check=True)

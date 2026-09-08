@@ -68,6 +68,26 @@ PY
 [[ -x "$EXTRACT/usr/sbin/dex-remote-setup" ]]
 [[ -x "$EXTRACT/usr/sbin/dex-remote-restore" ]]
 
+# A restrictive build umask must not make the policy unreadable to Projects.
+python3 - "$EXTRACT/opt/dex-remote/placement" <<'PYMODE'
+import pathlib,sys
+root=pathlib.Path(sys.argv[1])
+for p in [root,*root.rglob('*')]:
+ assert p.stat().st_mode & (5 if p.is_dir() else 4)==(5 if p.is_dir() else 4),p
+PYMODE
+CONTROL_DEB="$ROOT/dist/sasocq-control-plane_$(cat "$ROOT/CONTROL_PLANE_VERSION")_all.deb"
+if [[ -f "$CONTROL_DEB" ]]; then
+  dpkg-deb -x "$CONTROL_DEB" "$TEST_ROOT/core-extract"
+  python3 - "$TEST_ROOT/core-extract" <<'PYMODE'
+import pathlib,sys
+root=pathlib.Path(sys.argv[1]);policy=root/'usr/share/sasocq-placement'
+for p in [policy,*policy.rglob('*'),root/'usr/lib/python3/dist-packages/sasocq_control/placement_policy.py']:
+ assert p.stat().st_mode & (5 if p.is_dir() else 4)==(5 if p.is_dir() else 4),p
+for p in [root/'etc/systemd',root/'etc/systemd/system']:
+ assert p.stat().st_mode & 5==5,p
+PYMODE
+fi
+
 DPKG_ROOT="$TEST_ROOT/dpkg-root"
 mkdir -p "$DPKG_ROOT/var/lib/dpkg/updates" "$DPKG_ROOT/var/log"
 touch "$DPKG_ROOT/var/lib/dpkg/status" "$DPKG_ROOT/var/lib/dpkg/available"

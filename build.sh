@@ -62,6 +62,8 @@ Description: Dex remoto para Codex de Projetos e Codex do Sistema
  Nenhuma credencial, conversa ou configuração pessoal acompanha o pacote.
 EOF
 
+find "$STAGE/opt/dex-remote/placement" -type d -exec chmod 0755 {} +
+find "$STAGE/opt/dex-remote/placement" -type f -exec chmod 0644 {} +
 find "$STAGE/opt/dex-remote/app" -type d -exec chmod 0755 {} +
 find "$STAGE/opt/dex-remote/app" -type f -exec chmod 0644 {} +
 chmod 0755 "$STAGE/opt/dex-remote/app/scripts/run-playwright-mcp"
