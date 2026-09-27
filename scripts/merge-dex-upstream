@@ -110,9 +110,76 @@ def merge_text(local: bytes, base: bytes, remote: bytes, relative: str) -> bytes
             check=False,
         )
     if completed.returncode != 0:
+        if relative == "clc/main.py":
+            resolved = resolve_startup_conflict(completed.stdout)
+            if resolved is not None:
+                return resolved
+        if relative == "web/styles.css":
+            resolved = resolve_styles_tail_conflict(completed.stdout)
+            if resolved is not None:
+                return resolved
         detail = completed.stderr.decode("utf-8", errors="replace").strip()
         raise RuntimeError(f"conflito de atualização em {relative}: {detail or 'mesclagem manual necessária'}")
     return completed.stdout
+
+
+def resolve_startup_conflict(content: bytes) -> bytes | None:
+    """Preserve the portable Projects profile around new System migrations.
+
+    This resolves only the known startup block. All other conflicts still
+    require review, so future upstream changes cannot be accepted silently.
+    """
+    text = content.decode("utf-8", errors="strict")
+    pattern = re.compile(
+        r"^<<<<<<< [^\n]+\n(?P<local>.*?)^=======\n(?P<remote>.*?)^>>>>>>> [^\n]+\n",
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    matches = list(pattern.finditer(text))
+    if len(matches) != 1 or text.count("<<<<<<< ") != 1:
+        return None
+    match = matches[0]
+    local = match.group("local")
+    remote = match.group("remote")
+    before = text[:match.start()]
+    if (
+        not before.endswith("    projects.ensure_default()\n")
+        or not local.startswith("    if not settings.projects_only:\n")
+        or "await asyncio.to_thread(migrate_android_tools" not in local
+        or not remote.startswith("    _system_project()\n")
+        or "migrate_rollout_tools" not in remote
+        or "migrate_publication_tools" not in remote
+        or not text[match.end():].startswith("    # The Playwright MCP")
+    ):
+        return None
+    guarded_remote = "    if not settings.projects_only:\n" + "".join(
+        "    " + line if line.strip() else line
+        for line in remote.splitlines(keepends=True)
+    )
+    return (before + guarded_remote + text[match.end():]).encode("utf-8")
+
+
+def resolve_styles_tail_conflict(content: bytes) -> bytes | None:
+    """Keep the portable Projects selector and append new upstream styles."""
+    text = content.decode("utf-8", errors="strict")
+    pattern = re.compile(
+        r"^<<<<<<< [^\n]+\n(?P<local>.*?)^=======\n(?P<remote>.*?)^>>>>>>> [^\n]+\n",
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    matches = list(pattern.finditer(text))
+    if len(matches) != 1 or text.count("<<<<<<< ") != 1:
+        return None
+    match = matches[0]
+    local = match.group("local")
+    remote = match.group("remote")
+    if (
+        not local.startswith('body[data-install-mode="projects"] #open-system,')
+        or '#system-control' not in local
+        or '/* Spacious queue editor' not in remote
+        or '.composer-queue-items' not in remote
+        or text[match.end():].strip()
+    ):
+        return None
+    return (text[:match.start()] + local.rstrip() + "\n" + remote.lstrip()).encode("utf-8")
 
 
 def without_index_cache_versions(content: bytes) -> bytes:
