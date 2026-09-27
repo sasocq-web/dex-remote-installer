@@ -15,7 +15,7 @@ def shell(args,timeout=15): return run(['-s',SERIAL,'shell',*args],timeout)
 def validate(argv):
     if not argv: raise ValueError('Operação obrigatória')
     op=argv[0]; args=argv[1:]
-    if op not in {'status','ui','apps','is-installed','open','play','back','home','tap','type'}: raise ValueError('Operação não permitida')
+    if op not in {'status','ui','apps','is-installed','open','play','back','home','tap','type','screenshot'}: raise ValueError('Operação não permitida')
     expected=2 if op=='tap' else 1 if op in {'is-installed','open','play','type'} else 0
     if len(args)!=expected: raise ValueError('Argumentos inválidos')
     if op in {'is-installed','open','play'} and not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+',args[0]): raise ValueError('Pacote inválido')
@@ -36,6 +36,16 @@ def main():
         if time.monotonic()>=deadline: raise RuntimeError('Boot Android não concluído no prazo')
         time.sleep(1)
     if op=='status': out='runtime=host\ntransport=private-adb\nboot_completed=1\nandroid='+shell(['getprop','ro.build.version.release'])
+    elif op=='screenshot':
+        import json
+        from lab_conversation import image_url
+        shell(['screencap','-p','/data/local/tmp/sasocq-conversation.png'],20)
+        try:
+            shot=subprocess.run([ADB,'-L',SOCKET,'-s',SERIAL,'exec-out','cat','/data/local/tmp/sasocq-conversation.png'],capture_output=True,timeout=20,check=True)
+        finally:
+            shell(['rm','-f','/data/local/tmp/sasocq-conversation.png'])
+        if not shot.stdout.startswith(b'\x89PNG\r\n\x1a\n'): raise RuntimeError('Captura Android indisponível')
+        out=json.dumps({'image_url':image_url(shot.stdout)})
     elif op=='ui':
         shell(['uiautomator','dump','/sdcard/sasocq-window.xml'],30)
         out=run(['-s',SERIAL,'exec-out','cat','/sdcard/sasocq-window.xml'])

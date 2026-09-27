@@ -10,7 +10,7 @@
   <link rel="manifest" href="/manifest.webmanifest">
   <link rel="icon" href="/icons/codex-remoto-192.png" type="image/png">
   <link rel="apple-touch-icon" href="/icons/codex-remoto-192.png">
-  <link rel="stylesheet" href="/styles.css?v=queue-reorder-20260908-304-portable">
+  <link rel="stylesheet" href="/styles.css?v=orientation-collapse-20260909-312-queue-editor313-queue-collapse314-plain-messages315-secure-credential-vault329-automation-menu333-portable">
   <link rel="stylesheet" href="/workbench.css?v=modern-workbench-20260830-4">
 </head>
 <body>
@@ -310,6 +310,27 @@
       <button id="retry-device-auth" class="primary-button">Tentar novamente</button>
     </div>
   </section>
+
+  <dialog id="queue-editor-dialog" class="dialog queue-editor-dialog" aria-labelledby="queue-editor-title" aria-describedby="queue-editor-context">
+    <form id="queue-editor-form" novalidate>
+      <header class="queue-editor-header">
+        <h2 id="queue-editor-title">Editar orientação</h2>
+        <div class="queue-editor-window-actions">
+          <button id="queue-editor-expand" type="button" class="secondary-button" aria-pressed="false">Expandir</button>
+          <button id="queue-editor-close" type="button" class="icon-button" aria-label="Fechar edição">×</button>
+        </div>
+      </header>
+      <p id="queue-editor-context" class="queue-editor-context"></p>
+      <label class="queue-editor-field" for="queue-editor-message">Mensagem
+        <textarea id="queue-editor-message" maxlength="200000" spellcheck="true" aria-describedby="queue-editor-error"></textarea>
+      </label>
+      <p id="queue-editor-error" class="queue-editor-error" role="alert"></p>
+      <footer class="queue-editor-actions">
+        <button id="queue-editor-cancel" type="button" class="secondary-button">Cancelar</button>
+        <button id="queue-editor-save" type="submit" class="primary-button">Salvar</button>
+      </footer>
+    </form>
+  </dialog>
 
   <dialog id="project-dialog" class="dialog project-dialog" aria-labelledby="project-dialog-title">
     <div class="dialog-header">
@@ -689,6 +710,17 @@
     </div>
   </dialog>
 
+  <dialog id="automation-edit-dialog" class="dialog automation-edit-dialog" aria-labelledby="automation-edit-heading">
+    <form id="automation-edit-form" class="automation-edit-form" method="dialog">
+      <div class="dialog-header"><div><h2 id="automation-edit-heading">Editar agendamento</h2><p id="automation-edit-title"></p></div><button id="automation-edit-close" class="icon-button" type="button" aria-label="Fechar edição">×</button></div>
+      <label>Modelo<select id="automation-edit-model"><option value="">Padrão da conversa</option></select></label>
+      <label>Periodicidade (RRULE)<input id="automation-edit-rrule" required spellcheck="false" placeholder="FREQ=DAILY;BYHOUR=9;BYMINUTE=0"><small id="automation-edit-rule-preview"></small></label>
+      <p class="automation-edit-help">Exemplos: diário às 9h: FREQ=DAILY;BYHOUR=9;BYMINUTE=0 · semanal às segundas: FREQ=WEEKLY;BYDAY=MO;BYHOUR=9;BYMINUTE=0</p>
+      <label>Onde iniciar cada execução<select id="automation-edit-kind"><option value="heartbeat">Continuar a conversa atual</option><option value="cron">Iniciar em nova conversa</option></select></label>
+      <div class="automation-edit-actions"><button class="secondary-button" type="button" onclick="document.getElementById('automation-edit-dialog').close()">Voltar</button><button id="automation-edit-save" class="primary-button" type="submit">Salvar alterações</button></div>
+    </form>
+  </dialog>
+
   <dialog id="system-update-dialog" class="dialog task-dialog system-update-dialog" aria-labelledby="system-update-progress-title">
     <div class="dialog-header"><h2 id="system-update-progress-title">Atualização do sistema</h2><button id="system-update-progress-close" class="icon-button" aria-label="Fechar">×</button></div>
     <div class="task-status-row"><span class="spinner"></span><strong id="system-update-progress-message">Preparando a atualização do sistema…</strong></div>
@@ -726,10 +758,10 @@
   </dialog>
 
   <div id="toast-container" class="toast-container" aria-live="assertive"></div>
-  <script src="/app.js?v=quota-manual-reset-20260907-302-gnome-codex3-portable" defer></script>
+  <script src="/app.js?v=canvas-auth321-gnome-codex3-secure-credential-vault329-gnome-codex3-portable" defer></script>
   <script src="/sites.js?v=conversation-approval-persistence-20260906-300" defer></script>
-  <script src="/automations.js?v=pc-managers-20260824-229b" defer></script>
-  <script src="/operations.js?v=queue-reorder-20260908-304" defer></script>
+  <script src="/automations.js?v=automation-menu333" defer></script>
+  <script src="/operations.js?v=queue-reorder-20260908-304-queue-editor313-queue-collapse314-conversation-load317" defer></script>
   <script src="/workbench.js?v=modern-workbench-20260830-4" defer></script>
 </body>
 </html>

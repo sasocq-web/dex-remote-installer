@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 import json
 import socket
 import uuid
@@ -62,3 +65,17 @@ def status(socket_path: str | Path = DEFAULT_SOCKET) -> dict[str, Any]:
         return {"available": True, "socket": str(socket_path), "ping": ping.get("result", {})}
     except ControlPlaneError as exc:
         return {"available": False, "socket": str(socket_path), "error": str(exc)}
+
+
+# Administrative commands may wait for minutes. They must not consume the
+# default executor used by conversation transport, policies and file reads.
+_admin_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="clc-admin")
+
+async def async_request(action, params=None, *, socket_path=DEFAULT_SOCKET, timeout=60.0):
+    return await asyncio.get_running_loop().run_in_executor(
+        _admin_executor, partial(request, action, params, socket_path=socket_path, timeout=timeout))
+
+
+async def async_status(socket_path=DEFAULT_SOCKET):
+    return await asyncio.get_running_loop().run_in_executor(
+        _admin_executor, partial(status, socket_path))

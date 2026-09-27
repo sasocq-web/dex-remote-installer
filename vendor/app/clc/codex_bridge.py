@@ -13,9 +13,10 @@ from .events import EventHub
 LOGGER = logging.getLogger(__name__)
 
 # App-server uses JSONL and a thread/read or thread/resume response can contain
-# the complete conversation in one line.  asyncio's 64 KiB default breaks the
-# reader for ordinary conversations with a moderately sized history.
-SUBPROCESS_STREAM_LIMIT = 64 * 1024 * 1024
+# the complete conversation in one line. A project conversation reached 197 MB
+# on disk and exceeded the previous 64 MiB stream limit. Keep this bounded,
+# while allowing the existing history to load without terminating its bridge.
+SUBPROCESS_STREAM_LIMIT = 384 * 1024 * 1024
 
 
 class CodexRPCError(RuntimeError):

@@ -41,7 +41,8 @@ function automationKindLabel(kind) {
 function automationCardHTML(item) {
   const active = item.status === "ACTIVE";
   const title = item.name || "Agendamento sem nome";
-  const conversation = item.thread_title || (item.target_thread_id ? `Conversa ${String(item.target_thread_id).slice(0, 8)}…` : "Nova conversa a cada execução");
+  const conversation = item.kind === "cron" ? "Nova conversa a cada execução" : (item.thread_title || `Conversa ${String(item.target_thread_id || "").slice(0, 8)}…`);
+  const editable = !state.session?.read_only_automation;
   return `<article class="automation-card" data-automation-id="${escapeHTML(item.id || "")}">
     <div class="automation-card-head">
       <div class="automation-icon ${active ? "active" : "paused"}" aria-hidden="true">◷</div>
@@ -56,6 +57,11 @@ function automationCardHTML(item) {
       <div><span>Destino</span><strong>${escapeHTML(conversation)}</strong></div>
     </div>
     <div class="automation-card-foot"><code>${escapeHTML(item.rrule || "")}</code>${item.model ? `<span>Modelo ${escapeHTML(item.model)}</span>` : ""}</div>
+    ${editable ? `<div class="automation-actions">
+      <button class="secondary-button" type="button" data-automation-action="toggle" data-automation-id="${escapeHTML(item.id)}">${active ? "Pausar" : "Retomar"}</button>
+      <button class="secondary-button" type="button" data-automation-action="edit" data-automation-id="${escapeHTML(item.id)}">Editar</button>
+      <button class="danger-button" type="button" data-automation-action="cancel" data-automation-id="${escapeHTML(item.id)}">Cancelar</button>
+    </div>` : ""}
   </article>`;
 }
 
@@ -97,7 +103,43 @@ function renderAutomationPage() {
   } else {
     list.innerHTML = filtered.map(automationCardHTML).join("");
   }
-  el("automation-timezone").textContent = `Horários exibidos em São Paulo (${data.timezone || "America/Sao_Paulo"}). A página é somente leitura; alterações continuam sendo confirmadas na conversa com o Codex.`;
+  el("automation-timezone").textContent = `Horários exibidos em São Paulo (${data.timezone || "America/Sao_Paulo"}).`;
+}
+
+async function updateAutomationFromPage(item, changes) {
+  const result = await api(`/api/automations/${encodeURIComponent(item.id)}`, {method:"PATCH", body:JSON.stringify(changes)});
+  await refreshAutomationPage();
+  return result;
+}
+
+async function editAutomation(item) {
+  const dialog = el("automation-edit-dialog");
+  el("automation-edit-title").textContent = item.name || "Agendamento";
+  const modelSelect = el("automation-edit-model");
+  modelSelect.innerHTML = '<option value="">Padrão da conversa</option>' + (item.model ? `<option value="${escapeHTML(item.model)}">${escapeHTML(item.model)} (atual)</option>` : "");
+  modelSelect.value = item.model || "";
+  el("automation-edit-rrule").value = item.rrule || "";
+  el("automation-edit-kind").value = item.kind || "heartbeat";
+  el("automation-edit-kind").querySelector('option[value="heartbeat"]').disabled = !item.target_thread_id;
+  el("automation-edit-rule-preview").textContent = automationRuleLabel(item.rrule);
+  dialog.dataset.automationId = item.id;
+  dialog.showModal();
+  try {
+    const workspace = item.project_kind === "system" ? "system" : "project";
+    const params = new URLSearchParams({workspace});
+    if (workspace === "project") params.set("project_id", item.project_id);
+    const result = await api(`/api/models?${params}`);
+    if (dialog.dataset.automationId !== item.id || !dialog.open) return;
+    modelSelect.innerHTML = '<option value="">Padrão da conversa</option>' + (result.data || []).filter(model => !model.hidden).map(model =>
+      `<option value="${escapeHTML(model.id || model.model || "")}">${escapeHTML(model.displayName || model.model || model.id || "")}</option>`
+    ).join("");
+    if (item.model && ![...modelSelect.options].some(option => option.value === item.model)) {
+      modelSelect.insertAdjacentHTML("beforeend", `<option value="${escapeHTML(item.model)}">${escapeHTML(item.model)} (atual)</option>`);
+    }
+    modelSelect.value = item.model || "";
+  } catch (error) {
+    toast(`Lista de modelos indisponível: ${error.message}`, "error");
+  }
 }
 
 async function refreshAutomationPage() {
@@ -127,7 +169,48 @@ el("automation-search")?.addEventListener("input", renderAutomationPage);
 el("automation-status-filter")?.addEventListener("change", renderAutomationPage);
 el("automation-project-filter")?.addEventListener("change", renderAutomationPage);
 el("automation-refresh")?.addEventListener("click", () => refreshAutomationPage().catch(error => toast(error.message, "error")));
+el("automation-edit-close")?.addEventListener("click", () => el("automation-edit-dialog")?.close());
+el("automation-edit-rrule")?.addEventListener("input", event => {
+  el("automation-edit-rule-preview").textContent = automationRuleLabel(event.target.value);
+});
+el("automation-edit-form")?.addEventListener("submit", async event => {
+  event.preventDefault();
+  const item = (automationPageState.data.automations || []).find(entry => entry.id === el("automation-edit-dialog").dataset.automationId);
+  if (!item) return;
+  const button = el("automation-edit-save");
+  button.disabled = true;
+  try {
+    const model = el("automation-edit-model").value;
+    await updateAutomationFromPage(item, {
+      model,
+      rrule:el("automation-edit-rrule").value.trim(),
+      kind:el("automation-edit-kind").value,
+    });
+    el("automation-edit-dialog").close();
+    toast("Agendamento atualizado.");
+  } catch (error) { toast(error.message, "error"); }
+  finally { button.disabled = false; }
+});
 el("automation-list")?.addEventListener("click", async event => {
+  const action = event.target.closest("[data-automation-action]");
+  if (action) {
+    const item = (automationPageState.data.automations || []).find(entry => entry.id === action.dataset.automationId);
+    if (!item || state.session?.read_only_automation) return;
+    if (action.dataset.automationAction === "edit") return editAutomation(item);
+    if (action.dataset.automationAction === "cancel" && !confirm(`Cancelar o agendamento “${item.name}”? As próximas execuções serão removidas.`)) return;
+    action.disabled = true;
+    try {
+      if (action.dataset.automationAction === "toggle") {
+        await updateAutomationFromPage(item, {status:item.status === "ACTIVE" ? "PAUSED" : "ACTIVE"});
+        toast(item.status === "ACTIVE" ? "Agendamento pausado." : "Agendamento retomado.");
+      } else if (action.dataset.automationAction === "cancel") {
+        await api(`/api/automations/${encodeURIComponent(item.id)}`, {method:"DELETE"});
+        await refreshAutomationPage();
+        toast("Agendamento cancelado.");
+      }
+    } catch (error) { action.disabled = false; toast(error.message, "error"); }
+    return;
+  }
   const button = event.target.closest("[data-automation-thread]");
   if (!button) return;
   el("automation-dialog")?.close();

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import re
+import os
+import stat
 import sqlite3
 import time
+import tomllib
 from contextlib import closing
 from pathlib import Path
 from typing import Any, Callable
@@ -23,6 +26,57 @@ PENDING_LIMIT = 2_000
 def _credential_elicitation(params: dict[str, Any]) -> bool:
     message = str(params.get("message") or "")
     return message.startswith("SASOCQ_CREDENTIALS\n") or message.startswith("SASOCQ_PAYMENT_CARD\n")
+
+
+def _interactive_elicitation(params: dict[str, Any]) -> bool:
+    """Actual user forms/URLs cannot inherit permission to execute a tool."""
+    schema = params.get("requestedSchema")
+    properties = schema.get("properties") if isinstance(schema, dict) else None
+    if _tool_approval_identity(params) is not None:
+        return False
+    return _credential_elicitation(params) or params.get("mode") in {"form", "url"} or bool(properties)
+
+
+def _tool_approval_identity(params: dict[str, Any]) -> tuple[str, str] | None:
+    """Recognize Codex's permission envelope, never a server's login form."""
+    meta = params.get("_meta")
+    schema = params.get("requestedSchema")
+    if (not isinstance(meta, dict) or meta.get("codex_approval_kind") != "mcp_tool_call"
+            or params.get("mode") != "form" or params.get("url")
+            or not isinstance(schema, dict) or schema.get("type") != "object"
+            or schema.get("properties") != {} or schema.get("required")):
+        return None
+    parsed = re.fullmatch(r'Allow the ([A-Za-z0-9_.-]+) MCP server to run tool "([A-Za-z0-9_.-]+)"\?',
+                          str(params.get("message") or ""))
+    if not parsed or params.get("serverName") != parsed.group(1):
+        return None
+    return parsed.group(1), parsed.group(2)
+
+
+def project_tool_approval(path: Path, server: str, tool: str) -> bool:
+    """Read an explicit, root-owned project policy, including for loaded turns.
+
+    Project source cannot grant itself permission by writing a configuration.
+    Read the file descriptor we checked, fail closed and never cache approvals.
+    """
+    try:
+        with (Path(path) / ".codex/config.toml").open("rb") as stream:
+            info = os.fstat(stream.fileno())
+            if info.st_uid != 0 or info.st_mode & 0o022 or not stat.S_ISREG(info.st_mode):
+                return False
+            raw = stream.read(131073)
+        if len(raw) > 131072:
+            return False
+        config = tomllib.loads(raw.decode("utf-8"))
+        policy = config.get("mcp_servers", {}).get(server, {})
+        if policy.get("enabled") is False:
+            return False
+        override = policy.get("tools", {}).get(tool, {})
+        if override.get("enabled") is False:
+            return False
+        return override.get("approval_mode", policy.get("default_tools_approval_mode")) == "approve"
+    except (OSError, ValueError, TypeError, AttributeError):
+        return False
 
 
 def _command_text(value: Any) -> str:
@@ -56,7 +110,7 @@ def approval_type_key(method: Any, params: Any) -> str:
         return ""
     params = params if isinstance(params, dict) else {}
     if method == "mcpServer/elicitation/request":
-        if _credential_elicitation(params):
+        if _interactive_elicitation(params):
             return ""
         message = str(params.get("message") or "")
         parsed = re.search(
@@ -78,7 +132,7 @@ def approval_type_key(method: Any, params: Any) -> str:
 
 
 def approval_result(method: str, params: dict[str, Any]) -> dict[str, Any] | None:
-    if method == "mcpServer/elicitation/request" and not _credential_elicitation(params):
+    if method == "mcpServer/elicitation/request" and not _interactive_elicitation(params):
         return {"action": "accept", "content": {}}
     if method == "item/permissions/requestApproval":
         permissions = params.get("permissions")
@@ -91,11 +145,14 @@ def approval_result(method: str, params: dict[str, Any]) -> dict[str, Any] | Non
 class ConversationApprovalRules:
     """Durable per-conversation rules plus a short-lived cache of real requests."""
 
-    def __init__(self, path: Path, site_policy: Callable[[str], str] | None = None) -> None:
+    def __init__(self, path: Path, site_policy: Callable[[str], str] | None = None,
+                 project_path: Callable[[str], Path | None] | None = None) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.site_policy = site_policy
+        self.project_path = project_path
         self._pending: dict[tuple[str, str], tuple[dict[str, Any], float]] = {}
+        self._forms = {}
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
@@ -189,7 +246,69 @@ class ConversationApprovalRules:
             return {"decision": "decline"}
         return None
 
+    def discard_finished_forms(self, event):
+        workspace = event.get("workspace", "system")
+        notification = event.get("notification") or {}
+        method = notification.get("method")
+        params = notification.get("params") or {}
+        thread_id = params.get("threadId")
+        bridge_ended = event.get("kind") == "bridge_status" and event.get("status") in {"stopped", "error"}
+        if not bridge_ended and method != "turn/completed":
+            return []
+        resolved = []
+        for key, (request, _) in list(self._forms.items()):
+            owner = request.get("params", {}).get("threadId")
+            if key[0] == workspace and (bridge_ended or thread_id and owner == thread_id):
+                self._forms.pop(key, None)
+                resolved.append({"kind": "mcp_form_resolved", "workspace": workspace, "thread_id": owner, "request_id": key[1]})
+        return resolved
+
+    def pending_form_events(self) -> list[dict[str, Any]]:
+        cutoff = time.monotonic() - 300
+        self._forms = {key: value for key, value in self._forms.items() if value[1] >= cutoff}
+        return [{"kind": "server_request", "workspace": key[0], "request": value[0]}
+                for key, value in self._forms.items()]
+
+    def validate_form_response(self, workspace, request_id, result):
+        record = self._forms.get((workspace, str(request_id)))
+        if record is None:
+            return False
+        self.pending_form_events()
+        if (workspace, str(request_id)) not in self._forms:
+            raise ValueError("O formulário expirou; solicite uma nova tentativa.")
+        if result.get("action") in {"cancel", "decline"}:
+            return True
+        if result.get("action") != "accept":
+            raise ValueError("Resposta de formulário inválida.")
+        params = record[0].get("params", {})
+        schema = params.get("requestedSchema", {})
+        content = result.get("content")
+        if not isinstance(content, dict):
+            raise ValueError("Preencha o formulário antes de responder.")
+        properties = schema.get("properties", {})
+        if set(content) - set(properties) or set(schema.get("required", [])) - set(content):
+            raise ValueError("Campos do formulário inválidos ou incompletos.")
+        if "signed_in" in properties and content.get("signed_in") is not True:
+            raise ValueError("Confirme o login pelo formulário; aprovação genérica não conclui autenticação.")
+        for name, value in content.items():
+            definition = properties[name]
+            kind = definition.get("type")
+            valid = (kind == "boolean" and type(value) is bool or
+                     kind == "string" and isinstance(value, str) or
+                     kind == "integer" and type(value) is int or
+                     kind == "number" and type(value) in {int, float})
+            if not valid or ("enum" in definition and value not in definition["enum"]):
+                raise ValueError("Valor inválido no formulário: " + name)
+        return True
+
     async def handle_server_request(self, workspace: str, message: dict[str, Any]) -> dict[str, Any] | None:
+        params = message.get("params") or {}
+        if message.get("method") == "mcpServer/elicitation/request" and _interactive_elicitation(params) and not _credential_elicitation(params):
+            self.pending_form_events()
+            if len(self._forms) >= PENDING_LIMIT:
+                return {"action": "cancel", "content": None}
+            self._forms[(workspace, str(message.get("id")))] = (message, time.monotonic())
+            return None
         identity = self._identity(workspace, message)
         if identity is None:
             return None
@@ -204,6 +323,12 @@ class ConversationApprovalRules:
         if site_decision in {"allow", "deny"}:
             self._pending.pop(pending_key, None)
             return approval_result(method, params) if site_decision == "allow" else self._denial_result(method)
+        tool_identity = _tool_approval_identity(params) if method == "mcpServer/elicitation/request" else None
+        if tool_identity and workspace.startswith("project:") and self.project_path is not None:
+            path = self.project_path(workspace)
+            if path is not None and project_tool_approval(path, *tool_identity):
+                self._pending.pop(pending_key, None)
+                return approval_result(method, params)
         if not self._matches(identity):
             return None
         self._pending.pop(pending_key, None)
@@ -224,8 +349,10 @@ class ConversationApprovalRules:
             )
         return identity, cursor.rowcount > 0
 
-    def finish_pending(self, workspace: str, request_id: Any) -> None:
+    def finish_pending(self, workspace: str, request_id: Any) -> dict[str, Any] | None:
         self._pending.pop((workspace, str(request_id)), None)
+        form = self._forms.pop((workspace, str(request_id)), None)
+        return form[0] if form else None
 
     def remove(self, identity: tuple[str, str, str]) -> None:
         with closing(self._connect()) as connection, connection:

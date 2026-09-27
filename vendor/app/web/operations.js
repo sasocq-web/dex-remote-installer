@@ -128,12 +128,41 @@
     return image ? `<img src="${escape(image.preview_url)}" alt="">` : `<span>${item.status === "running" ? "▶" : "↳"}</span>`;
   }
 
+  const COMPOSER_QUEUE_EXPANDED_KEY = "codex-linux-control.expanded-queues.v1";
+  const expandedComposerQueues = new Set();
+  try {
+    const saved = JSON.parse(sessionStorage.getItem(COMPOSER_QUEUE_EXPANDED_KEY) || "[]");
+    if (Array.isArray(saved)) saved.filter(id => typeof id === "string").slice(-200).forEach(id => expandedComposerQueues.add(id));
+  } catch { /* Keep the queue usable when browser storage is unavailable. */ }
+
+  function composerQueueViewKey() {
+    return JSON.stringify([state.activeProject?.id || "", state.activeThreadId || ""]);
+  }
+
+  function toggleComposerQueue() {
+    const tray = byId("composer-queue-tray");
+    const button = tray?.querySelector("[data-composer-queue-toggle]");
+    if (!button) return;
+    const expanded = button.getAttribute("aria-expanded") !== "true";
+    const key = composerQueueViewKey();
+    if (expanded) expandedComposerQueues.add(key);
+    else expandedComposerQueues.delete(key);
+    while (expandedComposerQueues.size > 200) expandedComposerQueues.delete(expandedComposerQueues.values().next().value);
+    try { sessionStorage.setItem(COMPOSER_QUEUE_EXPANDED_KEY, JSON.stringify([...expandedComposerQueues])); } catch { /* Preserve the in-memory choice. */ }
+    button.setAttribute("aria-expanded", String(expanded));
+    button.querySelector(".composer-queue-toggle-hint").textContent = expanded ? "Recolher" : "Mostrar";
+    tray.querySelector(".composer-queue-items").hidden = !expanded;
+  }
+
   function renderComposerQueue(pending) {
     const tray = byId("composer-queue-tray");
     if (!tray) return;
     const queued = pending.filter(item => item.status === "queued");
     tray.classList.toggle("hidden", !queued.length);
-    tray.innerHTML = queued.map((item, index) => `
+    const expanded = expandedComposerQueues.has(composerQueueViewKey());
+    const focusedToggle = document.activeElement === tray.querySelector("[data-composer-queue-toggle]");
+    const listScrollTop = tray.querySelector(".composer-queue-items")?.scrollTop || 0;
+    const rows = queued.map((item, index) => `
       <div class="composer-queue-row" data-queue-id="${escape(item.id)}" data-queue-thread="${escape(state.activeThreadId)}">
         <div class="composer-queue-preview">${queuePreview(item)}</div>
         <div class="composer-queue-copy"><strong>${escape(item.message)}</strong><small>${(item.references || []).length ? `${item.references.length} anexo(s) ou referência(s)` : "Aguardando a execução atual"}</small></div>
@@ -145,16 +174,29 @@
           <button type="button" class="composer-queue-delete" data-queue-delete="${escape(item.id)}" aria-label="Excluir da fila">⌫</button>
         </div>
       </div>`).join("");
+    tray.innerHTML = queued.length ? `<button type="button" class="composer-queue-toggle" data-composer-queue-toggle aria-expanded="${expanded}" aria-controls="composer-queue-items">
+      <span>${queued.length} ${queued.length === 1 ? "orientação" : "orientações"} na fila</span>
+      <span class="composer-queue-toggle-hint">${expanded ? "Recolher" : "Mostrar"}</span>
+    </button><div id="composer-queue-items" class="composer-queue-items"${expanded ? "" : " hidden"}>${rows}</div>` : "";
+    if (queued.length) {
+      tray.querySelector(".composer-queue-items").scrollTop = listScrollTop;
+      if (focusedToggle) tray.querySelector("[data-composer-queue-toggle]").focus({preventScroll:true});
+    }
   }
 
   async function addMessageToQueue() {
     const message = selectors.prompt.value.trim();
     if (!message) return;
     if (!state.activeThreadId) return sendMessage();
+    const viewGeneration = state.conversationViewGeneration;
+    const threadId = state.activeThreadId;
+    const submissionDraft = beginComposerSubmission();
     try {
-      await api(`/api/threads/${encodeURIComponent(state.activeThreadId)}/queue`, {method:"POST", body:JSON.stringify(activePayload(message))});
-      selectors.prompt.value = "";
-      clearComposerDraft();
+      await api(`/api/threads/${encodeURIComponent(threadId)}/queue`, {method:"POST", body:JSON.stringify(activePayload(message))});
+      finishComposerSubmission(submissionDraft, true);
+      if (state.conversationViewGeneration !== viewGeneration || state.activeThreadId !== threadId) return;
+      // Keep text and references entered while the queue request was pending.
+      if (composerDraftText()) { await loadOperationQueue(); return; }
       state.references = [];
       state.composerMode = null;
       renderOperationReferences();
@@ -163,8 +205,99 @@
       await loadOperationQueue();
       toast("Comando adicionado à fila.", "success");
       finishDeferredSystemUpdateReload();
-    } catch (error) { toast(error.message, "error"); }
+    } catch (error) { finishComposerSubmission(submissionDraft, false); toast(error.message, "error"); }
   }
+
+  // The editor lives outside the queue lists, so live refreshes keep the draft intact.
+  let queueEditor = null;
+
+  function openQueueEditor(item, threadId) {
+    if (queueEditor) return;
+    const dialog = byId("queue-editor-dialog");
+    queueEditor = {threadId, itemId:item.id, original:String(item.message || ""), saving:false};
+    byId("queue-editor-message").value = queueEditor.original;
+    byId("queue-editor-context").textContent = [item.project_name, item.thread_title].filter(Boolean).join(" • ") || "Mensagem na fila da conversa";
+    byId("queue-editor-error").textContent = "";
+    dialog.classList.remove("expanded");
+    byId("queue-editor-expand").setAttribute("aria-pressed", "false");
+    byId("queue-editor-expand").textContent = "Expandir";
+    dialog.showModal();
+    byId("queue-editor-message").focus({preventScroll:true});
+    byId("queue-editor-message").setSelectionRange(0, 0);
+  }
+
+  function closeQueueEditor() {
+    if (!byId("queue-editor-dialog")?.open) return false;
+    if (!queueEditor?.saving) byId("queue-editor-dialog").close();
+    return true;
+  }
+
+  async function saveQueueEditor(event) {
+    event.preventDefault();
+    const editing = queueEditor;
+    if (!editing || editing.saving) return;
+    const input = byId("queue-editor-message");
+    const message = input.value.trim();
+    const error = byId("queue-editor-error");
+    if (!message) {
+      error.textContent = "Escreva uma mensagem antes de salvar.";
+      input.focus();
+      return;
+    }
+    editing.saving = true;
+    error.textContent = "";
+    input.readOnly = true;
+    const buttons = [...byId("queue-editor-dialog").querySelectorAll("button")];
+    buttons.forEach(button => { button.disabled = true; });
+    byId("queue-editor-save").textContent = "Salvando…";
+    try {
+      const endpoint = `/api/threads/${encodeURIComponent(editing.threadId)}/queue`;
+      const latest = await api(endpoint);
+      const item = (latest.items || []).find(item => item.id === editing.itemId);
+      if (!item || item.status !== "queued") throw new Error("Esta orientação já saiu da fila. Seu texto continua aqui para você copiar.");
+      if (String(item.message || "") !== editing.original) throw new Error("Esta orientação foi alterada em outro lugar. Seu texto foi mantido aqui; reabra a edição para conferir a versão atual.");
+      await api(`${endpoint}/${encodeURIComponent(editing.itemId)}`, {method:"PATCH", body:JSON.stringify({message})});
+      editing.saving = false;
+      byId("queue-editor-dialog").close();
+      toast("Orientação da fila atualizada.", "success");
+      await loadOperationQueue();
+    } catch (failure) {
+      error.textContent = failure.message || "Não foi possível salvar. O texto foi preservado; tente novamente.";
+    } finally {
+      editing.saving = false;
+      input.readOnly = false;
+      buttons.forEach(button => { button.disabled = false; });
+      byId("queue-editor-save").textContent = "Salvar";
+    }
+  }
+
+  function installQueueEditor() {
+    const dialog = byId("queue-editor-dialog");
+    if (!dialog) return;
+    byId("queue-editor-form").addEventListener("submit", saveQueueEditor);
+    byId("queue-editor-cancel").addEventListener("click", closeQueueEditor);
+    byId("queue-editor-close").addEventListener("click", closeQueueEditor);
+    byId("queue-editor-expand").addEventListener("click", () => {
+      const expanded = dialog.classList.toggle("expanded");
+      byId("queue-editor-expand").setAttribute("aria-pressed", String(expanded));
+      byId("queue-editor-expand").textContent = expanded ? "Reduzir" : "Expandir";
+    });
+    dialog.addEventListener("cancel", event => {
+      event.preventDefault();
+      closeQueueEditor();
+    });
+    dialog.addEventListener("close", () => {
+      queueEditor = null;
+      byId("queue-editor-message").value = "";
+      finishDeferredSystemUpdateReload();
+    });
+    window.closeQueueEditor = closeQueueEditor;
+    window.hasQueueEditorDraft = () => Boolean(queueEditor && (queueEditor.saving || byId("queue-editor-message").value !== queueEditor.original));
+    window.addEventListener("beforeunload", event => {
+      if (window.hasQueueEditorDraft()) { event.preventDefault(); event.returnValue = ""; }
+    });
+  }
+  installQueueEditor();
 
   async function mutateQueue(action, itemId, requestedThreadId = "") {
     const threadId = requestedThreadId || state.activeThreadId;
@@ -186,8 +319,8 @@
     } else if (action === "delete") {
       await api(`/api/threads/${encodeURIComponent(threadId)}/queue/${encodeURIComponent(itemId)}`, {method:"DELETE"});
     } else if (action === "edit") {
-      const message = window.prompt("Editar comando da fila:", sourceQueue[index].message);
-      if (message?.trim()) await api(`/api/threads/${encodeURIComponent(threadId)}/queue/${encodeURIComponent(itemId)}`, {method:"PATCH", body:JSON.stringify({message:message.trim()})});
+      openQueueEditor(sourceQueue[index], threadId);
+      return;
     } else {
       const offset = action === "up" ? -1 : 1;
       const next = index + offset;
@@ -337,13 +470,10 @@
   }
 
   function decorateThreadRows() {
-    [...selectors.threadList.querySelectorAll(".nav-item")].forEach((row, index) => {
-      const thread = state.threads.filter(thread => {
-        const q = byId("thread-search").value.trim().toLowerCase();
-        return !q || `${thread.name || ""} ${thread.preview || ""}`.toLowerCase().includes(q);
-      })[index];
+    const threadsById = new Map(state.threads.map(thread => [thread.id, thread]));
+    [...selectors.threadList.querySelectorAll(".nav-item")].forEach(row => {
+      const thread = threadsById.get(row.dataset.threadId);
       if (!thread) return;
-      row.dataset.threadId = thread.id;
       if (thread.clc?.pinned && !row.querySelector(".pin-mark")) row.querySelector(".nav-copy")?.insertAdjacentHTML("afterbegin", '<span class="pin-mark" title="Fixada">◆</span>');
       row.insertAdjacentHTML("beforeend", `<span class="row-menu-button" role="button" tabindex="0" data-thread-menu="${escape(thread.id)}" aria-label="Opções da conversa">•••</span>`);
     });
@@ -489,6 +619,10 @@
   }
 
   document.addEventListener("click", event => {
+    if (event.target.closest("[data-composer-queue-toggle]")) {
+      toggleComposerQueue();
+      return;
+    }
     const rail = event.target.closest("[data-operation-view]");
     if (rail) activateOperationView(rail.dataset.operationView);
     const menu = event.target.closest("[data-thread-menu]");

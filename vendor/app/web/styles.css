@@ -179,6 +179,18 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 .automation-card-foot { display: flex; align-items: center; justify-content: space-between; min-width: 0; gap: 10px; margin-top: 12px; color: var(--muted); font-size: 11px; }
 .automation-card-foot code { overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; }
 .automation-card-foot span { flex: 0 0 auto; }
+.automation-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+.automation-actions button { min-height: 36px; padding: 7px 12px; }
+.dialog.automation-edit-dialog { width: min(560px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); padding: 24px; }
+.dialog .automation-edit-form { display: grid; gap: 17px; }
+.automation-edit-form .dialog-header { display: flex; justify-content: space-between; gap: 16px; }
+.automation-edit-form .dialog-header p { margin: 4px 0 0; color: var(--muted); }
+.automation-edit-form label { display: grid; gap: 7px; font-weight: 700; }
+.dialog.automation-edit-dialog input, .dialog.automation-edit-dialog select { min-width: 0; width: 100%; padding: 10px 12px; color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: 9px; font: inherit; }
+.automation-edit-form small, .automation-edit-help { color: var(--muted); font-size: 12px; font-weight: 400; line-height: 1.45; }
+.automation-edit-help { margin: -8px 0 0; overflow-wrap: anywhere; }
+.automation-edit-actions { position: sticky; bottom: -24px; display: flex; justify-content: flex-end; gap: 9px; margin: 0 -24px -24px; padding: 12px 24px; background: var(--surface); border-top: 1px solid var(--border); }
+.automation-edit-actions button { min-height: 40px; padding: 8px 13px; }
 .automation-empty { grid-column: 1 / -1; }
 .automation-empty > span { font-size: 42px; color: var(--accent); }
 .automation-empty p { max-width: 480px; margin: 0; line-height: 1.5; }
@@ -213,6 +225,9 @@ button:disabled { cursor: not-allowed; opacity: .45; }
   .automation-card { padding: 14px; border-radius: 15px; }
   .automation-card-head { grid-template-columns: auto minmax(0, 1fr); }
   .automation-open-thread { grid-column: 1 / -1; width: 100%; }
+  .automation-actions { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .automation-actions button { min-width: 0; padding: 8px 4px; }
+  .dialog.automation-edit-dialog { width: 100vw; max-height: 100dvh; min-height: 100dvh; margin: 0; border: 0; border-radius: 0; }
   .automation-prompt { margin: 13px 0; }
   .automation-metrics { grid-template-columns: 1fr; }
   .automation-metrics strong { white-space: normal; }
@@ -511,6 +526,8 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 .credential-field { display: grid; gap: 5px; color: var(--text); font-size: 12px; font-weight: 750; }
 .credential-field input { width: 100%; min-width: 0; min-height: 42px; padding: 9px 11px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface-2); color: var(--text); font: inherit; }
 .credential-field input:focus { outline: 2px solid color-mix(in srgb, var(--accent) 40%, transparent); border-color: var(--accent); }
+.credential-remember { display: flex; align-items: flex-start; gap: 8px; margin-top: 9px; color: var(--muted); font-size: 11px; line-height: 1.35; }
+.credential-remember input { flex: 0 0 auto; width: 16px; height: 16px; margin: 0; accent-color: var(--accent); }
 .credential-modal-layer { position: fixed; z-index: 100; inset: 0; display: grid; place-items: center; padding: max(12px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right)) max(12px, env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left)); overflow: hidden; overscroll-behavior: contain; background: rgba(10,18,32,.24); pointer-events: none; }
 .credential-modal-stack { width: min(400px, calc(100vw - 24px)); max-height: calc(100dvh - 24px); display: flex; flex-direction: column; gap: 9px; overflow: auto; overscroll-behavior: contain; scrollbar-width: thin; pointer-events: auto; }
 .credential-modal-layer .credential-approval-card { width: 100%; max-height: min(440px, calc(100dvh - 24px)); align-self: stretch; flex: 0 0 auto; padding: 10px 11px; border-radius: 14px; background: var(--surface); box-shadow: 0 22px 70px rgba(10,18,32,.36); }
@@ -525,6 +542,7 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 .credential-modal-layer .credential-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
 .credential-modal-layer .credential-field { gap: 3px; font-size: 11px; }
 .credential-modal-layer .credential-field input { min-height: 36px; padding: 7px 9px; border-radius: 8px; }
+.credential-modal-layer .credential-remember { margin-top: 6px; font-size: 9px; }
 .credential-modal-layer .approval-timeout-note { margin-top: 4px; font-size: 9px; }
 .credential-modal-layer .approval-actions { justify-content: flex-end; gap: 6px; margin-top: 5px; padding: 0; overflow: visible; }
 .credential-modal-layer .approval-actions button { min-height: 34px; padding: 6px 10px; font-size: 11px; }
@@ -2732,3 +2750,53 @@ body[data-install-mode="projects"] [data-settings-jump="system-control"],
 body[data-install-mode="projects"] #system-control {
   display: none !important;
 }
+/* Spacious queue editor; the textarea, not the window, scrolls on small screens. */
+.dialog.queue-editor-dialog {
+  width: min(920px, calc(100vw - 24px));
+  height: min(780px, calc(var(--app-height, 100dvh) * .82));
+  max-width: calc(100vw - 16px); max-height: calc(var(--app-height, 100dvh) - 16px);
+  padding: 20px; overflow: hidden;
+}
+.dialog.queue-editor-dialog.expanded {
+  width: calc(100vw - 16px); height: calc(var(--app-height, 100dvh) - 16px);
+}
+.queue-editor-dialog form { height: 100%; min-height: 0; gap: 10px; }
+.queue-editor-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-shrink: 0; }
+.queue-editor-header h2 { margin: 0; font-size: 20px; }
+.queue-editor-window-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.queue-editor-dialog .queue-editor-context { margin: 0; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex-shrink: 0; }
+.queue-editor-dialog .queue-editor-field { flex: 1; min-height: 0; }
+.queue-editor-field textarea {
+  flex: 1; min-width: 0; min-height: 0; width: 100%; resize: none;
+  border: 1px solid var(--border); border-radius: 10px; padding: 14px;
+  background: var(--surface-2); color: var(--text); font-size: 16px; font-weight: 400; line-height: 1.6;
+  overflow: auto;
+}
+.queue-editor-field textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.queue-editor-dialog .queue-editor-error { margin: 0; color: var(--danger); font-size: 13px; max-height: 4.5em; overflow: auto; flex-shrink: 0; }
+.queue-editor-error:empty { display: none; }
+.queue-editor-actions { display: flex; justify-content: flex-end; gap: 8px; flex-shrink: 0; }
+.queue-editor-dialog button { min-height: 44px; }
+@media (max-width: 600px), (max-height: 500px) {
+  .dialog.queue-editor-dialog { padding: 12px; border-radius: 12px; height: calc(var(--app-height, 100dvh) * .86); }
+  .dialog.queue-editor-dialog.expanded { height: calc(var(--app-height, 100dvh) - 16px); }
+  .queue-editor-header { gap: 6px; }
+  .queue-editor-header h2 { font-size: 17px; }
+  .queue-editor-window-actions { gap: 4px; }
+  .queue-editor-dialog form { gap: 7px; }
+  .queue-editor-field textarea { padding: 10px; line-height: 1.45; }
+}
+
+/* Collapse the queue above the composer as one group, preserving all row actions. */
+.composer-queue-tray { max-height: none; overflow: hidden; padding: 0; }
+.composer-queue-toggle {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  width: 100%; min-height: 44px; padding: 9px 12px; border: 0;
+  border-radius: inherit; background: transparent; color: var(--text);
+  font-size: 13px; font-weight: 650; text-align: left; cursor: pointer;
+}
+.composer-queue-toggle:hover { background: var(--surface-3); }
+.composer-queue-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: -3px; }
+.composer-queue-toggle-hint { flex-shrink: 0; color: var(--accent); font-size: 12px; }
+.composer-queue-items { max-height: min(200px, 24dvh); overflow: auto; overscroll-behavior: contain; padding: 4px; border-top: 1px solid var(--border); }
+.composer-queue-items[hidden] { display: none; }

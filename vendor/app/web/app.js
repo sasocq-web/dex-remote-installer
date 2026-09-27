@@ -10,6 +10,8 @@ const THREAD_TERMINAL_STATUS_KEY = "codex-linux-control.thread-terminal-statuses
 const CONVERSATION_APPROVAL_RULES_KEY = "codex-linux-control.conversation-approval-rules.v1";
 const SYSTEM_UPDATE_AUTOMATIC_KEY = "codex-linux-control.system-update-automatic.v1";
 const COMPOSER_DRAFT_STORAGE_KEY = "codex-linux-control.composer-draft.v1";
+const COMPOSER_DRAFT_PREFIX = "codex-linux-control.composer-drafts.v2:";
+const COMPOSER_DRAFT_LAST_KEY = "codex-linux-control.composer-drafts.last.v2";
 const COMPOSER_DRAFT_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const RECENT_PROJECT_LIMIT = 5;
 const PROJECT_CONVERSATION_LIMIT = 100;
@@ -47,25 +49,30 @@ function loadProjectUsage() {
   }
 }
 
-function loadComposerDraft() {
+function composerDraftKey(context) {
+  return COMPOSER_DRAFT_PREFIX + JSON.stringify([String(context?.project_id || ""), String(context?.thread_id || "")]);
+}
+
+function loadComposerDraft(context = null) {
   try {
-    const saved = JSON.parse(localStorage.getItem(COMPOSER_DRAFT_STORAGE_KEY) || "null");
-    const text = typeof saved?.text === "string" ? saved.text.slice(0, 200000) : "";
-    const updatedAt = Number(saved?.updated_at || 0);
-    if (!text || !updatedAt || Date.now() - updatedAt > COMPOSER_DRAFT_MAX_AGE_MS) {
-      try { localStorage.removeItem(COMPOSER_DRAFT_STORAGE_KEY); } catch {}
-      return null;
+    let legacy = null;
+    try { legacy = JSON.parse(localStorage.getItem(COMPOSER_DRAFT_STORAGE_KEY) || "null"); } catch {}
+    if (legacy?.text && legacy.project_id) {
+      const key = composerDraftKey(legacy);
+      try {
+        if (!localStorage.getItem(key)) localStorage.setItem(key, JSON.stringify(legacy));
+        if (!localStorage.getItem(COMPOSER_DRAFT_LAST_KEY)) localStorage.setItem(COMPOSER_DRAFT_LAST_KEY, key);
+        localStorage.removeItem(COMPOSER_DRAFT_STORAGE_KEY);
+      } catch { /* Preserve the legacy copy if migration cannot be committed. */ }
     }
-    return {
-      text,
-      project_id:String(saved.project_id || ""),
-      thread_id:String(saved.thread_id || ""),
-      updated_at:updatedAt,
-    };
-  } catch {
-    try { localStorage.removeItem(COMPOSER_DRAFT_STORAGE_KEY); } catch {}
-    return null;
-  }
+    const key = context ? composerDraftKey(context) : (localStorage.getItem(COMPOSER_DRAFT_LAST_KEY) || (legacy?.project_id ? composerDraftKey(legacy) : null));
+    if (!key?.startsWith(COMPOSER_DRAFT_PREFIX)) return null;
+    const saved = JSON.parse(localStorage.getItem(key) || "null") || (legacy && composerDraftKey(legacy) === key ? legacy : null);
+    if (typeof saved?.text !== "string" || !saved.text || !Number(saved.updated_at)
+      || Date.now() - Number(saved.updated_at) > COMPOSER_DRAFT_MAX_AGE_MS
+      || composerDraftKey(saved) !== key) return null;
+    return {...saved, text:saved.text.slice(0, 200000)};
+  } catch { return null; }
 }
 
 function emptyComposerPreferences(networkAccess = "enabled") {
@@ -145,11 +152,19 @@ const state = {
   composerPreferences: emptyComposerPreferences(initialComposerPreferenceStore.networkAccess),
   composerDraft: loadComposerDraft(),
   composerDraftRestored: false,
+  composerDraftContext: null,
+  composerDrafts: new Map(),
+  composerDraftSubmissions: new Map(),
+  composerDraftStorageFailures: new Set(),
   threads: [],
   projectThreads: loadCachedThreadSummaries(),
   threadTerminalStatuses: loadThreadTerminalStatuses(),
   threadDetails: new Map(),
   messageRenderLimit: 100,
+  historyActivityGroups: new Map(),
+  expandedHistoryGroups: new Set(),
+  threadHistory: null,
+  threadHistoryLoading: null,
   threadLoadGeneration: 0,
   threadSearch: {query:"", results:[], loading:false, error:"", generation:0, timer:null},
   conversationViewGeneration: 0,
@@ -1343,7 +1358,7 @@ async function initializeMainInterface() {
   }
   const statusPromise = loadStatus({light:true});
   await loadProjects({loadConversationList:false});
-  await window.loadSiteAccessPolicies?.({policiesOnly:true}).catch(error => console.warn("Políticas de sites indisponíveis", error));
+  void window.loadSiteAccessPolicies?.({policiesOnly:true}).catch(error => console.warn("Políticas de sites indisponíveis", error));
   await statusPromise;
   void refreshUpdateControl();
   clearInterval(state.systemUpdateAutomaticTimer);
@@ -1381,33 +1396,98 @@ function composerDraftText() {
   return String(selectors.prompt?.value || "");
 }
 
-function persistComposerDraft() {
-  const text = composerDraftText();
-  if (!text) {
-    state.composerDraft = null;
-    try { localStorage.removeItem(COMPOSER_DRAFT_STORAGE_KEY); } catch {}
-    return null;
-  }
-  const previous = state.composerDraft || {};
-  const activeProjectId = String(state.activeProject?.id || "");
-  const draft = {
-    text:text.slice(0, 200000),
-    project_id:activeProjectId || String(previous.project_id || ""),
-    thread_id:activeProjectId
-      ? String(state.activeThreadId || "")
-      : String(previous.thread_id || ""),
-    updated_at:Date.now(),
-  };
-  state.composerDraft = draft;
-  try { localStorage.setItem(COMPOSER_DRAFT_STORAGE_KEY, JSON.stringify(draft)); }
-  catch { /* O rascunho continua no campo quando o armazenamento está indisponível. */ }
+function currentComposerDraft(context = state.composerDraftContext) {
+  if (!context) return null;
+  const key = composerDraftKey(context);
+  if (state.composerDraftStorageFailures.has(key)) return state.composerDrafts.get(key) || null;
+  try {
+    // Probe access separately: loadComposerDraft intentionally tolerates corrupt storage.
+    localStorage.getItem(key);
+    const saved = loadComposerDraft(context);
+    if (saved) state.composerDrafts.set(key, saved);
+    else state.composerDrafts.delete(key);
+    return saved;
+  } catch { return state.composerDrafts.get(key) || null; }
+}
+
+function writeComposerDraft(draft) {
+  const key = composerDraftKey(draft);
+  state.composerDrafts.set(key, draft);
+  try {
+    localStorage.setItem(key, JSON.stringify(draft));
+    state.composerDraftStorageFailures.delete(key);
+    localStorage.setItem(COMPOSER_DRAFT_LAST_KEY, key);
+  } catch { state.composerDraftStorageFailures.add(key); }
   return draft;
 }
 
-function clearComposerDraft() {
-  state.composerDraft = null;
-  try { localStorage.removeItem(COMPOSER_DRAFT_STORAGE_KEY); }
-  catch { /* Não há ação adicional segura quando o armazenamento está indisponível. */ }
+function persistComposerDraft() {
+  // Before initialization there is no owner; never overwrite a saved draft.
+  if (!state.composerDraftContext) {
+    if (!composerDraftText()) return null;
+    state.composerDraftContext = {project_id:String(state.activeProject?.id || ""), thread_id:String(state.activeThreadId || "")};
+  }
+  const context = state.composerDraftContext;
+  const text = composerDraftText().slice(0, 200000);
+  const previous = currentComposerDraft(context);
+  if (!text) {
+    const pending = state.composerDraftSubmissions.get(composerDraftKey(context));
+    if (pending && previous?.revision === pending.revision) return previous;
+    clearComposerDraft();
+    return null;
+  }
+  if (previous?.text === text) return previous;
+  return writeComposerDraft({...context, text, updated_at:Date.now(), revision:crypto.randomUUID()});
+}
+
+function clearComposerDraft(expected = null) {
+  const context = expected || state.composerDraftContext;
+  if (!context) return;
+  const key = composerDraftKey(context);
+  const saved = currentComposerDraft(context);
+  if (expected && (!saved || saved.revision !== expected.revision || saved.text !== expected.text)) return;
+  state.composerDrafts.delete(key);
+  try { localStorage.removeItem(key); state.composerDraftStorageFailures.delete(key); }
+  catch { state.composerDraftStorageFailures.add(key); }
+}
+
+function switchComposerDraft(projectId, threadId = "") {
+  persistComposerDraft();
+  state.composerDraftContext = {project_id:String(projectId || ""), thread_id:String(threadId || "")};
+  const draft = currentComposerDraft();
+  selectors.prompt.value = draft?.text || "";
+  autoResizePrompt();
+}
+
+function beginComposerSubmission() {
+  const draft = persistComposerDraft();
+  if (draft) state.composerDraftSubmissions.set(composerDraftKey(draft), draft);
+  return draft;
+}
+
+function finishComposerSubmission(draft, success) {
+  if (!draft) return;
+  const key = composerDraftKey(draft);
+  if (state.composerDraftSubmissions.get(key) === draft) state.composerDraftSubmissions.delete(key);
+  const saved = currentComposerDraft(draft);
+  const unchanged = saved?.revision === draft.revision && saved?.text === draft.text;
+  const visible = state.composerDraftContext && composerDraftKey(state.composerDraftContext) === key;
+  if (success) {
+    clearComposerDraft(draft);
+    if (visible && unchanged && composerDraftText() === draft.text) selectors.prompt.value = "";
+  } else if (visible && unchanged && !composerDraftText()) selectors.prompt.value = draft.text;
+  if (visible) autoResizePrompt();
+}
+
+function adoptCreatedThreadDraft(threadId, origin) {
+  if (!threadId || !origin) return;
+  // Follow-up text belongs to the new thread even if the user has already navigated away.
+  const visible = state.composerDraftContext && composerDraftKey(state.composerDraftContext) === composerDraftKey(origin);
+  const draft = visible ? persistComposerDraft() : currentComposerDraft(origin);
+  if (draft) clearComposerDraft(draft);
+  const context = {project_id:String(origin.project_id || ""), thread_id:String(threadId)};
+  if (draft) writeComposerDraft({...draft, ...context});
+  if (visible) state.composerDraftContext = context;
 }
 
 async function restoreComposerDraft() {
@@ -1416,17 +1496,17 @@ async function restoreComposerDraft() {
   const draft = state.composerDraft;
   if (!draft?.text || composerDraftText()) return false;
   const project = state.projects.find(item => item.id === draft.project_id);
-  if (project && state.activeProject?.id !== project.id) await selectProject(project.id);
-  if (project && draft.thread_id && state.activeThreadId !== draft.thread_id) await openThread(draft.thread_id);
-  if (composerDraftText()) return false;
-  selectors.prompt.value = draft.text;
-  autoResizePrompt();
-  selectors.prompt.focus();
-  toast("Seu rascunho foi restaurado.", "success");
-  return true;
+  // A missing project must never restore its text into a different conversation.
+  if (!project) return false;
+  if (state.activeProject?.id !== project.id) await selectProject(project.id);
+  if (draft.thread_id && state.activeThreadId !== draft.thread_id) await openThread(draft.thread_id);
+  if (state.activeProject?.id !== draft.project_id || String(state.activeThreadId || "") !== String(draft.thread_id || "")) return false;
+  if (!composerDraftText()) switchComposerDraft(draft.project_id, draft.thread_id);
+  return Boolean(composerDraftText());
 }
 
 function hasUnsentComposerDraft() {
+  if (window.hasQueueEditorDraft?.()) return true;
   return Boolean(composerDraftText().trim());
 }
 
@@ -1809,16 +1889,18 @@ async function openNotificationTarget(payload = null) {
 
 async function loadStatus({light = false} = {}) {
   const data = await api(light ? "/api/status?light=true" : "/api/status");
-  state.lastStatus = data;
+  state.lastStatus = light ? {...(state.lastStatus || {}), ...data} : data;
   const legacy = data.bridge || {};
   state.bridges = {
     system: {...(data.bridges?.system || legacy)},
     projects: {...(data.bridges?.projects || {})},
   };
   syncActiveBridgeUI();
-  if (state.identity === "localhost") await loadPairedDevices();
-  renderSettings(data);
-  void refreshRemoteStatus().catch(() => null);
+  if (!light) {
+    if (state.identity === "localhost") await loadPairedDevices();
+    renderSettings(data);
+    void refreshRemoteStatus().catch(() => null);
+  }
   return data;
 }
 
@@ -2849,10 +2931,13 @@ function renderProjects() {
 }
 
 async function clearProjectSelection() {
+  switchComposerDraft("", "");
   state.conversationViewGeneration += 1;
   state.threadLoadId = crypto.randomUUID();
   state.activeProject = null;
   state.activeThreadId = null;
+  state.threadHistory = null;
+  state.threadHistoryLoading = null;
   state.activeTurnId = null;
   state.items.clear();
   state.diff = "";
@@ -3166,12 +3251,15 @@ async function loadToolProfile(threadId = state.activeThreadId) {
 async function selectProject(projectId) {
   const project = state.projects.find(item => item.id === projectId);
   if (!project) return;
+  switchComposerDraft(project.id, "");
   if (project.kind !== "system") markProjectUsed(project.id);
   state.conversationViewGeneration += 1;
   state.threadLoadId = crypto.randomUUID();
   state.activeProject = project;
   state.composerPreferences = composerPreferencesForProject(project);
   state.activeThreadId = null;
+  state.threadHistory = null;
+  state.threadHistoryLoading = null;
   state.activeTurnId = null;
   state.items.clear();
   state.diff = "";
@@ -3230,17 +3318,16 @@ function conversationExecutionTiming(thread) {
 }
 
 async function enrichActiveThreadExecution(project, threads) {
-  const active = threads.filter(thread => thread?.status?.type === "active" && thread.id);
-  await Promise.all(active.map(async thread => {
-    try {
-      const query = new URLSearchParams({project_id:project.id});
-      const data = await api(`/api/threads/${encodeURIComponent(thread.id)}?${query}`);
-      if (!data?.thread) return;
-      thread.clc = {...(thread.clc || {}), execution_timing:conversationExecutionTiming(data.thread)};
-    } catch (error) {
-      console.warn(`Não foi possível calcular o tempo acumulado da conversa ${thread.id}:`, error);
+  // Lifecycle events persist timing in each summary. Downloading every active
+  // history here held the list behind megabytes of tool output and images.
+  // Only reuse an already loaded history for legacy summaries lacking timing.
+  for (const thread of threads) {
+    if (thread.clc?.execution_timing?.turn_count) continue;
+    const cached = state.threadDetails.get(thread.id);
+    if (cached?.turns?.length && thread.status?.type !== "active") {
+      thread.clc = {...(thread.clc || {}), execution_timing:conversationExecutionTiming(cached)};
     }
-  }));
+  }
   return threads;
 }
 
@@ -3584,7 +3671,7 @@ function conversationItemsForDisplay(items) {
   const compact = [];
   let newerTechnicalActivityCompleted = false;
   for (const item of items) {
-    const technicalActivity = ["commandExecution", "fileChange", "mcpToolCall"].includes(item.type);
+    const technicalActivity = ["commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall"].includes(item.type);
     const handledFailure = technicalActivity
       && item.status === "failed"
       && newerTechnicalActivityCompleted;
@@ -3603,6 +3690,40 @@ function conversationItemsForDisplay(items) {
     if (technicalActivity && item.status === "completed") newerTechnicalActivityCompleted = true;
   }
   return compact;
+}
+
+function groupCompletedTurnActivities(items) {
+  const groups = new Map();
+  const output = [];
+  state.historyActivityGroups = new Map();
+  for (const item of items) {
+    if (!item._historyTurnComplete || !item._historyTurnId || item._historyFinal || isUserMessageItem(item) || item.type === "error") {
+      output.push(item);
+      continue;
+    }
+    const key = item._historyTurnId;
+    let group = groups.get(key);
+    if (!group) {
+      group = {id:`history-steps-${key}`, type:"completedTurnActivities", items:[]};
+      groups.set(key, group);
+      state.historyActivityGroups.set(group.id, group);
+      output.push(group);
+    }
+    group.items.push(item);
+  }
+  return output;
+}
+
+function completedTurnActivitiesHTML(group) {
+  return groupTechnicalActivities(groupAndroidActivities(groupBrowserActivities(group.items))).map(itemCard).join("");
+}
+
+function completedTurnActivitiesCard(group) {
+  const expanded = state.expandedHistoryGroups.has(group.id);
+  return `<details class="technical-activity-group" data-history-group="${escapeHTML(group.id)}" data-item-id="${escapeHTML(group.id)}" ${expanded ? "open" : ""}>
+    <summary><span>Etapas intermediárias · ${group.items.length} itens</span><span class="technical-activity-group-hint">Ver detalhes</span></summary>
+    <div class="technical-activity-group-items">${expanded ? completedTurnActivitiesHTML(group) : ""}</div>
+  </details>`;
 }
 
 function isCodexMessageItem(item) {
@@ -3689,7 +3810,7 @@ function groupBrowserActivities(items) {
 }
 
 function groupTechnicalActivities(items) {
-  const technicalTypes = new Set(["commandExecution", "fileChange", "mcpToolCall"]);
+  const technicalTypes = new Set(["commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall"]);
   const groups = new Map();
   let segment = 0;
   items.forEach((item, index) => {
@@ -3984,6 +4105,7 @@ function renderThreads() {
   visibleThreads.forEach(thread => {
     const button = document.createElement("button");
     button.className = `nav-item recent-thread-card ${state.activeThreadId === thread.id ? "active" : ""}`;
+    button.dataset.threadId = thread.id;
     const title = conversationTitle(thread);
     const cleanedPreview = visibleConversationText(thread.clc?.request_preview || thread.preview);
     const matchedPreview = query ? String(thread.search?.snippet || "").trim() : "";
@@ -4012,6 +4134,7 @@ function renderThreads() {
 async function openThread(threadId) {
   const threadSummary = state.threads.find(thread => thread.id === threadId);
   const projectId = threadSummary?._projectId || state.activeProject?.id;
+  switchComposerDraft(projectId, threadId);
   const loadId = crypto.randomUUID();
   state.conversationViewGeneration += 1;
   state.conversationAutoFollow = true;
@@ -4020,6 +4143,8 @@ async function openThread(threadId) {
   state.threadLoadId = loadId;
   state.activeThreadId = threadId;
   state.messageRenderLimit = 100;
+  state.threadHistory = null;
+  state.threadHistoryLoading = null;
   state.activeTurnId = null;
   state.turnSubmissionPending = false;
   state.items.clear();
@@ -4041,7 +4166,7 @@ async function openThread(threadId) {
   if (cachedThread) hydrateThread(cachedThread);
   try {
     void loadToolProfile(threadId);
-    const data = await api(`/api/threads/${encodeURIComponent(threadId)}?project_id=${encodeURIComponent(projectId)}`);
+    const data = await api(`/api/threads/${encodeURIComponent(threadId)}?project_id=${encodeURIComponent(projectId)}&item_limit=200`);
     if (state.threadLoadId !== loadId || state.activeThreadId !== threadId) return;
     state.threadDetails.set(threadId, data.thread || {});
     hydrateThread(data.thread || {});
@@ -4051,6 +4176,7 @@ async function openThread(threadId) {
 }
 
 function hydrateThread(thread) {
+  state.threadHistory = thread._history || null;
   state.items.clear();
   state.activeTurnId = null;
   state.turnSubmissionPending = false;
@@ -4070,7 +4196,12 @@ function hydrateThread(thread) {
     terminal = state.threadTerminalStatuses.get(threadId);
   }
   for (const turn of turns) {
-    for (const item of turn.items || []) state.items.set(item.id || crypto.randomUUID(), item);
+    const turnItems = turn.items || [];
+    const completed = turn.status === "completed";
+    const final = completed ? [...turnItems].reverse().find(item => ["agentMessage", "assistantMessage", "agent_message"].includes(item.type)) : null;
+    for (const item of turnItems) state.items.set(item.id || crypto.randomUUID(), {...item,
+      _historyTurnId:item._historyTurnId || turn.id, _historyTurnComplete:completed,
+      _historyFinal:item._historyFinal ?? (item === final)});
     if (!terminal && turn.status === "inProgress") {
       state.activeTurnId = turn.id;
       state.activeTurnStartedAt = Date.parse(turn.startedAt || turn.started_at || "") || Date.now();
@@ -4095,12 +4226,15 @@ async function newThread() {
     }
     await selectProject(defaultProject.id);
   }
+  switchComposerDraft(state.activeProject.id, "");
   state.conversationViewGeneration += 1;
   state.conversationAutoFollow = true;
   state.conversationScrollInteractionUntil = 0;
   state.conversationScrollInteractionVersion += 1;
   state.threadLoadId = crypto.randomUUID();
   state.activeThreadId = null;
+  state.threadHistory = null;
+  state.threadHistoryLoading = null;
   state.activeTurnId = null;
   state.turnSubmissionPending = false;
   state.items.clear();
@@ -4357,6 +4491,7 @@ function androidActivityGroupCard(item) {
 function itemCard(item) {
   const type = item.type || "unknown";
   const id = item.id || "";
+  if (type === "completedTurnActivities") return completedTurnActivitiesCard(item);
   if (type === "technicalActivityGroup") return technicalActivityGroupCard(item);
   if (type === "browserActivityGroup") return browserActivityGroupCard(item);
   if (type === "androidActivityGroup") return androidActivityGroupCard(item);
@@ -4391,6 +4526,11 @@ function itemCard(item) {
     const status = item.status || "inProgress";
     const details = `<pre class="tool-output">${escapeHTML(`${item.server || "MCP"}/${item.tool || ""}\n${JSON.stringify(item.arguments || {}, null, 2)}`)}</pre>`;
     body = `<span class="tool-status ${escapeHTML(status)}">${escapeHTML(activityStatus(status))}</span><p>${escapeHTML(toolActivitySummary(item))}</p>${technicalDetails(details)}`;
+  } else if (type === "dynamicToolCall") {
+    label = "Atividade";
+    const status = item.status || "inProgress";
+    const details = `<pre class="tool-output">${escapeHTML(JSON.stringify(item, null, 2))}</pre>`;
+    body = `<span class="tool-status ${escapeHTML(status)}">${escapeHTML(activityStatus(status))}</span><p>${escapeHTML(toolActivitySummary(item))}</p>${technicalDetails(details)}`;
   } else if (type === "webSearch") {
     label = "Pesquisa web"; body = escapeHTML(item.query || JSON.stringify(item.action || {}));
   } else if (type === "imageView") {
@@ -4399,7 +4539,8 @@ function itemCard(item) {
     cls = "error"; label = "Erro"; body = escapeHTML(item.message || extractContent(item));
   } else {
     const text = extractContent(item);
-    body = text ? escapeHTML(text) : `<pre class="tool-output">${escapeHTML(JSON.stringify(item, null, 2))}</pre>`;
+    label = "Atividade";
+    body = technicalDetails(`<pre class="tool-output">${escapeHTML(text || JSON.stringify(item, null, 2))}</pre>`);
   }
   const handledFailureClass = item._failureHandled ? " handled-failure" : "";
   return `<article class="message-card ${cls}${handledFailureClass}" data-item-id="${escapeHTML(id)}"><div class="message-meta"><span>${escapeHTML(label)}</span>${item.status ? `<span>${escapeHTML(item.status)}</span>` : ""}</div><div class="message-body">${body}</div></article>`;
@@ -4411,19 +4552,19 @@ function executionStatusSummary() {
   if (waiting === "approval") return `${activeUserActionLabel()} ou recuse a solicitação para a conversa continuar.`;
   const recent = [...state.items.values()].reverse();
   const activeTechnical = recent.find(item =>
-    item.status === "inProgress" && ["commandExecution", "fileChange", "mcpToolCall"].includes(item.type));
+    item.status === "inProgress" && ["commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall"].includes(item.type));
   if (activeTechnical?.type === "commandExecution") return commandActivitySummary(activeTechnical);
   if (activeTechnical?.type === "fileChange") return "Atualizando os arquivos necessários.";
-  if (activeTechnical?.type === "mcpToolCall") return toolActivitySummary(activeTechnical);
+  if (["mcpToolCall", "dynamicToolCall"].includes(activeTechnical?.type)) return toolActivitySummary(activeTechnical);
   const reasoning = recent.find(item => item.type === "reasoning" && extractContent(item).trim());
   if (reasoning) {
     const summary = compactReasoningPreview(extractContent(reasoning));
     if (summary !== "Preparando a próxima etapa…") return summary;
   }
-  const lastTechnical = recent.find(item => ["commandExecution", "fileChange", "mcpToolCall"].includes(item.type));
+  const lastTechnical = recent.find(item => ["commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall"].includes(item.type));
   if (lastTechnical?.type === "commandExecution") return `Última etapa: ${commandActivitySummary(lastTechnical)} Preparando a próxima.`;
   if (lastTechnical?.type === "fileChange") return "Última etapa: arquivos atualizados. Preparando a próxima.";
-  if (lastTechnical?.type === "mcpToolCall") return `Última etapa: ${toolActivitySummary(lastTechnical)} Preparando a próxima.`;
+  if (["mcpToolCall", "dynamicToolCall"].includes(lastTechnical?.type)) return `Última etapa: ${toolActivitySummary(lastTechnical)} Preparando a próxima.`;
   return "Analisando a solicitação e preparando a próxima etapa.";
 }
 
@@ -4687,7 +4828,7 @@ function renderMessages() {
   if (state.conversationRenderTimer) clearTimeout(state.conversationRenderTimer);
   state.conversationRenderTimer = null;
   const scrollState = captureMessageScrollState();
-  const items = groupTechnicalActivities(groupAndroidActivities(groupBrowserActivities(conversationItemsForDisplay([...state.items.values()].reverse()))));
+  const items = groupTechnicalActivities(groupAndroidActivities(groupBrowserActivities(groupCompletedTurnActivities(conversationItemsForDisplay([...state.items.values()].reverse())))));
   state.browserPreviewGroupId = items.find(item => item?.type === "browserActivityGroup")?.id || "";
   const visibleItems = items.slice(0, state.messageRenderLimit);
   selectors.empty.classList.toggle("hidden", items.length > 0);
@@ -4700,7 +4841,9 @@ function renderMessages() {
     .map(approval => approvalCardHTML(approval, true));
   const older = items.length > visibleItems.length
     ? `<button type="button" class="secondary-button load-older-messages" data-load-older-messages>Mostrar mais ${Math.min(100, items.length - visibleItems.length)} itens anteriores</button>`
-    : "";
+    : state.threadHistory?.has_more
+      ? `<button type="button" class="secondary-button load-older-messages" data-fetch-older-messages ${state.threadHistoryLoading ? "disabled" : ""}>${state.threadHistoryLoading ? "Carregando itens anteriores…" : "Mostrar itens anteriores"}</button>`
+      : "";
   const attentionCards = [executionStatusHTML(), deferredUserActionHTML(), ...approvals].filter(Boolean);
   const attentionStack = attentionCards.length
     ? `<div class="conversation-attention-stack" aria-label="Atividade e aprovações da conversa">${attentionCards.join("")}</div>`
@@ -4720,6 +4863,36 @@ function renderMessages() {
     state.conversationScrollRestoreFrame = null;
     restoreMessageScrollState(scrollState);
   });
+}
+
+async function loadOlderThreadMessages() {
+  if (!state.threadHistory?.has_more || state.threadHistoryLoading) return;
+  const threadId = state.activeThreadId;
+  const loadId = state.threadLoadId;
+  const cursor = state.threadHistory.before_item;
+  const projectId = state.activeProject?.id;
+  state.threadHistoryLoading = loadId;
+  renderMessages();
+  try {
+    const query = new URLSearchParams({project_id:projectId, item_limit:"200", before_item:cursor});
+    const data = await api(`/api/threads/${encodeURIComponent(threadId)}?${query}`);
+    if (state.activeThreadId !== threadId || state.threadLoadId !== loadId) return;
+    if (!data.thread?._history) throw new Error("Atualize o Dex para carregar o histórico anterior.");
+    const olderItems = (data.thread.turns || []).flatMap(turn => turn.items || []);
+    // Existing live items win if a stream update arrived during the request.
+    state.items = new Map([...new Map([...olderItems.map(item => [item.id || crypto.randomUUID(), item]), ...state.items])]
+      .sort((a, b) => (a[1]._historyOrder ?? Infinity) - (b[1]._historyOrder ?? Infinity)));
+    state.threadHistory = data.thread._history;
+    state.threadDetails.delete(threadId);
+    state.messageRenderLimit += 100;
+  } catch (error) {
+    if (state.activeThreadId === threadId && state.threadLoadId === loadId) toast(error.message, "error");
+  } finally {
+    if (state.threadHistoryLoading === loadId) {
+      state.threadHistoryLoading = null;
+      if (state.activeThreadId === threadId && state.threadLoadId === loadId) renderMessages();
+    }
+  }
 }
 
 function setConversationContextUI() {
@@ -4763,7 +4936,7 @@ async function sendMessage() {
   clearThreadTerminalStatus(initialThreadId);
   setThreadAwaitingUserAction(initialThreadId, false);
   const messageReferences = (state.references || []).map(reference => ({...reference}));
-  persistComposerDraft();
+  const submissionDraft = beginComposerSubmission();
   selectors.prompt.value = "";
   autoResizePrompt();
   addLocalUserMessage(message, messageReferences);
@@ -4790,6 +4963,8 @@ async function sendMessage() {
     let data;
     if (!state.activeThreadId) {
       data = await api("/api/threads", {method:"POST", body:JSON.stringify(payload)});
+      finishComposerSubmission(submissionDraft, true);
+      adoptCreatedThreadDraft(data.thread?.id, submissionDraft);
       if (state.conversationViewGeneration !== viewGeneration || state.activeThreadId !== initialThreadId) {
         state.turnSubmissionPending = false;
         syncExecutionTicker();
@@ -4808,6 +4983,7 @@ async function sendMessage() {
       if (data.toolProfile) state.toolProfile = normalizeToolProfile(data.toolProfile);
     } else {
       data = await api(`/api/threads/${encodeURIComponent(state.activeThreadId)}/messages`, {method:"POST", body:JSON.stringify(payload)});
+      finishComposerSubmission(submissionDraft, true);
       if (state.conversationViewGeneration !== viewGeneration || state.activeThreadId !== initialThreadId) {
         state.turnSubmissionPending = false;
         syncExecutionTicker();
@@ -4815,7 +4991,6 @@ async function sendMessage() {
         return;
       }
     }
-    clearComposerDraft();
     state.turnSubmissionPending = false;
     if (data.queued) {
       state.activeTurnId = data.turn?.id || state.activeTurnId;
@@ -4836,17 +5011,13 @@ async function sendMessage() {
     finishDeferredSystemUpdateReload();
     await loadThreads();
   } catch (error) {
+    finishComposerSubmission(submissionDraft, false);
     if (state.conversationViewGeneration !== viewGeneration) {
       await loadThreads().catch(() => null);
       return;
     }
     clearLocalActivity();
     state.turnSubmissionPending = false;
-    if (!composerDraftText()) {
-      selectors.prompt.value = message;
-      autoResizePrompt();
-      persistComposerDraft();
-    }
     state.items.set(`error-${crypto.randomUUID()}`, {id:crypto.randomUUID(), type:"error", message:error.message});
     state.activeTurnId = null;
     setStatus("error", "Falha");
@@ -4995,7 +5166,7 @@ function handleEvent(event) {
     if (!previousApproval && window.Notification?.permission === "granted" && waitingKind) new Notification(`${workspaceLabel(rawWorkspace)} • ${userActionLabel(approval)}`, {body:approvalTitle(request.method, request.params || {})});
     return;
   }
-  if (event.kind === "browser_credentials_resolved") {
+  if (event.kind === "browser_credentials_resolved" || event.kind === "mcp_form_resolved") {
     const key = `${rawWorkspace}:${String(event.request_id || "")}`;
     const approval = state.approvals.get(key);
     if (approval) approval.resolved = true;
@@ -5095,7 +5266,7 @@ function handleEvent(event) {
     case "item/started":
     case "item/completed":
       clearLocalActivity();
-      if (params.item?.id) state.items.set(params.item.id, {...state.items.get(params.item.id), ...params.item});
+      if (params.item?.id) state.items.set(params.item.id, {...state.items.get(params.item.id), ...params.item, _historyTurnId:params.turnId || state.activeTurnId});
       renderMessages();
       addActivity(method, summarizeEvent(params.item || params));
       break;
@@ -5112,6 +5283,12 @@ function handleEvent(event) {
       addActivity(method, `Turno ${state.activeTurnId || ""} iniciado`);
       break;
     case "turn/completed":
+      if (params.turn?.status === "completed") {
+        const completedId = params.turn.id || state.activeTurnId;
+        const turnItems = [...state.items.values()].filter(item => item._historyTurnId === completedId);
+        const final = [...turnItems].reverse().find(item => ["agentMessage", "assistantMessage", "agent_message"].includes(item.type));
+        for (const item of turnItems) { item._historyTurnComplete = true; item._historyFinal = item === final; }
+      }
       clearLocalActivity();
       state.activeTurnId = null;
       if (["failed", "error"].includes(String(params.turn?.status || "").toLowerCase()) || params.turn?.error) {
@@ -5125,6 +5302,7 @@ function handleEvent(event) {
       addActivity(method, params.turn?.status || "concluído");
       loadThreads();
       loadRateLimits(workspaceGroup(rawWorkspace));
+      renderMessages();
       break;
     case "turn/diff/updated": state.diff = params.diff || ""; renderDiff(); break;
     case "clc/turnWatchdog": {
@@ -5171,6 +5349,7 @@ function appendDelta(itemId, type, field, delta) {
   const item = state.items.get(itemId) || {id:itemId, type};
   item[field] = (item[field] || "") + delta;
   if (["agentMessage", "plan", "reasoning"].includes(type)) item.text = item[field];
+  item._historyTurnId ||= state.activeTurnId;
   state.items.set(itemId, item);
   renderMessages();
 }
@@ -5200,6 +5379,7 @@ function approvalTitle(method, params) {
   if (method === "item/permissions/requestApproval") return "Conceder permissões solicitadas";
   if (method === "mcpServer/elicitation/request") {
     if (isCredentialElicitation({method, params})) return "Entrar com segurança";
+    if (isFormElicitation({method, params})) return "Responder à autenticação ou formulário";
     const {tool} = mcpApprovalIdentity(params);
     if (tool === "browser_run_code_unsafe") return "Executar código avançado no navegador";
     return params.message || "Responder à ferramenta";
@@ -5526,6 +5706,59 @@ function isCredentialElicitation(approval) {
     && ["cardholder_name", "card_number", "expiration", "expiration_month", "expiration_year", "security_code", "postal_code"].some(name => properties[name]?.type === "string");
 }
 
+
+function isFormElicitation(approval) {
+  if (approval?.method !== "mcpServer/elicitation/request" || isCredentialElicitation(approval)) return false;
+  const p = approval.params || {};
+  return p.mode === "form" || p.mode === "url" || Object.keys(p.requestedSchema?.properties || {}).length > 0;
+}
+
+function formElicitationHTML(approval) {
+  const p = approval.params || {};
+  const message = '<p style="white-space:pre-wrap;overflow-wrap:anywhere">' + escapeHTML(p.message || "") + '</p>';
+  if (p.mode === "url") return message + '<p style="overflow-wrap:anywhere">' + escapeHTML(p.url || "") + '</p>';
+  const fields = Object.entries(p.requestedSchema?.properties || {}).map(([name, d]) => {
+    const attr = ' data-elicitation-field="' + escapeHTML(name) + '"';
+    const title = escapeHTML(d.title || name);
+    const values = d.enum || (d.type === "boolean" ? [true, false] : null);
+    if (values) return '<label class="credential-field"><span>' + title + '</span><select' + attr + '><option value="">Selecione</option>' +
+      values.map((v, i) => '<option value="' + i + '">' + escapeHTML(d.enumNames?.[i] || (v === true ? "Sim" : v === false ? "Não" : v)) + '</option>').join("") + '</select></label>';
+    if (["string", "integer", "number"].includes(d.type)) return '<label class="credential-field"><span>' + title + '</span><input' + attr +
+      ' type="' + (d.type === "string" ? "text" : "number") + '" autocomplete="off" maxlength="' + Math.min(d.maxLength || 8192, 8192) + '"></label>';
+    return '<p>Campo não suportado: ' + title + '. Cancele a solicitação para evitar uma resposta incompleta.</p>';
+  }).join("");
+  return message + '<div class="credential-fields">' + fields + '</div>';
+}
+
+function formElicitationContent(approval, cards) {
+  const schema = approval.params?.requestedSchema || {};
+  const required = new Set(schema.required || []);
+  const content = Object.create(null);
+  for (const [name, d] of Object.entries(schema.properties || {})) {
+    const inputs = cards.flatMap(card => [...card.querySelectorAll("[data-elicitation-field]")])
+      .filter(input => input.getAttribute("data-elicitation-field") === name);
+    const raw = inputs.map(input => input.value).find(value => value !== "") || "";
+    if (!raw && !required.has(name) && name !== "signed_in") continue;
+    if (!raw) throw new Error("Responda: " + (d.title || name));
+    const values = d.enum || (d.type === "boolean" ? [true, false] : null);
+    let value;
+    if (values) {
+      if (!/^\d+$/.test(raw) || !Object.hasOwn(values, raw)) throw new Error("Seleção inválida.");
+      value = values[Number(raw)];
+    } else if (d.type === "string") {
+      value = raw;
+      if (value.length < (d.minLength || 0) || value.length > (d.maxLength || 8192)) throw new Error("Confira o tamanho de " + name);
+    } else if (["integer", "number"].includes(d.type)) {
+      value = Number(raw);
+      if (!Number.isFinite(value) || (d.type === "integer" && !Number.isInteger(value)) ||
+          (d.minimum !== undefined && value < d.minimum) || (d.maximum !== undefined && value > d.maximum)) throw new Error("Número inválido: " + name);
+    } else throw new Error("Campo não suportado: " + name);
+    if (name === "signed_in" && value !== true) throw new Error("Conclua o login antes de confirmar, ou cancele a solicitação.");
+    content[name] = value;
+  }
+  return content;
+}
+
 function credentialElicitationHTML(approval) {
   const params = approval.params || {};
   const schema = params.requestedSchema || {};
@@ -5536,6 +5769,7 @@ function credentialElicitationHTML(approval) {
   const site = message[1] || "este site";
   const purpose = message.slice(2).join(" ") || (paymentCard ? "Preencher dados de pagamento" : "Concluir autenticação");
   const previewUrl = String(params.previewUrl || "");
+  const rememberAvailable = !paymentCard && params.rememberAvailable === true;
   const fields = [
     ["login", "text", "username", "Login"],
     ["password", "password", "current-password", "Senha"],
@@ -5555,8 +5789,9 @@ function credentialElicitationHTML(approval) {
   return `<div class="credential-elicitation" role="group" aria-label="${paymentCard ? "Dados de pagamento protegidos" : "Credenciais protegidas"}">
     <div class="credential-security-head"><span aria-hidden="true">◆</span><div><strong>${escapeHTML(site)}</strong><small>${escapeHTML(purpose)}</small></div></div>
     ${previewUrl ? `<figure class="credential-page-preview"><img src="${escapeHTML(previewUrl)}" alt="Prévia da página de login em ${escapeHTML(site)}"><figcaption>Confira a página e o endereço antes de continuar.</figcaption></figure>` : ""}
-    <p>${paymentCard ? "Digite aqui sem abrir o navegador remoto. Os valores serão usados uma única vez apenas para preencher a página; nenhuma compra será confirmada automaticamente e nada aparecerá para o Codex ou no histórico." : "Digite aqui sem abrir o navegador remoto. Os valores serão usados uma única vez para preencher a página e não aparecerão para o Codex nem no histórico da conversa."}</p>
+    <p>${paymentCard ? "Digite aqui sem abrir o navegador remoto. Os valores serão usados uma única vez apenas para preencher a página; nenhuma compra será confirmada automaticamente e nada aparecerá para o Codex ou no histórico." : rememberAvailable ? "Digite aqui sem abrir o navegador remoto. Login e senha podem ficar criptografados pelo TPM deste mini PC e serão reutilizados somente neste endereço; nada aparecerá para o Codex ou no histórico. Códigos temporários nunca são salvos." : "Digite aqui sem abrir o navegador remoto. Esta página não apresentou uma origem HTTPS verificável, então os valores serão usados uma única vez e não aparecerão para o Codex nem no histórico."}</p>
     <div class="credential-fields${paymentCard ? " payment-card-fields" : ""}">${fields}</div>
+    ${rememberAvailable ? '<label class="credential-remember"><input type="checkbox" data-credential-remember checked><span>Salvar login e senha com proteção do host e do TPM para reutilizar neste endereço</span></label>' : ""}
   </div>`;
 }
 
@@ -5566,10 +5801,12 @@ function approvalCardHTML(approval, inline = false) {
   const key = `${approval.workspace || "system"}:${String(approval.id)}`;
   const origin = approvalOriginDetails(approval);
   const credentialApproval = isCredentialElicitation(approval);
-  const questionApproval = method === "item/tool/requestUserInput" || credentialApproval;
+  const formApproval = isFormElicitation(approval);
+  const questionApproval = method === "item/tool/requestUserInput" || credentialApproval || formApproval;
   const cls = `${inline ? "message-card tool approval-inline" : "approval-panel-card"} ${questionApproval ? "approval-input-card" : "approval-detail-card"} ${credentialApproval ? "credential-approval-card" : ""}`;
   const content = credentialApproval
     ? credentialElicitationHTML(approval)
+    : formApproval ? formElicitationHTML(approval)
     : questionApproval ? `<div class="approval-input-scroll">${userInputQuestionsHTML(approval)}</div>`
     : approvalDisclosureHTML(approval);
   const originHTML = inline ? "" : `<div class="approval-origin"><span class="approval-origin-mark">${escapeHTML(approvalOriginInitials(origin.projectName))}</span><div class="approval-origin-copy"><strong title="${escapeHTML(origin.projectName)}">${escapeHTML(origin.projectName)}</strong><small title="${escapeHTML(origin.threadName)}">${escapeHTML(origin.threadName)}</small></div>${origin.threadId ? `<button type="button" class="secondary-button" data-open-approval-origin="${escapeHTML(key)}">Abrir conversa</button>` : ""}</div>`;
@@ -5578,6 +5815,7 @@ function approvalCardHTML(approval, inline = false) {
 }
 
 function approvalTypeKey(approval) {
+  if (isFormElicitation(approval)) return "";
   const method = String(approval?.method || "");
   const params = approval?.params || {};
   if (method === "mcpServer/elicitation/request") {
@@ -5596,6 +5834,7 @@ function approvalTypeKey(approval) {
 }
 
 function conversationApprovalRuleKey(approval) {
+  if (isFormElicitation(approval)) return "";
   const workspace = String(approval?.workspace || "system");
   const threadId = approvalThreadId(approval);
   return threadId ? `${workspace}:${threadId}:${approvalTypeKey(approval)}` : "";
@@ -5612,6 +5851,7 @@ function rememberConversationApprovalRule(approval) {
 
 function automaticConversationApprovalAction(approval) {
   if (isCredentialElicitation(approval)) return "";
+  if (isFormElicitation(approval)) return "";
   const siteAction = window.automaticSiteAccessApprovalAction?.(approval) || "";
   if (siteAction === "requirePrompt") return "";
   if (siteAction) return siteAction;
@@ -5789,6 +6029,7 @@ function approvalButtons(approval) {
     const paymentCard = String(approval.params?.message || "").startsWith("SASOCQ_PAYMENT_CARD\n");
     return `<button class="primary-button" data-approval="${id}" data-action="submit-credentials">${paymentCard ? "Preencher cartão" : "Preencher com segurança"}</button><button class="danger-button" data-approval="${id}" data-action="cancel-credentials">Cancelar</button>`;
   }
+  if (isFormElicitation(approval)) return `<button class="primary-button" data-approval="${id}" data-action="submit-elicitation-form">Responder e continuar</button><button class="danger-button" data-approval="${id}" data-action="cancel-elicitation">Cancelar</button>`;
   if (approval.method === "item/permissions/requestApproval") return `<button class="primary-button" data-approval="${id}" data-action="grant">Conceder uma vez</button><button class="secondary-button" data-approval="${id}" data-action="grant-all">Conceder este tipo nesta conversa</button><button class="danger-button" data-approval="${id}" data-action="deny-permissions">Negar</button>`;
   if (["item/commandExecution/requestApproval", "item/fileChange/requestApproval"].includes(approval.method)) return `<button class="primary-button" data-approval="${id}" data-action="accept">Aprovar uma vez</button><button class="secondary-button" data-approval="${id}" data-action="acceptForSession">Aprovar este tipo nesta conversa</button><button class="danger-button" data-approval="${id}" data-action="decline">Recusar</button>`;
   if (approval.method === "mcpServer/elicitation/request") return `<button class="primary-button" data-approval="${id}" data-action="accept-elicitation">Aprovar uma vez</button><button class="secondary-button" data-approval="${id}" data-action="accept-all-elicitation">Aprovar este tipo nesta conversa</button><button class="danger-button" data-approval="${id}" data-action="cancel-elicitation">Cancelar solicitação</button>`;
@@ -5830,6 +6071,7 @@ async function respondApproval(key, action, options = {}) {
   const approval = state.approvals.get(String(key));
   if (!approval) return;
   const payload = {request_id:approval.id, workspace:approval.workspace || "system"};
+  if (isFormElicitation(approval) && !["submit-elicitation-form", "cancel-elicitation"].includes(action)) return;
   if (["submit-credentials", "cancel-credentials"].includes(action)) {
     const content = {};
     const cards = [...document.querySelectorAll(`[data-approval-key="${CSS.escape(String(key))}"]`)];
@@ -5844,7 +6086,16 @@ async function respondApproval(key, action, options = {}) {
         content[name] = value;
       }
     }
-    payload.result = action === "submit-credentials" ? {action:"accept", content} : {action:"cancel", content:null};
+    const rememberInput = cards.map(card => card.querySelector("[data-credential-remember]")).find(Boolean);
+    payload.result = action === "submit-credentials"
+      ? {action:"accept", content, remember:Boolean(rememberInput?.checked)}
+      : {action:"cancel", content:null};
+  }
+  else if (action === "submit-elicitation-form") {
+    try {
+      const cards = [...document.querySelectorAll(`[data-approval-key="${CSS.escape(String(key))}"]`)];
+      payload.result = {action:"accept", content:formElicitationContent(approval, cards)};
+    } catch (error) { return toast(error.message, "error"); }
   }
   else if (["grant", "grant-all"].includes(action)) payload.result = {scope:"turn", permissions:approval.params.permissions || {}};
   else if (action === "deny-permissions") payload.result = {scope:"turn", permissions:{}};
@@ -5877,7 +6128,7 @@ async function respondApproval(key, action, options = {}) {
   }
   try {
     const endpoint = ["browser/credentials/request", "browser/payment-card/request"].includes(approval.method) ? "/api/browser-credentials/respond" : "/api/approvals/respond";
-    await api(endpoint, {method:"POST", body:serializedPayload || JSON.stringify(payload)});
+    const response = await api(endpoint, {method:"POST", body:serializedPayload || JSON.stringify(payload)});
     if (rememberConversation) rememberConversationApprovalRule(approval);
     approval.resolved = true;
     const requestThreadId = String(approval.params?.threadId || "");
@@ -5885,7 +6136,8 @@ async function respondApproval(key, action, options = {}) {
     renderApprovals(); updateRunningUI();
     if (!options.automatic) {
       const paymentCard = String(approval.params?.message || "").startsWith("SASOCQ_PAYMENT_CARD\n");
-      toast(action === "submit-credentials" ? (paymentCard ? "Cartão encaminhado com segurança; confirme o pagamento separadamente." : "Credenciais encaminhadas com segurança.") : action === "submit-user-input" ? "Resposta enviada." : action.startsWith("accept") || action.startsWith("grant") ? (["grant-all", "acceptForSession", "accept-all-elicitation"].includes(action) ? "Este tipo foi aprovado para a conversa." : "Operação aprovada.") : "Operação recusada.");
+      const rememberRequested = Boolean(payload.result?.remember);
+      toast(action === "submit-credentials" ? (paymentCard ? "Cartão encaminhado com segurança; confirme o pagamento separadamente." : rememberRequested && response?.saved ? "Credenciais salvas no cofre e encaminhadas com segurança." : rememberRequested ? "Credenciais encaminhadas, mas não puderam ser salvas no cofre." : "Credenciais encaminhadas com segurança.") : ["submit-user-input", "submit-elicitation-form"].includes(action) ? "Resposta enviada." : action.startsWith("accept") || action.startsWith("grant") ? (["grant-all", "acceptForSession", "accept-all-elicitation"].includes(action) ? "Este tipo foi aprovado para a conversa." : "Operação aprovada.") : "Operação recusada.", action === "submit-credentials" && rememberRequested && !response?.saved ? "error" : undefined);
     }
   } catch (error) { toast(error.message, "error"); }
 }
@@ -6838,24 +7090,42 @@ async function openToolsDialog() {
   await loadExtensions(false);
 }
 
-async function loadExtensions(refresh = false) {
+let extensionDiscoveryTimer = null;
+let extensionDiscoveryGeneration = 0;
+
+async function loadExtensions(refresh = false, attempt = 0) {
   if (!state.activeProject) return;
+  clearTimeout(extensionDiscoveryTimer);
+  const generation = ++extensionDiscoveryGeneration;
+  const projectId = state.activeProject.id;
+  const threadId = state.activeThreadId;
+  const current = () => generation === extensionDiscoveryGeneration &&
+    state.activeProject?.id === projectId && state.activeThreadId === threadId;
   state.extensionsLoading = true;
   state.extensionsError = "";
   if (state.extensions) renderToolsDialog();
   else selectors.toolsContent.innerHTML = '<div class="panel-empty">Carregando skills, apps e servidores MCP…</div>';
   try {
-    const query = new URLSearchParams({project_id:state.activeProject.id, refresh:String(refresh)});
-    if (state.activeThreadId) query.set("thread_id", state.activeThreadId);
-    state.extensions = await api(`/api/extensions?${query}`);
-    state.toolProfile = normalizeToolProfile(state.extensions.profile || state.toolProfile);
+    const query = new URLSearchParams({project_id:projectId, refresh:String(refresh)});
+    if (threadId) query.set("thread_id", threadId);
+    const result = await api(`/api/extensions?${query}`);
+    if (!current()) return;
+    state.extensions = result;
+    state.toolProfile = normalizeToolProfile(result.profile || state.toolProfile);
     renderToolProfileChip();
+    if (result.pending_sources?.length && attempt < 24 && selectors.toolsDialog.open) {
+      extensionDiscoveryTimer = setTimeout(() => {
+        if (current() && selectors.toolsDialog.open) loadExtensions(false, attempt + 1);
+      }, 2000);
+    }
   } catch (error) {
-    state.extensionsError = error.message;
+    if (current()) state.extensionsError = error.message;
   } finally {
-    state.extensionsLoading = false;
-    if (state.extensions) renderToolsDialog();
-    else selectors.toolsContent.innerHTML = `<div class="inline-notice">Não foi possível carregar o catálogo agora. ${escapeHTML(state.extensionsError)}</div>`;
+    if (current()) {
+      state.extensionsLoading = false;
+      if (state.extensions) renderToolsDialog();
+      else selectors.toolsContent.innerHTML = `<div class="inline-notice">Não foi possível carregar o catálogo agora. ${escapeHTML(state.extensionsError)}</div>`;
+    }
   }
 }
 
@@ -8796,6 +9066,7 @@ function isMobileAppNavigation() {
 }
 
 function handleAppBack() {
+  if (window.closeQueueEditor?.()) return true;
   if (selectors.taskDialog?.open) {
     if (!selectors.taskClose?.disabled) selectors.taskDialog.close();
     else toast("A operação atual precisa terminar antes de voltar.");
@@ -8950,10 +9221,28 @@ function bindEvents() {
       openRemoteDesktop({liveAndroid:true});
       return;
     }
+    if (event.target.closest("[data-fetch-older-messages]")) {
+      void loadOlderThreadMessages();
+      return;
+    }
     if (!event.target.closest("[data-load-older-messages]")) return;
     state.messageRenderLimit += 100;
     renderMessages();
   });
+  selectors.messageList.addEventListener("toggle", event => {
+    const details = event.target;
+    const id = details.dataset?.historyGroup;
+    if (!id) return;
+    if (details.open) {
+      state.expandedHistoryGroups.add(id);
+      const group = state.historyActivityGroups.get(id);
+      const content = details.querySelector(".technical-activity-group-items");
+      if (group && content && !content.childElementCount) content.innerHTML = completedTurnActivitiesHTML(group);
+    } else {
+      state.expandedHistoryGroups.delete(id);
+      details.querySelector(".technical-activity-group-items")?.replaceChildren();
+    }
+  }, true);
   selectors.messageList.addEventListener("keydown", event => {
     if (!["Enter", " "].includes(event.key) || !event.target.closest(".execution-status-card")) return;
     event.preventDefault();
@@ -9413,6 +9702,10 @@ function bindEvents() {
   }));
 
   window.addEventListener("beforeunload", persistComposerDraft);
+  window.addEventListener("pagehide", persistComposerDraft);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") persistComposerDraft();
+  });
   document.addEventListener("click", event => {
     if (state.projectMenu && !event.target.closest(".floating-row-menu") && !event.target.closest(".project-icon-menu")) closeProjectMenu();
     const approvalOrigin = event.target.closest("[data-open-approval-origin]");

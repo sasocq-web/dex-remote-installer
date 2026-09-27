@@ -24,13 +24,18 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi import Query, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from .automations import AUTOMATION_TOOL_SPEC, AutomationManager, migrate_thread_dynamic_tools
+from .automations import AUTOMATION_TOOL_SPEC, AutomationManager, AutomationValidationError, migrate_thread_dynamic_tools
 from .android_lifecycle import ANDROID_TOOL_SPEC, AndroidLifecycle, migrate_android_tools
+from .lab_lifecycle import LAB_TOOL_SPEC, LabLifecycle, migrate_lab_tools
+from .build_lifecycle import BUILD_TOOL_SPEC, BuildLifecycle, migrate_build_tools
+from .browser_credentials import BrowserCredentialVault, BrowserCredentialVaultError, canonical_secure_origin
+from .publication_lifecycle import PUBLICATION_TOOL_SPEC, PublicationLifecycle, migrate_publication_tools
+from .dynamic_tool_migration import migrate_rollout_tools
 from .codex_bridge import CodexBridge, CodexRPCError
 from .conversation_search import (
     broken_generated_title,
@@ -43,8 +48,9 @@ from .conversation_search import (
 )
 from .cloud_sync import CloudSyncManager
 from .config import Settings, get_settings, load_settings, persist_settings
+from .deferred_catalog import DeferredCatalogQueries
 from .conversation_approvals import ConversationApprovalRules
-from .control_plane import ControlPlaneError, request as control_request, status as control_plane_status
+from .control_plane import ControlPlaneError, request as control_request, async_request as control_request_async, async_status as control_plane_status_async
 from .events import EventHub
 from .entra_auth import EntraAuthManager
 from .device_auth import MAX_DEVICES, DeviceAuthStore, pairing_qr_png
@@ -63,6 +69,7 @@ from .desktop_mcp import (
 from .extensions import app_slug, config_identifier, profile_input, skill_path
 from .projects import Project, ProjectStore, SYSTEM_PROJECT_ID
 from .operations_store import OperationsStore
+from .thread_transport import thread_json_response, thread_window
 from .pc_insights import PROCESS_SCAN_ARGV, STORAGE_SCAN_ARGV, process_snapshot, storage_snapshot
 from .project_bridges import ProjectBridgePool, safe_project_unit
 from .remote_desktop import RemoteDesktopManager, adaptive_geometry, find_novnc_web_root, novnc_inline_script_csp_hashes
@@ -146,12 +153,37 @@ tool_profiles = ToolProfileStore(settings.resolved_tool_profiles_file)
 automations = AutomationManager(settings.resolved_config_dir / "automations.sqlite3")
 android_lifecycle = AndroidLifecycle(settings.resolved_config_dir / "android-owned.marker")
 android_worker_task = None
+lab_worker_task = None
+lab_lifecycle = LabLifecycle(
+    settings.resolved_config_dir / "lab-leases.json",
+    lambda workspace: _project_workspace_paths(projects.get(workspace.split(":", 1)[1]))
+    if workspace.startswith("project:") and projects.get(workspace.split(":", 1)[1]) else [],
+)
+build_lifecycle = BuildLifecycle(lab_lifecycle.roots_for_workspace)
+publication_lifecycle = PublicationLifecycle(lab_lifecycle.roots_for_workspace)
 conversation_approvals = ConversationApprovalRules(
-    settings.resolved_config_dir / "conversation-approval-rules.sqlite3"
+    settings.resolved_config_dir / "conversation-approval-rules.sqlite3",
+    project_path=lambda workspace: (
+        Path(project.path) if workspace.startswith("project:")
+        and (project := projects.get(workspace.removeprefix("project:"))) is not None
+        and project.kind == "project" else None
+    ),
+)
+browser_credential_vault = BrowserCredentialVault(
+    settings.resolved_config_dir / "browser-credentials.cred"
 )
 
 
 async def _handle_codex_server_request(workspace: str, message: dict[str, Any]) -> dict[str, Any] | None:
+    result = await publication_lifecycle.handle_server_request(workspace, message)
+    if result is not None:
+        return result
+    result = await build_lifecycle.handle_server_request(workspace, message)
+    if result is not None:
+        return result
+    result = await lab_lifecycle.handle_server_request(workspace, message)
+    if result is not None:
+        return result
     result = await android_lifecycle.handle_server_request(workspace, message)
     if result is not None:
         return result
@@ -447,6 +479,9 @@ class BrowserCredentialBridgeRequest(BaseModel):
     purpose: str = Field(min_length=1, max_length=300)
     fields: list[str] = Field(min_length=1, max_length=7)
     kind: str = Field(default="credentials", pattern=r"^(credentials|payment_card)$")
+    origin: str = Field(default="", max_length=2048)
+    force_prompt: bool = False
+    prompt_if_missing: bool = False
 
 
 class BrowserCredentialUserResponse(BaseModel):
@@ -606,7 +641,7 @@ def _unpack_control(response: Dict[str, Any]) -> Any:
 
 
 async def _control_snapshot() -> Dict[str, Any]:
-    base = control_plane_status(settings.control_broker_socket)
+    base = await control_plane_status_async(settings.control_broker_socket)
     if not base.get("available") or not settings.control_plane_enabled:
         return base
     try:
@@ -614,22 +649,22 @@ async def _control_snapshot() -> Dict[str, Any]:
             system, resources, workers, provision, backup, recovery, game_storage,
             emulation, physical, power_policy, host_admin, server, authd, vm_resources, publication, watchdog,
         ) = await asyncio.gather(
-            asyncio.to_thread(control_request, "system", {"operation": "overview"}, socket_path=settings.control_broker_socket, timeout=15),
-            asyncio.to_thread(control_request, "resources", {"operation": "status"}, socket_path=settings.control_broker_socket, timeout=15),
-            asyncio.to_thread(control_request, "workers", {"operation": "status"}, socket_path=settings.control_broker_socket, timeout=15),
-            asyncio.to_thread(control_request, "provision.status", {}, socket_path=settings.control_broker_socket, timeout=15),
-            asyncio.to_thread(control_request, "backup", {"operation": "status"}, socket_path=settings.control_broker_socket, timeout=15),
-            asyncio.to_thread(control_request, "recovery", {"operation": "status"}, socket_path=settings.control_broker_socket, timeout=15),
-            asyncio.to_thread(control_request, "game-storage", {"operation": "status"}, socket_path=settings.control_broker_socket, timeout=15),
-            asyncio.to_thread(control_request, "emulation", {"operation": "status"}, socket_path=settings.control_broker_socket, timeout=15),
-            asyncio.to_thread(control_request, "physical", {"operation": "status"}, socket_path=settings.control_broker_socket, timeout=15),
-            asyncio.to_thread(control_request, "system", {"operation": "power-policy"}, socket_path=settings.control_broker_socket, timeout=15),
-            asyncio.to_thread(control_request, "host-admin", {"operation": "status"}, socket_path=settings.control_broker_socket, timeout=15),
-            asyncio.to_thread(control_request, "server", {"operation": "status"}, socket_path=settings.control_broker_socket, timeout=20),
-            asyncio.to_thread(control_request, "authd", {"operation": "status"}, socket_path=settings.control_broker_socket, timeout=20),
-            asyncio.to_thread(control_request, "vm", {"operation": "resource-status", "name": "sasocq-server"}, socket_path=settings.control_broker_socket, timeout=20),
-            asyncio.to_thread(control_request, "publication", {"operation": "status"}, socket_path=settings.control_broker_socket, timeout=30),
-            asyncio.to_thread(control_request, "watchdog", {"operation": "status"}, socket_path=settings.control_broker_socket, timeout=30),
+            control_request_async("system", {"operation": "overview"}, socket_path=settings.control_broker_socket, timeout=15),
+            control_request_async("resources", {"operation": "status"}, socket_path=settings.control_broker_socket, timeout=15),
+            control_request_async("workers", {"operation": "status"}, socket_path=settings.control_broker_socket, timeout=15),
+            control_request_async("provision.status", {}, socket_path=settings.control_broker_socket, timeout=15),
+            control_request_async("backup", {"operation": "status"}, socket_path=settings.control_broker_socket, timeout=15),
+            control_request_async("recovery", {"operation": "status"}, socket_path=settings.control_broker_socket, timeout=15),
+            control_request_async("game-storage", {"operation": "status"}, socket_path=settings.control_broker_socket, timeout=15),
+            control_request_async("emulation", {"operation": "status"}, socket_path=settings.control_broker_socket, timeout=15),
+            control_request_async("physical", {"operation": "status"}, socket_path=settings.control_broker_socket, timeout=15),
+            control_request_async("system", {"operation": "power-policy"}, socket_path=settings.control_broker_socket, timeout=15),
+            control_request_async("host-admin", {"operation": "status"}, socket_path=settings.control_broker_socket, timeout=15),
+            control_request_async("server", {"operation": "status"}, socket_path=settings.control_broker_socket, timeout=20),
+            control_request_async("authd", {"operation": "status"}, socket_path=settings.control_broker_socket, timeout=20),
+            control_request_async("vm", {"operation": "resource-status", "name": "sasocq-server"}, socket_path=settings.control_broker_socket, timeout=20),
+            control_request_async("publication", {"operation": "status"}, socket_path=settings.control_broker_socket, timeout=30),
+            control_request_async("watchdog", {"operation": "status"}, socket_path=settings.control_broker_socket, timeout=30),
         )
         base.update({
             "system": _unpack_control(system),
@@ -800,9 +835,7 @@ async def _register_project_worker(project: Project, priority: str = "normal") -
     if project.kind == "system" or not settings.control_plane_enabled:
         return
     try:
-        response = await asyncio.to_thread(
-            control_request,
-            "workers",
+        response = await control_request_async("workers",
             {"operation": "register", "project_id": project.id, "name": project.name, "path": project.path, "priority": priority},
             socket_path=settings.control_broker_socket,
             timeout=30,
@@ -815,24 +848,31 @@ async def _register_project_worker(project: Project, priority: str = "normal") -
 async def _prepare_project_bridge(project: Project, *, configure: bool = True) -> CodexBridge:
     if project.kind == "system":
         return system_bridge
-    await _register_project_worker(project)
     target = project_bridges.get(project.id, project.path, project.name)
-    await target.start()
-    if settings.control_plane_enabled:
-        try:
-            response = await asyncio.to_thread(
-                control_request,
-                "workers",
-                {"operation": "apply", "project_id": project.id},
-                socket_path=settings.control_broker_socket,
-                timeout=30,
-            )
-            _unpack_control(response)
-        except Exception as exc:
-            LOGGER.warning("Não foi possível aplicar os limites do worker %s: %s", project.id, exc)
-    if configure and settings.full_experience_installed:
-        await _configure_bundled_mcp(target, include_desktop=False)
-        setattr(target, "_clc_mcp_configured", True)
+    lock = getattr(target, "_clc_prepare_lock", None)
+    if lock is None:
+        lock = target._clc_prepare_lock = asyncio.Lock()
+    async with lock:
+        prepared = (target.running and target.initialized
+                    and getattr(target, "_clc_worker_prepared_process", None) is target.process)
+        if not prepared:
+            await _register_project_worker(project)
+            await target.start()
+            applied = not settings.control_plane_enabled
+            if settings.control_plane_enabled:
+                try:
+                    response = await control_request_async(
+                        "workers", {"operation": "apply", "project_id": project.id},
+                        socket_path=settings.control_broker_socket, timeout=30)
+                    _unpack_control(response)
+                    applied = True
+                except Exception as exc:
+                    LOGGER.warning("Não foi possível aplicar os limites do worker %s: %s", project.id, exc)
+            if applied:
+                target._clc_worker_prepared_process = target.process
+        if configure and settings.full_experience_installed and not getattr(target, "_clc_mcp_configured", False):
+            await _configure_bundled_mcp(target, include_desktop=False)
+            target._clc_mcp_configured = True
     return target
 
 
@@ -841,9 +881,7 @@ async def _unregister_project_worker(project_id: str) -> None:
     if not settings.control_plane_enabled:
         return
     try:
-        response = await asyncio.to_thread(
-            control_request,
-            "workers",
+        response = await control_request_async("workers",
             {"operation": "unregister", "project_id": project_id, "confirm": True},
             socket_path=settings.control_broker_socket,
             timeout=60,
@@ -1126,23 +1164,7 @@ async def _rpc(
         if selected.label.startswith("project:"):
             project_id = selected.label.split(":", 1)[1]
             project = _project_or_404(project_id)
-            await _register_project_worker(project)
-            await selected.start()
-            if settings.control_plane_enabled:
-                try:
-                    response = await asyncio.to_thread(
-                        control_request,
-                        "workers",
-                        {"operation": "apply", "project_id": project_id},
-                        socket_path=settings.control_broker_socket,
-                        timeout=30,
-                    )
-                    _unpack_control(response)
-                except Exception as exc:
-                    LOGGER.warning("Não foi possível aplicar os limites do worker %s: %s", project_id, exc)
-            if settings.full_experience_installed and not getattr(selected, "_clc_mcp_configured", False):
-                await _configure_bundled_mcp(selected, include_desktop=False)
-                setattr(selected, "_clc_mcp_configured", True)
+            selected = await _prepare_project_bridge(project)
         return await selected.request(method, params, timeout=timeout)
     except CodexRPCError as exc:
         LOGGER.warning("Falha RPC em %s no workspace %s: %s", method, selected.label, exc.error)
@@ -1575,7 +1597,12 @@ def _bundled_mcp_edits(*, include_desktop: bool) -> list[Dict[str, Any]]:
     edits: list[Dict[str, Any]] = [
         {"keyPath": "apps._default.destructive_enabled", "value": False, "mergeStrategy": "upsert"},
         {"keyPath": "apps._default.approvals_reviewer", "value": "user", "mergeStrategy": "upsert"},
-        {"keyPath": "apps._default.default_tools_approval_mode", "value": "prompt", "mergeStrategy": "upsert"},
+        # Connected apps are the preferred structured path for external
+        # services. Let tools explicitly annotated as read-only use the
+        # already-authenticated account without a redundant prompt, while
+        # keeping every write-capable tool behind user approval. Destructive
+        # tools remain disabled by the adjacent hard safety boundary.
+        {"keyPath": "apps._default.default_tools_approval_mode", "value": "writes", "mergeStrategy": "upsert"},
         {"keyPath": "mcp_servers.playwright.command", "value": _bundled_wrapper("run-playwright-mcp"), "mergeStrategy": "replace"},
         {"keyPath": "mcp_servers.playwright.args", "value": [], "mergeStrategy": "replace"},
         {"keyPath": "mcp_servers.playwright.env.SASOCQ_BROWSER_CREDENTIAL_SOCKET", "value": str(BROWSER_CREDENTIAL_SOCKET_PATH), "mergeStrategy": "replace"},
@@ -1776,19 +1803,31 @@ def _observe_turn_activity(event: Dict[str, Any]) -> None:
         state.update({"turn_id": turn_id, "starting": False, "last_activity": time.monotonic()})
     elif method == "turn/completed":
         turn = (event.get("notification") or {}).get("params", {}).get("turn") or {}
-        existing = operations.metadata().get("threads", {}).get(thread_id, {}).get("execution_timing") or {}
-        started_at = _epoch_milliseconds(turn.get("startedAt", turn.get("started_at"))) or int(existing.get("active_started_at") or 0)
-        completed_at = _epoch_milliseconds(turn.get("completedAt", turn.get("completed_at"))) or round(time.time() * 1000)
-        operations.record_thread_execution(
-            thread_id,
-            turn_id or f"{started_at}:{completed_at}",
-            started_at_ms=started_at,
-            completed_at_ms=completed_at,
-            duration_ms=_turn_duration_milliseconds(turn, started_at, completed_at),
-        )
-        _active_turns.pop(key, None)
+        try:
+            existing = operations.metadata().get("threads", {}).get(thread_id, {}).get("execution_timing") or {}
+            started_at = _epoch_milliseconds(turn.get("startedAt", turn.get("started_at"))) or int(existing.get("active_started_at") or 0)
+            completed_at = _epoch_milliseconds(turn.get("completedAt", turn.get("completed_at"))) or round(time.time() * 1000)
+            operations.record_thread_execution(
+                thread_id,
+                turn_id or f"{started_at}:{completed_at}",
+                started_at_ms=started_at,
+                completed_at_ms=completed_at,
+                duration_ms=_turn_duration_milliseconds(turn, started_at, completed_at),
+            )
+        finally:
+            # Completion is authoritative for the matching turn even when
+            # optional timing persistence fails. A delayed completion from an
+            # older turn must never clear a newer execution in the same thread.
+            active_turn_id = str((_active_turns.get(key) or {}).get("turn_id") or "")
+            if not turn_id or not active_turn_id or active_turn_id == turn_id:
+                _active_turns.pop(key, None)
     elif key in _active_turns:
         _active_turns[key]["last_activity"] = time.monotonic()
+
+
+# Release safety is control-plane state, not UI telemetry. It must observe the
+# app-server stream before EventHub's bounded queues can discard an event.
+events.add_critical_observer(_observe_turn_activity)
 
 
 def _active_conversation_summaries() -> list[Dict[str, Any]]:
@@ -2227,6 +2266,7 @@ def _browser_credential_request_event(record: Dict[str, Any]) -> Dict[str, Any]:
                     else f"SASOCQ_CREDENTIALS\n{record['site']}\n{record['purpose']}"
                 ),
                 "requestedSchema": record["schema"],
+                "rememberAvailable": bool(record.get("remember_available", False)),
                 "previewUrl": (
                     "/api/remote-desktop/browser-preview?thread_id="
                     f"{urllib.parse.quote(record['thread_id'], safe='')}"
@@ -2316,6 +2356,11 @@ def _observe_playwright_conversation(event: Dict[str, Any]) -> None:
                     "item_id": str(item.get("id") or ""),
                     "fields": fields,
                     "kind": "payment_card" if tool == "browser_fill_payment_card" else "credentials",
+                    "force_prompt": bool(arguments.get("force_prompt", False)),
+                    "prompt_if_missing": (
+                        bool(arguments.get("prompt_if_missing", False))
+                        or bool(arguments.get("force_prompt", False))
+                    ),
                     "expires_at": time.monotonic() + BROWSER_CREDENTIAL_TIMEOUT_SECONDS + 30,
                 }
         if tool != "browser_close":
@@ -2388,8 +2433,9 @@ async def _playwright_conversation_worker() -> None:
         while True:
             try:
                 event = await asyncio.wait_for(subscription.get(), timeout=PLAYWRIGHT_SWEEP_INTERVAL_SECONDS)
-                _observe_turn_activity(event)
                 _observe_playwright_conversation(event)
+                for resolved_form in conversation_approvals.discard_finished_forms(event):
+                    await events.publish(resolved_form)
             except asyncio.TimeoutError:
                 pass
             now = time.monotonic()
@@ -2485,7 +2531,7 @@ async def _thread_start_canary() -> str:
             "approvalPolicy": _thread_approval_policy(project),
             "sandbox": "danger-full-access",
             "serviceName": "codex_linux_control_system_canary",
-            "dynamicTools": [AUTOMATION_TOOL_SPEC, ANDROID_TOOL_SPEC],
+            "dynamicTools": [AUTOMATION_TOOL_SPEC, ANDROID_TOOL_SPEC, LAB_TOOL_SPEC, BUILD_TOOL_SPEC, PUBLICATION_TOOL_SPEC],
         },
         target=system_bridge,
     )
@@ -2498,6 +2544,7 @@ async def _thread_start_canary() -> str:
 
 @app.on_event("startup")
 async def startup_event() -> None:
+    global lab_worker_task
     global android_worker_task
     global queue_worker_task, push_worker_task, upstream_worker_task, playwright_conversation_task, site_access_worker_task, automation_worker_task
     global _startup_canary_error, _startup_canary_checked_at
@@ -2508,8 +2555,13 @@ async def startup_event() -> None:
         if removed_false_sites:
             LOGGER.info("Removidos %s falsos domínios legados derivados de código", removed_false_sites)
         await _start_browser_credential_server()
+        catalog_migration = await asyncio.to_thread(migrate_rollout_tools, _system_codex_state_database())
+        LOGGER.info("Migração do catálogo persistido do Sistema: %s", catalog_migration)
         try:
             await asyncio.to_thread(migrate_android_tools, _system_codex_state_database())
+            await asyncio.to_thread(migrate_lab_tools, _system_codex_state_database())
+            await asyncio.to_thread(migrate_build_tools, _system_codex_state_database())
+            await asyncio.to_thread(migrate_publication_tools, _system_codex_state_database())
         except Exception:
             LOGGER.exception("Não foi possível vincular Android às conversas existentes")
         try:
@@ -2558,6 +2610,9 @@ async def startup_event() -> None:
     android_worker_task = asyncio.create_task(
         android_lifecycle.worker(events, lambda: set(_active_turns)), name="clc-android-lifecycle"
     )
+    lab_worker_task = asyncio.create_task(
+        lab_lifecycle.worker(events, lambda: set(_active_turns)), name="clc-lab-lifecycle"
+    )
     push_worker_task = asyncio.create_task(_push_event_worker(), name="clc-web-push")
     upstream_worker_task = asyncio.create_task(_upstream_event_worker(), name="clc-codex-upstream-watcher")
     playwright_conversation_task = asyncio.create_task(
@@ -2573,6 +2628,16 @@ async def startup_event() -> None:
 
 @app.on_event("shutdown")
 async def shutdown_event() -> None:
+    global lab_worker_task
+    if lab_worker_task:
+        lab_worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await lab_worker_task
+        lab_worker_task = None
+    try:
+        await lab_lifecycle.recover()
+    except Exception:
+        LOGGER.exception("Encerramento de laboratório pendente; reservas preservadas")
     global android_worker_task
     if android_worker_task:
         android_worker_task.cancel()
@@ -2734,6 +2799,8 @@ def _fallback_browser_credential_route(
         "item_id": "nested-mcp-call",
         "fields": list(payload.fields),
         "kind": payload.kind,
+        "force_prompt": payload.force_prompt,
+        "prompt_if_missing": payload.prompt_if_missing,
         "expires_at": now + BROWSER_CREDENTIAL_TIMEOUT_SECONDS + 30,
     }
     _browser_credential_routes[payload.request_token] = route
@@ -2762,6 +2829,10 @@ async def _register_browser_credential_request(
         raise HTTPException(status_code=400, detail="os campos não correspondem à chamada vinculada")
     if payload.kind != route.get("kind", "credentials"):
         raise HTTPException(status_code=400, detail="o tipo de formulário não corresponde à chamada vinculada")
+    if payload.force_prompt != bool(route.get("force_prompt", False)):
+        raise HTTPException(status_code=400, detail="o modo de reutilização não corresponde à chamada vinculada")
+    if payload.prompt_if_missing != bool(route.get("prompt_if_missing", False)):
+        raise HTTPException(status_code=400, detail="o modo de solicitação não corresponde à chamada vinculada")
     existing = _browser_credential_requests.get(payload.request_token)
     if existing:
         return {"ok": True, "status": existing["status"]}
@@ -2770,11 +2841,61 @@ async def _register_browser_credential_request(
     purpose = " ".join(payload.purpose.split())[:300]
     workspace = route["workspace"]
     thread_id = route["thread_id"]
+    origin = canonical_secure_origin(payload.origin) if payload.kind == "credentials" else ""
+    if payload.kind == "credentials" and origin and not payload.force_prompt:
+        try:
+            saved = await asyncio.to_thread(browser_credential_vault.lookup, origin, payload.fields)
+        except BrowserCredentialVaultError as exc:
+            saved = None
+            LOGGER.warning("Cofre de credenciais indisponível para %s: %s", origin, exc)
+        if saved:
+            _browser_credential_requests[payload.request_token] = {
+                **route,
+                "kind": payload.kind,
+                "site": site,
+                "purpose": purpose,
+                "origin": origin,
+                "status": "accept",
+                "response": {"action": "accept", "content": saved, "reused": True},
+                "consume_by": time.monotonic() + 30,
+                "expires_at": time.monotonic() + 30,
+            }
+            state = _touch_playwright_conversation((workspace, thread_id))
+            state["credential_waiting"] = False
+            state["last_activity"] = time.monotonic()
+            return {"ok": True, "status": "accept", "reused": True}
+    if payload.kind == "credentials" and not payload.prompt_if_missing:
+        _browser_credential_requests[payload.request_token] = {
+            **route,
+            "kind": payload.kind,
+            "site": site,
+            "purpose": purpose,
+            "origin": origin,
+            "status": "cancel",
+            "response": {
+                "action": "cancel",
+                "content": None,
+                "reused": False,
+                "missing": True,
+            },
+            "consume_by": time.monotonic() + 30,
+            "expires_at": time.monotonic() + 30,
+        }
+        state = _touch_playwright_conversation((workspace, thread_id))
+        state["credential_waiting"] = False
+        state["last_activity"] = time.monotonic()
+        return {"ok": True, "status": "cancel", "missing": True}
     record = {
         **route,
         "kind": payload.kind,
         "site": site,
         "purpose": purpose,
+        "origin": origin,
+        "remember_available": bool(
+            origin
+            and payload.kind == "credentials"
+            and any(field in {"login", "password"} for field in payload.fields)
+        ),
         "schema": _browser_credential_schema(payload.fields),
         "status": "waiting",
         "response": None,
@@ -2801,6 +2922,8 @@ def _consume_browser_credential_response(request_token: str) -> Dict[str, Any]:
     result = {
         "action": str(response.get("action") or "cancel"),
         "content": dict(response.get("content")) if isinstance(response.get("content"), dict) else None,
+        "reused": bool(response.get("reused", False)),
+        "missing": bool(response.get("missing", False)),
     }
     secret_content = response.get("content") if isinstance(response, dict) else None
     if isinstance(secret_content, dict):
@@ -2919,6 +3042,7 @@ async def browser_credentials_user_response(
     if action not in {"accept", "cancel"}:
         raise HTTPException(status_code=400, detail="resposta inválida para o formulário protegido")
     content: Dict[str, str] | None = None
+    saved = False
     if action == "accept":
         supplied = payload.result.get("content")
         if not isinstance(supplied, dict) or set(supplied) != set(record["fields"]):
@@ -2930,15 +3054,25 @@ async def browser_credentials_user_response(
             if not isinstance(value, str) or not value or len(value) > max_length:
                 raise HTTPException(status_code=400, detail=f"o campo protegido {field} está vazio ou é inválido")
             content[field] = value
+        remember = bool(payload.result.get("remember", True))
+        if record.get("kind") == "credentials" and remember and record.get("origin"):
+            try:
+                saved = await asyncio.to_thread(
+                    browser_credential_vault.store,
+                    str(record["origin"]),
+                    content,
+                )
+            except BrowserCredentialVaultError as exc:
+                LOGGER.error("Falha ao salvar credenciais no cofre protegido: %s", exc)
     record["status"] = action
-    record["response"] = {"action": action, "content": content}
+    record["response"] = {"action": action, "content": content, "reused": False}
     record["consume_by"] = time.monotonic() + 30
     state = _playwright_conversations.get((record["workspace"], record["thread_id"]))
     if state:
         state["credential_waiting"] = False
         state["last_activity"] = time.monotonic()
     await _publish_browser_credential_resolution(record)
-    return {"ok": True}
+    return {"ok": True, "saved": saved}
 
 
 @app.post("/api/internal/rollout/quiesce")
@@ -3451,7 +3585,9 @@ async def authenticate_remote_device(
 @app.get("/api/status")
 async def status_api(request: Request, light: bool = False) -> Dict[str, Any]:
     _session(request)
-    state = system_state(settings)
+    # The conversation bootstrap needs process state, not machine/cloud probes.
+    # Full diagnostics remain available on the administration screens.
+    state = {"light": True, "app": {"name": settings.app_name, "version": settings.app_version}} if light else await asyncio.to_thread(system_state, settings)
     state["bridge"] = _bridge_state(system_bridge)
     state["bridges"] = {"system": _bridge_state(system_bridge), "projects": project_bridges.state()}
     state["project_bridges"] = project_bridges.state().get("projects", {})
@@ -3465,20 +3601,12 @@ async def status_api(request: Request, light: bool = False) -> Dict[str, Any]:
         "paired_devices": device_auth.active_count(settings.remote_operator_identity),
         "approval_autonomy": _approval_autonomy_payload(),
     }
-    state["remote_desktop"] = remote_desktop.status()
-    state["cloud_sync"] = cloud_sync.state()
-    state["backup_cloud"] = backup_cloud.state()
-    # The full control-plane snapshot fans out to sixteen audited broker
-    # operations. It belongs on the administration screens, but made every
-    # Dex navigation wait several seconds before conversations became usable.
-    # Keep the existing full response as the default for API compatibility;
-    # the initial web bootstrap explicitly requests this lightweight summary.
-    state["control"] = (
-        control_plane_status(settings.control_broker_socket)
-        if light
-        else await _control_snapshot()
-    )
-    state["upstream"] = upstream_registry.read()
+    if not light:
+        state["remote_desktop"] = remote_desktop.status()
+        state["cloud_sync"], state["backup_cloud"] = await asyncio.gather(
+            asyncio.to_thread(cloud_sync.state), asyncio.to_thread(backup_cloud.state))
+        state["control"] = await _control_snapshot()
+        state["upstream"] = upstream_registry.read()
     state["project_roots"] = [str(item) for item in settings.project_roots]
     return state
 
@@ -3549,9 +3677,7 @@ async def control_status_api(request: Request) -> Dict[str, Any]:
 
 
 async def _fresh_machine_overview() -> Dict[str, Any]:
-    response = await asyncio.to_thread(
-        control_request,
-        "system",
+    response = await control_request_async("system",
         {"operation": "overview"},
         socket_path=settings.control_broker_socket,
         timeout=20,
@@ -3564,9 +3690,7 @@ async def _fresh_machine_overview() -> Dict[str, Any]:
 
 async def _host_insight_command(argv: list[str], *, timeout: int) -> str:
     """Run one fixed, read-only host inspection through the audited broker."""
-    response = await asyncio.to_thread(
-        control_request,
-        "host-admin",
+    response = await control_request_async("host-admin",
         {"operation": "exec", "argv": argv, "timeout": timeout},
         socket_path=settings.control_broker_socket,
         timeout=timeout + 10,
@@ -3653,9 +3777,7 @@ async def control_pc_activities_api(request: Request) -> Dict[str, Any]:
 @app.get("/api/backup/status")
 async def backup_status_api(request: Request) -> Dict[str, Any]:
     _session(request)
-    response = await asyncio.to_thread(
-        control_request,
-        "backup",
+    response = await control_request_async("backup",
         {"operation": "status"},
         socket_path=settings.control_broker_socket,
         timeout=20,
@@ -3672,9 +3794,7 @@ async def backup_run_task_api(request: Request) -> Dict[str, Any]:
     async def worker(record: SetupTask) -> Dict[str, Any]:
         record.set_message("Iniciando o backup do servidor…")
         record.result = {"progress": {"percent": 2, "phase": "starting"}}
-        response = await asyncio.to_thread(
-            control_request,
-            "backup",
+        response = await control_request_async("backup",
             {"operation": "run"},
             socket_path=settings.control_broker_socket,
             timeout=30,
@@ -3687,9 +3807,7 @@ async def backup_run_task_api(request: Request) -> Dict[str, Any]:
         while time.monotonic() < deadline:
             await asyncio.sleep(1)
             try:
-                status_response = await asyncio.to_thread(
-                    control_request,
-                    "backup",
+                status_response = await control_request_async("backup",
                     {"operation": "status"},
                     socket_path=settings.control_broker_socket,
                     timeout=20,
@@ -3746,9 +3864,7 @@ async def control_action_api(request: Request, payload: ControlActionRequest) ->
             raise HTTPException(status_code=400, detail="Digite CONFIRMAR depois da autenticação forte")
         params["confirm"] = True
     try:
-        response = await asyncio.to_thread(
-            control_request,
-            payload.action,
+        response = await control_request_async(payload.action,
             params,
             socket_path=settings.control_broker_socket,
             timeout=3600,
@@ -3969,11 +4085,9 @@ async def finish_setup(request: Request, payload: SetupFinish) -> Dict[str, Any]
     service = set_autostart(settings, autostart)
     persist_settings(settings, setup_completed=True, start_at_login=autostart)
     control_completion: Dict[str, Any] = {"available": False}
-    if control_plane_status(settings.control_broker_socket).get("available"):
+    if (await control_plane_status_async(settings.control_broker_socket)).get("available"):
         try:
-            completion_response = await asyncio.to_thread(
-                control_request,
-                "provision.complete",
+            completion_response = await control_request_async("provision.complete",
                 {"confirm": True},
                 socket_path=settings.control_broker_socket,
                 timeout=60,
@@ -4058,9 +4172,7 @@ async def _activate_backup_cloud(remote_path: str = "SASOCQ/Backups/Servidor") -
     if not state.get("configured") or not state.get("remote_name"):
         raise RuntimeError("Conclua primeiro o login da conta OneDrive exclusiva de backup")
     selected_path = remote_path.strip("/") or state.get("remote_path") or "SASOCQ/Backups/Servidor"
-    response = await asyncio.to_thread(
-        control_request,
-        "backup",
+    response = await control_request_async("backup",
         {
             "operation": "configure",
             "remote_name": state["remote_name"],
@@ -4903,6 +5015,7 @@ async def account_rate_limits_reset(
 
 
 _EXTENSION_CATALOG_CACHE: Dict[str, Dict[str, Any]] = {}
+_EXTENSION_DISCOVERY = DeferredCatalogQueries()
 
 
 def _catalog_text(*values: Any, limit: int = 600) -> str:
@@ -5004,9 +5117,9 @@ async def extension_catalog(
 
     skills_call, apps_call, installed_call, mcp_call, plugins_call = await asyncio.gather(
         _optional_rpc("skills/list", {"cwds": [project.path], "forceReload": refresh}, timeout=20, target=target),
-        _optional_rpc("app/list", app_params, timeout=5, target=target),
+        _EXTENSION_DISCOVERY.query(target, "app/list", app_params, refresh=refresh),
         _optional_rpc("app/installed", installed_params, timeout=15, target=target),
-        _optional_rpc("mcpServerStatus/list", mcp_params, timeout=5, target=target),
+        _EXTENSION_DISCOVERY.query(target, "mcpServerStatus/list", mcp_params, refresh=refresh),
         _optional_rpc("plugin/list", {"cwds": [project.path], "forceRefetch": refresh}, timeout=20, target=target),
     )
 
@@ -5126,6 +5239,7 @@ async def extension_catalog(
         "project_kind": project.kind,
         "profile": tool_profiles.effective(project_id, thread_id).as_dict(),
         "full_experience": full_experience_state(settings),
+        "pending_sources": [name for name, call in (("apps", apps_call), ("mcp", mcp_call)) if call.get("pending")],
         "errors": {
             "skills": skills_call.get("error", ""),
             "apps": apps_call.get("error", ""),
@@ -5329,9 +5443,7 @@ def _android_remote_status() -> Dict[str, Any]:
 
 async def _physical_session(operation: str, user: str, **params: Any) -> Dict[str, Any]:
     request_params = {"operation": operation, "user": user, **params}
-    response = await asyncio.to_thread(
-        control_request,
-        "physical",
+    response = await control_request_async("physical",
         request_params,
         socket_path=settings.control_broker_socket,
         timeout=90,
@@ -5341,9 +5453,7 @@ async def _physical_session(operation: str, user: str, **params: Any) -> Dict[st
 
 
 async def _gaming_session(operation: str) -> Dict[str, Any]:
-    response = await asyncio.to_thread(
-        control_request,
-        "gaming",
+    response = await control_request_async("gaming",
         {"operation": operation},
         socket_path=settings.control_broker_socket,
         timeout=180,
@@ -5375,9 +5485,7 @@ def _physical_ubuntu_keyboard_argv(method: str, *arguments: str) -> list[str]:
 
 
 async def _physical_ubuntu_keyboard_exec(argv: list[str], timeout: int = 15) -> Dict[str, Any]:
-    response = await asyncio.to_thread(
-        control_request,
-        "host-admin",
+    response = await control_request_async("host-admin",
         {"operation": "exec", "argv": argv, "timeout": timeout},
         socket_path=settings.control_broker_socket,
         timeout=max(20, timeout + 5),
@@ -6093,14 +6201,22 @@ async def _repair_generated_thread_titles(
 
 
 @app.get("/api/threads")
-async def list_threads(request: Request, project_id: str, archived: bool = False) -> Dict[str, Any]:
+async def list_threads(
+    request: Request,
+    project_id: str,
+    archived: bool = False,
+    limit: int = Query(default=100, ge=1, le=100),
+) -> Dict[str, Any]:
     _session(request)
     project = _project_or_404(project_id)
     target = _bridge_for_project(project)
     result = await _rpc(
         "thread/list",
         {
-            "limit": 100,
+            # The all-projects home intentionally requests a small page from
+            # each worker. Ignoring it multiplied payload, title repair and
+            # browser rendering work by every configured project.
+            "limit": limit,
             "sortKey": "updated_at",
             "sortDirection": "desc",
             "sourceKinds": ["cli", "vscode", "appServer", "exec"],
@@ -6308,6 +6424,51 @@ async def get_automations(request: Request) -> Dict[str, Any]:
     }
 
 
+class AutomationPageUpdate(BaseModel):
+    status: Optional[str] = Field(default=None, pattern="^(ACTIVE|PAUSED)$")
+    model: Optional[str] = Field(default=None, max_length=120)
+    rrule: Optional[str] = Field(default=None, min_length=1, max_length=500)
+    kind: Optional[str] = Field(default=None, pattern="^(heartbeat|cron)$")
+
+
+def _automation_page_record(automation_id: str) -> Dict[str, Any]:
+    record = next((item for item in automations.store.list_all() if item["id"] == automation_id), None)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Agendamento não encontrado")
+    project_id = str(record.get("project_id") or SYSTEM_PROJECT_ID)
+    project = _project_or_404(SYSTEM_PROJECT_ID if project_id == "system" else project_id)
+    if record["workspace"] != _workspace_for_project(project):
+        raise HTTPException(status_code=409, detail="O projeto do agendamento mudou")
+    return record
+
+
+@app.patch("/api/automations/{automation_id}")
+async def update_automation_page(request: Request, automation_id: str, payload: AutomationPageUpdate) -> Dict[str, Any]:
+    _session(request, mutate=True)
+    record = await asyncio.to_thread(_automation_page_record, automation_id)
+    changes = payload.model_dump(exclude_unset=True)
+    if not changes:
+        raise HTTPException(status_code=400, detail="Nenhuma alteração informada")
+    if "model" in changes and changes["model"] != (record.get("model") or ""):
+        changes["reasoningEffort"] = ""
+    if changes.get("kind") == "heartbeat" and not record.get("target_thread_id"):
+        raise HTTPException(status_code=400, detail="Este agendamento não possui uma conversa para continuar")
+    try:
+        updated = await asyncio.to_thread(automations.store.update, record["workspace"], automation_id, changes)
+    except AutomationValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"automation": updated}
+
+
+@app.delete("/api/automations/{automation_id}")
+async def cancel_automation_page(request: Request, automation_id: str) -> Dict[str, Any]:
+    _session(request, mutate=True)
+    record = await asyncio.to_thread(_automation_page_record, automation_id)
+    if not await asyncio.to_thread(automations.store.delete, record["workspace"], automation_id):
+        raise HTTPException(status_code=404, detail="Agendamento não encontrado")
+    return {"cancelled": True, "automationId": automation_id}
+
+
 @app.put("/api/site-access/{domain}/policy")
 async def update_site_access_policy(
     request: Request,
@@ -6468,7 +6629,7 @@ async def search_threads(
 
 
 @app.get("/api/threads/{thread_id}")
-async def read_thread(request: Request, thread_id: str, project_id: Optional[str] = None) -> Dict[str, Any]:
+async def read_thread(request: Request, thread_id: str, project_id: Optional[str] = None, item_limit: Optional[int] = Query(default=None, ge=20, le=500), before_item: Optional[str] = None) -> Dict[str, Any]:
     _session(request)
     project = _project_or_404(project_id) if project_id else projects.get(_project_id_for_thread(thread_id))
     target = _bridge_for_project(project) if project else _bridge_for_thread(thread_id)
@@ -6480,7 +6641,7 @@ async def read_thread(request: Request, thread_id: str, project_id: Optional[str
             thread["_projectId"] = project.id
             thread["_projectName"] = project.name
             thread["_projectKind"] = project.kind
-    return result
+    return await thread_json_response(thread_window(result, item_limit, before_item), request)
 
 
 @app.post("/api/threads")
@@ -6492,7 +6653,7 @@ async def create_thread(request: Request, payload: ThreadCreate) -> Dict[str, An
         "approvalPolicy": _thread_approval_policy(project),
         "sandbox": "danger-full-access" if project.kind == "system" else "workspace-write",
         "serviceName": "codex_linux_control_system" if project.kind == "system" else "codex_linux_control_projects",
-        "dynamicTools": [AUTOMATION_TOOL_SPEC, ANDROID_TOOL_SPEC],
+        "dynamicTools": [AUTOMATION_TOOL_SPEC, ANDROID_TOOL_SPEC, LAB_TOOL_SPEC, BUILD_TOOL_SPEC, PUBLICATION_TOOL_SPEC],
     }
     if payload.model:
         params["model"] = payload.model
@@ -6778,7 +6939,7 @@ async def _run_automation(automation: Dict[str, Any]) -> str:
             "approvalPolicy": _thread_approval_policy(project),
             "sandbox": "danger-full-access" if project.kind == "system" else "workspace-write",
             "serviceName": "codex_linux_control_automations",
-            "dynamicTools": [AUTOMATION_TOOL_SPEC, ANDROID_TOOL_SPEC],
+            "dynamicTools": [AUTOMATION_TOOL_SPEC, ANDROID_TOOL_SPEC, LAB_TOOL_SPEC, BUILD_TOOL_SPEC, PUBLICATION_TOOL_SPEC],
         }
         if automation.get("model"):
             params["model"] = automation["model"]
@@ -7280,6 +7441,10 @@ async def delete_thread(request: Request, thread_id: str) -> Dict[str, Any]:
 async def respond_approval(request: Request, payload: ApprovalResponse) -> Dict[str, Any]:
     _session(request, mutate=True)
     result = payload.result if payload.result is not None else {"decision": payload.decision}
+    try:
+        conversation_approvals.validate_form_response(payload.workspace, payload.request_id, result)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     identity: tuple[str, str, str] | None = None
     created = False
     if payload.remember_conversation:
@@ -7293,7 +7458,11 @@ async def respond_approval(request: Request, payload: ApprovalResponse) -> Dict[
         if identity is not None and created:
             conversation_approvals.remove(identity)
         raise
-    conversation_approvals.finish_pending(payload.workspace, payload.request_id)
+    form_request = conversation_approvals.finish_pending(payload.workspace, payload.request_id)
+    if form_request:
+        await events.publish({"kind": "mcp_form_resolved", "workspace": payload.workspace,
+                              "thread_id": form_request.get("params", {}).get("threadId", ""),
+                              "request_id": payload.request_id})
     return {"ok": True}
 
 
@@ -7344,6 +7513,8 @@ async def event_socket(websocket: WebSocket) -> None:
     # Server requests are normally live events. Credential forms must survive
     # mobile suspension and WebSocket reconnects for their five-minute life.
     for pending_event in _pending_browser_credential_events():
+        await websocket.send_json(pending_event)
+    for pending_event in conversation_approvals.pending_form_events():
         await websocket.send_json(pending_event)
     try:
         while True:

@@ -22,10 +22,10 @@ UNITS = [TARGET, "waydroid-container.service", *[
         "ui.service", "binder.service", "keepalive.timer", "keepalive.service",
     )
 ]]
-OPERATIONS = ["status", "start", "stop", "open", "play", "ui", "apps", "is-installed", "back", "home", "tap", "type"]
+OPERATIONS = ["status", "start", "stop", "open", "play", "ui", "apps", "is-installed", "back", "home", "tap", "type", "screenshot"]
 ANDROID_TOOL_SPEC = {
     "type": "function", "name": "android_control", "deferLoading": False,
-    "description": "Usa o Android SASOCQ na conversa atual. start/open/play/ui ligam o Waydroid sob demanda pelo broker e aguardam o boot. A sessão é exclusiva de uma conversa; stop libera o uso. Ao terminar o turno, desliga quando não há visor aberto. Use play para instalações pela Google Play; não instala APK externo. status não liga o Android. Não peça ao usuário para abrir outra conversa no Sistema para ativá-lo.",
+    "description": "Usa o Android SASOCQ na conversa atual. start/open/play/ui ligam o Waydroid sob demanda pelo broker e aguardam o boot. A sessão é exclusiva de uma conversa; stop libera o uso. Ao terminar o turno, desliga quando não há visor aberto. Use play para instalações pela Google Play; não instala APK externo. screenshot retorna uma imagem pela ferramenta para validar visualmente e orientar tap. Para testes pelo Codex, use screenshot; viewer_url é destinado ao operador autenticado, não à identidade interna Playwright. status não liga o Android. Não peça ao usuário para abrir outra conversa no Sistema para ativá-lo.",
     "inputSchema": {"type": "object", "additionalProperties": False,
         "properties": {"operation": {"type": "string", "enum": OPERATIONS},
             "package": {"type": "string"}, "x": {"type": "integer", "minimum": 0, "maximum": 8192},
@@ -212,6 +212,11 @@ class AndroidLifecycle:
             await self._acquire(key, turn_active, turn_id)
             try:
                 output = "Android pronto" if op == "start" else await self._host(argv)
+                if op == "screenshot":
+                    image = json.loads(output)["image_url"]
+                    if not isinstance(image, str) or not image.startswith("data:image/jpeg;base64,") or len(image) > 1_300_000:
+                        raise RuntimeError("Captura Android inválida")
+                    return {**self._status(key), "image_url": image}
                 return {**self._status(key), "output": output}
             except BaseException:
                 if not self.viewers:
@@ -224,7 +229,11 @@ class AndroidLifecycle:
             return None
         try:
             value = await self.execute(workspace, str(params.get("threadId") or ""), params.get("arguments") or {}, turn_id=str(params.get("turnId") or ""))
-            return {"success": True, "contentItems": [{"type": "inputText", "text": json.dumps(value, ensure_ascii=False)}]}
+            image = value.pop("image_url", None)
+            items = [{"type": "inputText", "text": json.dumps(value, ensure_ascii=False)}]
+            if image:
+                items.append({"type": "inputImage", "imageUrl": image})
+            return {"success": True, "contentItems": items}
         except Exception as exc:
             return {"success": False, "contentItems": [{"type": "inputText", "text": str(exc)}]}
 

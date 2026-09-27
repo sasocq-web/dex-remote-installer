@@ -1,14 +1,14 @@
-const CACHE = "dex-remote-v1.0.0-0-modern-workbench0151-execution-progress275-steam-remote-recovery284-secure-payment-card294-gnome-codex3-draft-recovery295-conversation-approval300-android-lifecycle301-quota-manual-reset302-queue-reorder304";
+const CACHE = "dex-remote-v1.0.0-0-modern-workbench0151-execution-progress275-steam-remote-recovery284-secure-payment-card294-gnome-codex3-draft-recovery295-conversation-approval300-android-lifecycle301-quota-manual-reset302-queue-reorder304-dynamic-tool-collapse309-orientation-collapse312-queue-editor313-queue-collapse314-plain-messages315-conversation-load317-m365-catalog318-conversation-isolation319-secure-credential-vault329-automation-menu333";
 const ASSETS = [
   "/",
   "/index.html",
-  "/styles.css?v=queue-reorder-20260908-304-portable",
+  "/styles.css?v=orientation-collapse-20260909-312-queue-editor313-queue-collapse314-plain-messages315-secure-credential-vault329-automation-menu333-portable",
   "/workbench.css?v=modern-workbench-20260830-4",
-  "/app.js?v=quota-manual-reset-20260907-302-portable",
+  "/app.js?v=canvas-auth321-gnome-codex3-secure-credential-vault329-gnome-codex3-portable",
   "/sites.js?v=conversation-approval-persistence-20260906-300",
-  "/automations.js?v=pc-managers-20260824-229b",
+  "/automations.js?v=automation-menu333",
   "/release-status.json",
-  "/operations.js?v=queue-reorder-20260908-304",
+  "/operations.js?v=queue-reorder-20260908-304-queue-editor313-queue-collapse314-conversation-load317",
   "/workbench.js?v=modern-workbench-20260830-4",
   "/manifest.webmanifest",
   "/icons/codex-remoto-192.png",

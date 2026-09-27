@@ -503,6 +503,24 @@ class RemoteDesktopManager:
             ).resolve()
         return profile_dir
 
+    @staticmethod
+    def _clear_browser_tab_restore_state(profile_dir: Path) -> None:
+        """Discard crashed-window restore data without touching authentication."""
+        default_dir = profile_dir / "Default"
+        sessions_dir = default_dir / "Sessions"
+        if sessions_dir.is_symlink():
+            raise RuntimeError("O estado de abas do navegador não pode ser um link simbólico")
+        if sessions_dir.is_dir():
+            shutil.rmtree(sessions_dir)
+        elif sessions_dir.exists():
+            sessions_dir.unlink()
+        for name in ("Current Session", "Current Tabs", "Last Session", "Last Tabs"):
+            path = default_dir / name
+            if path.is_symlink():
+                raise RuntimeError("O estado de abas do navegador não pode ser um link simbólico")
+            if path.is_file():
+                path.unlink()
+
     def _managed_browser_pid(self) -> Optional[int]:
         expected_profile = f"--user-data-dir={self._managed_browser_profile_dir()}"
         for entry in Path("/proc").iterdir():
@@ -1246,6 +1264,12 @@ wait "$wm_pid"
         profile_dir = self._managed_browser_profile_dir(browser)
         profile_dir.mkdir(parents=True, exist_ok=True)
         os.chmod(profile_dir, 0o700)
+        # Browser processes are replaced only after their managed PID has
+        # stopped. Do not let a prior crash resurrect orphan Playwright tabs:
+        # they can saturate CDP before the new isolated context is created.
+        # Cookies and local authentication are kept in their normal profile
+        # databases and in the separate Playwright storage-state file.
+        self._clear_browser_tab_restore_state(profile_dir)
         profile = str(mode or "auto").casefold()
         if profile == "auto":
             profile = self._geometry.profile

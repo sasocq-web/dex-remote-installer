@@ -40,8 +40,13 @@ CREDENTIAL_TOOL = {
     "name": CREDENTIAL_TOOL_NAME,
     "description": (
         "Solicita login, senha e/ou código de uso único em um formulário protegido dentro da conversa do Dex "
-        "e preenche os campos indicados na página atual. Use esta ferramenta sempre que uma navegação no Chrome "
-        "precisar de credenciais; nunca peça a senha no chat nem digite segredos com browser_type/browser_fill_form. "
+        "e preenche os campos indicados na página atual. Sem autorização explícita para abrir o formulário, a "
+        "ferramenta somente reutiliza dados já salvos para a origem e falha de forma fechada quando não os encontra. "
+        "Use o formulário imediatamente quando o usuário pedir "
+        "digitação segura, entrada protegida, login, senha, código do Authenticator, MFA ou OTP, inclusive quando o "
+        "pedido chegar como orientação durante uma execução. Conduza primeiro a página até o campo necessário. "
+        "Nunca peça o segredo no chat nem o digite com browser_type/browser_fill_form. "
+        "Login e senha salvos são reutilizados somente na mesma origem HTTPS; código temporário nunca é salvo. "
         "A ferramenta devolve somente o resultado do preenchimento, nunca os valores informados pelo usuário."
     ),
     "inputSchema": {
@@ -86,6 +91,24 @@ CREDENTIAL_TOOL = {
                 "type": "string",
                 "description": "Referência do botão a clicar depois de preencher. Omita para apenas preencher.",
                 "maxLength": 1000,
+            },
+            "force_prompt": {
+                "type": "boolean",
+                "description": (
+                    "Solicita novos dados mesmo quando há credenciais salvas. Use apenas depois que o site "
+                    "recusar a credencial armazenada ou quando o usuário pedir para trocar de conta."
+                ),
+                "default": False,
+            },
+            "prompt_if_missing": {
+                "type": "boolean",
+                "description": (
+                    "Abre o formulário protegido quando não houver credencial salva para a origem. Defina como true "
+                    "somente quando o usuário tiver pedido explicitamente login, senha, entrada protegida, MFA ou OTP. "
+                    "Omita em tarefas autônomas e automações: credenciais salvas serão reutilizadas, mas nenhum pedido "
+                    "de login será exibido por iniciativa da tarefa."
+                ),
+                "default": False,
             },
         },
         "required": ["site", "request_token"],
@@ -407,6 +430,9 @@ def _request_protected_credentials(
     fields: list[str],
     *,
     kind: str = "credentials",
+    origin: str = "",
+    force_prompt: bool = False,
+    prompt_if_missing: bool = False,
 ) -> dict[str, Any]:
     deadline = time.monotonic() + 300
     registered = False
@@ -414,7 +440,16 @@ def _request_protected_credentials(
         try:
             _credential_bridge_json(
                 "request",
-                {"request_token": request_token, "site": site, "purpose": purpose, "fields": fields, "kind": kind},
+                {
+                    "request_token": request_token,
+                    "site": site,
+                    "purpose": purpose,
+                    "fields": fields,
+                    "kind": kind,
+                    "origin": origin,
+                    "force_prompt": force_prompt,
+                    "prompt_if_missing": prompt_if_missing,
+                },
             )
             registered = True
         except CredentialRoutePending:
@@ -439,8 +474,19 @@ def _handle_credential_call(message: dict[str, Any]) -> None:
         if not isinstance(arguments, dict):
             raise ValueError("parâmetros de credenciais inválidos")
         schema, requested = _credential_schema(arguments)
-        site = str(arguments.get("site") or "este site").strip()[:200]
-        site = _current_browser_site(site)
+        fallback_site = str(arguments.get("site") or "este site").strip()[:200]
+        current_url = _current_browser_url()
+        parsed = urllib.parse.urlparse(current_url)
+        site = (
+            parsed.hostname + (f":{parsed.port}" if parsed.port else "")
+            if parsed.hostname else fallback_site
+        )
+        origin = ""
+        if _payment_origin_is_secure(current_url) and parsed.hostname:
+            default_port = 443 if parsed.scheme == "https" else 80
+            authority_host = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+            authority = authority_host if parsed.port in {None, default_port} else f"{authority_host}:{parsed.port}"
+            origin = f"{parsed.scheme}://{authority}"
         purpose = str(arguments.get("purpose") or "Concluir a autenticação solicitada").strip()[:300]
         request_token = str(arguments.get("request_token") or "").strip()
         if not re.fullmatch(r"[0-9a-fA-F-]{32,64}", request_token):
@@ -450,9 +496,23 @@ def _handle_credential_call(message: dict[str, Any]) -> None:
             site,
             purpose,
             [field for field, _target, _field_type in requested],
+            origin=origin,
+            force_prompt=bool(arguments.get("force_prompt", False)),
+            prompt_if_missing=(
+                bool(arguments.get("prompt_if_missing", False))
+                or bool(arguments.get("force_prompt", False))
+            ),
         )
         if answer.get("action") != "accept":
-            _credential_result(request_id, "Credenciais canceladas pelo usuário; nenhum campo foi preenchido.")
+            if answer.get("missing"):
+                _credential_result(
+                    request_id,
+                    f"Nenhuma credencial salva para {site}; nenhum formulário foi aberto. "
+                    "Peça entrada protegida ao usuário somente se a autenticação for necessária para continuar.",
+                    error=True,
+                )
+            else:
+                _credential_result(request_id, "Credenciais canceladas pelo usuário; nenhum campo foi preenchido.")
             return
         content = answer.get("content")
         if not isinstance(content, dict):
@@ -469,7 +529,8 @@ def _handle_credential_call(message: dict[str, Any]) -> None:
         if submit_target:
             _internal_tool_call("browser_click", {"target": submit_target, "element": "Entrar"})
         action = "preenchidas e enviadas" if submit_target else "preenchidas"
-        _credential_result(request_id, f"Credenciais {action} com segurança em {site}. Os valores não foram expostos ao Codex.")
+        source = "reutilizadas do cofre" if answer.get("reused") else action
+        _credential_result(request_id, f"Credenciais {source} com segurança em {site}. Os valores não foram expostos ao Codex.")
     except Exception as exc:
         safe_error = str(exc)
         for value in secret_content.values():
@@ -603,9 +664,16 @@ def _ensure_stream(timeout: float = 10.0) -> None:
 
 
 def _post(message: dict[str, Any]) -> None:
-    _ensure_stream()
+    # A fresh SSE endpoint is a fresh MCP session. Never open one implicitly
+    # here: doing so sends tools/call before initialize, losing client roots
+    # and other capabilities. forward() must recover the handshake first.
+    with stream_lock:
+        endpoint = post_url
+        connected = bool(endpoint and stream_thread and stream_thread.is_alive())
+    if not connected:
+        raise BackendUnavailable("a conexão SSE terminou; é necessário reinicializar a sessão MCP")
     request = urllib.request.Request(
-        post_url,
+        endpoint,
         data=json.dumps(message, separators=(",", ":")).encode(),
         headers={"Content-Type": "application/json"},
         method="POST",
@@ -674,12 +742,15 @@ def forward(message: dict[str, Any]) -> None:
             threading.Thread(target=_handle_payment_card_call, args=(message,), name="sasocq-payment-card-fill", daemon=True).start()
             return
     try:
+        if method == "initialize":
+            _ensure_stream()
         _post(message)
         return
     except BackendUnavailable as first_error:
         if method == "initialize":
             _invalidate_stream()
             try:
+                _ensure_stream()
                 _post(message)
             except BackendUnavailable as retry_error:
                 emit_error(message, f"Playwright indisponível: {retry_error}")
