@@ -180,6 +180,7 @@ def main() -> int:
         try:
             response = handle(json.loads(raw))
             if response is not None:
+                response["jsonrpc"] = "2.0"
                 print(json.dumps(response, ensure_ascii=False, separators=(",", ":")), flush=True)
         except Exception as exc:
             print(f"server-mcp: {exc}", file=sys.stderr, flush=True)

@@ -439,6 +439,7 @@ def main() -> int:
             message = json.loads(raw)
             response = handle(message)
             if response is not None:
+                response["jsonrpc"] = "2.0"
                 sys.stdout.write(json.dumps(response, ensure_ascii=False, separators=(",", ":")) + "\n")
                 sys.stdout.flush()
         except Exception as exc:  # noqa: BLE001
