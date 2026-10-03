@@ -29,6 +29,7 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Red
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from .dot_bridge import Bridge as DotSystemBridge
 from .automations import AUTOMATION_TOOL_SPEC, AutomationManager, AutomationValidationError, migrate_thread_dynamic_tools
 from .android_lifecycle import ANDROID_TOOL_SPEC, AndroidLifecycle, migrate_android_tools
 from .lab_lifecycle import LAB_TOOL_SPEC, LabLifecycle, migrate_lab_tools
@@ -2542,6 +2543,13 @@ async def _thread_start_canary() -> str:
     return thread_id
 
 
+dot_system_bridge = None
+
+def _dot_system_ready() -> bool:
+    return not _startup_canary_error and not _rollout_gate_closed() and not any(
+        workspace == "system" for workspace, thread_id in _active_turns
+    )
+
 @app.on_event("startup")
 async def startup_event() -> None:
     global lab_worker_task
@@ -2625,9 +2633,27 @@ async def startup_event() -> None:
         automations.scheduler(_run_automation), name="clc-automation-scheduler"
     )
 
+    global dot_system_bridge
+    try:
+        dot_system_bridge = DotSystemBridge(
+            settings.resolved_config_dir / "dot-system-bridge",
+            _run_automation, _dot_system_ready,
+        )
+        await dot_system_bridge.start()
+    except Exception:
+        if dot_system_bridge is not None:
+            await dot_system_bridge.close()
+            dot_system_bridge = None
+        LOGGER.exception("Ponte Dot/Sistema indisponível; isolamento preservado")
+
+
 
 @app.on_event("shutdown")
 async def shutdown_event() -> None:
+    global dot_system_bridge
+    if dot_system_bridge is not None:
+        await dot_system_bridge.close()
+        dot_system_bridge = None
     global lab_worker_task
     if lab_worker_task:
         lab_worker_task.cancel()
