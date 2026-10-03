@@ -12,6 +12,7 @@ import stat
 import struct
 import time
 import uuid
+from .project_relay import ProjectRelay
 
 SOCKET = Path("/run/sasocq-dot-system/bridge.sock")
 ACTIVE = ("queued", "dispatching", "running", "waiting_operator", "dispatch_uncertain")
@@ -40,7 +41,7 @@ apenas a limitação e mantenha os detalhes nesta conversa do Sistema.
 """
 
 class Bridge:
-    def __init__(self, directory: Path, runner, ready, owner_uid=None, worker_uid=1001):
+    def __init__(self, directory: Path, runner, ready, owner_uid=None, worker_uid=1001, project_handler=None):
         self.directory = Path(directory)
         self.runner, self.ready = runner, ready
         self.owner_uid = os.getuid() if owner_uid is None else owner_uid
@@ -57,6 +58,7 @@ class Bridge:
         self.db.execute("UPDATE requests SET status='dispatch_uncertain' WHERE status='dispatching'")
         self.db.commit()
         os.chmod(self.directory / "requests.sqlite3", 0o600)
+        self.project_relay = ProjectRelay(self.directory, project_handler, self.owner_uid, self.worker_uid) if project_handler else None
 
     def audit(self, event, **fields):
         with (self.directory / "audit.jsonl").open("a", encoding="utf-8") as f:
@@ -169,6 +171,8 @@ class Bridge:
 
     async def loop(self):
         while True:
+            if self.project_relay:
+                await self.project_relay.dispatch_one()
             await self.dispatch_one()
             await asyncio.sleep(3)
 
@@ -183,7 +187,13 @@ class Bridge:
             raw = await asyncio.wait_for(reader.readline(), timeout=5)
             if len(raw) > 16000 or not raw.endswith(b"\n"):
                 raise ValueError("requisição excedeu o limite")
-            result = self.handle(uid, json.loads(raw))
+            data = json.loads(raw)
+            if isinstance(data, dict) and str(data.get("operation", "")).startswith("project-"):
+                if self.project_relay is None:
+                    raise ValueError("Ponte de projetos indisponível")
+                result = await self.project_relay.handle(uid, data)
+            else:
+                result = self.handle(uid, data)
             response = {"ok":True, "result":result}
         except (Exception,) as exc:
             response = {"ok":False, "error": str(exc) if isinstance(exc, (ValueError, PermissionError)) else type(exc).__name__}
@@ -221,4 +231,6 @@ class Bridge:
             await asyncio.gather(*tuple(self.clients), return_exceptions=True)
         if hasattr(self, "path") and self.path.exists():
             self.path.unlink()
+        if self.project_relay:
+            self.project_relay.db.close()
         self.db.close()

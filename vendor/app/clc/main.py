@@ -2637,7 +2637,7 @@ async def startup_event() -> None:
     try:
         dot_system_bridge = DotSystemBridge(
             settings.resolved_config_dir / "dot-system-bridge",
-            _run_automation, _dot_system_ready,
+            _run_automation, _dot_system_ready, project_handler=_dot_project_request,
         )
         await dot_system_bridge.start()
     except Exception:
@@ -5979,7 +5979,7 @@ async def remote_desktop_socket(websocket: WebSocket) -> None:
                 raise HTTPException(status_code=403, detail="Visualização somente leitura disponível apenas para Playwright")
         if not settings.remote_desktop_enabled:
             raise HTTPException(status_code=403, detail="Área de trabalho remota desativada")
-        if target not in {"codex", "desktop", "jogos", "playwright", "android"}:
+        if target not in {"codex", "desktop", "jogos", "playwright", "android", "dot"}:
             raise ValueError("alvo de tela remota inválido")
         if target == "android":
             android_key = android_lifecycle._key(_playwright_workspace_for_thread(thread_id), thread_id)
@@ -6013,6 +6013,8 @@ async def remote_desktop_socket(websocket: WebSocket) -> None:
     try:
         if target in {"codex", "playwright"}:
             selected_socket = remote_desktop.socket_path
+        elif target == "dot":
+            selected_socket = Path("/run/sasocq-dot-viewer/view.sock")
         elif target == "android":
             selected_socket = ANDROID_VNC_SOCKET
         else:
@@ -6951,6 +6953,40 @@ async def _start_turn(
         state["starting"] = False
         state["last_activity"] = time.monotonic()
     return turn
+
+
+async def _dot_project_request(action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Projects use their resident bridge; System threads are never exposed."""
+    if action == "list":
+        return {"projects": [{"id": p.id, "name": p.name, "path": p.path}
+                             for p in projects.list() if p.kind != "system"]}
+    project = _project_or_404(str(payload.get("project_id") or ""))
+    if project.kind == "system":
+        raise ValueError("Use a ponte Sistema para solicitações administrativas")
+    Path(project.path).resolve().relative_to(Path("/srv/sasocq/projects"))
+    thread_id = str(payload.get("thread_id") or "")
+    if thread_id and tool_profiles.thread_project_id(thread_id) != project.id:
+        raise ValueError("Conversa não pertence ao projeto selecionado")
+    if action == "validate":
+        return {"ok": True}
+    if action == "read":
+        result = await _rpc("thread/read", {"threadId": thread_id, "includeTurns": True}, target=_bridge_for_project(project))
+        thread = result.get("thread", {})
+        turns = thread.get("turns") or []
+        last = turns[-1] if turns else {}
+        return {"thread_id": thread_id, "project_id": project.id,
+                "status": thread.get("status"), "turn_id": last.get("id"),
+                "turn_status": last.get("status"),
+                "messages": [{"text": str(item.get("text") or "")[:8000]}
+                             for item in last.get("items", []) if item.get("type") == "agentMessage"][-3:]}
+    if action != "send":
+        raise ValueError("operação inválida")
+    if thread_id and (_workspace_for_project(project), thread_id) in _active_turns:
+        return {"status": "busy", "thread_id": thread_id, "message": "Conversa em execução; nenhuma nova mensagem enviada."}
+    tid = await _run_automation({"kind": "heartbeat" if thread_id else "cron",
+                                 "project_id": project.id, "target_thread_id": thread_id,
+                                 "name": "Pedido do Dot", "prompt": payload["message"]})
+    return {"status": "started", "thread_id": tid, "project_id": project.id}
 
 
 async def _run_automation(automation: Dict[str, Any]) -> str:

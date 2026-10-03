@@ -4,7 +4,7 @@
   const target = new URLSearchParams(location.search).get("target") || "codex";
   const threadId = new URLSearchParams(location.search).get("thread_id") || "";
   const viewOnly = new URLSearchParams(location.search).get("view_only") === "1";
-  const allowed = new Set(["codex", "projects", "desktop", "playwright", "jogos", "android"]);
+  const allowed = new Set(["codex", "projects", "desktop", "playwright", "jogos", "android", "dot"]);
   let rfb = null;
   let retry = null;
   let connectDeadline = null;
@@ -84,7 +84,7 @@
     trackpadPointer.x = null;
     trackpadPointer.y = null;
     rfb.scaleViewport = true;
-    rfb.resizeSession = false;
+    rfb.resizeSession = target === "dot";
     rfb.showDotCursor = true;
     rfb.addEventListener("connect", () => {
       clearTimeout(connectDeadline);

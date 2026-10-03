@@ -4,7 +4,7 @@ const ASSETS = [
   "/index.html",
   "/styles.css?v=orientation-collapse-20260909-312-queue-editor313-queue-collapse314-plain-messages315-secure-credential-vault329-automation-menu333-portable",
   "/workbench.css?v=modern-workbench-20260830-4",
-  "/app.js?v=canvas-auth321-gnome-codex3-secure-credential-vault329-gnome-codex3-device-admin335-portable",
+  "/app.js?v=canvas-auth321-gnome-codex3-secure-credential-vault329-gnome-codex3-device-admin335-gnome-codex3-portable",
   "/sites.js?v=conversation-approval-persistence-20260906-300",
   "/automations.js?v=automation-menu333",
   "/release-status.json",
