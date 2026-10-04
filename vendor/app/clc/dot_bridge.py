@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import errno
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -49,6 +51,9 @@ class Bridge:
         self.server = None
         self.task = None
         self.clients = set()
+        self.socket_identity = None
+        self.socket_lock = None
+        self.socket_guard = None
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.directory, 0o700)
         self.db = sqlite3.connect(self.directory / "requests.sqlite3")
@@ -204,24 +209,94 @@ class Bridge:
             writer.close()
             self.clients.discard(current)
 
-    async def start(self, path=SOCKET):
-        self.path = Path(path)
-        # Directory is provisioned root-owned policy; do not relax any parent.
+    def _owns_socket(self):
+        try:
+            st = self.path.lstat()
+            return (st.st_dev, st.st_ino) == self.socket_identity and stat.S_ISSOCK(st.st_mode)
+        except FileNotFoundError:
+            return False
+
+    async def _bind_socket(self):
+        # Never let asyncio unlink a live socket implicitly.
         if self.path.exists() or self.path.is_symlink():
             info = self.path.lstat()
             if not stat.S_ISSOCK(info.st_mode) or info.st_uid != self.owner_uid:
                 raise PermissionError("socket preexistente inesperado")
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                probe.settimeout(0.2)
+                probe.connect(str(self.path))
+            except OSError as exc:
+                if exc.errno != errno.ECONNREFUSED:
+                    raise
+            else:
+                raise RuntimeError("ponte já está ativa; socket preservado")
+            finally:
+                probe.close()
+            current = self.path.lstat()
+            if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
+                raise RuntimeError("socket mudou durante a verificação")
             self.path.unlink()
-        self.server = await asyncio.start_unix_server(self.connection, path=str(self.path), limit=16384)
-        os.chmod(self.path, 0o660)
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.bind(str(self.path))
+            info = self.path.lstat()
+            self.socket_identity = (info.st_dev, info.st_ino)
+            os.chmod(self.path, 0o660)
+            sock.setblocking(False)
+            self.server = await asyncio.start_unix_server(self.connection, sock=sock, limit=16384)
+        except BaseException:
+            sock.close()
+            if self._owns_socket():
+                self.path.unlink()
+            raise
+
+    async def _guard_socket(self):
+        while True:
+            await asyncio.sleep(3)
+            try:
+                if self._owns_socket():
+                    continue
+                if self.path.exists() or self.path.is_symlink():
+                    raise RuntimeError("socket substituído; não sobrescrever")
+                self.server.close()
+                await self.server.wait_closed()
+                await self._bind_socket()
+                self.audit("socket_recovered")
+            except Exception as exc:
+                self.audit("socket_recovery_failed", error=type(exc).__name__)
+
+    async def start(self, path=SOCKET):
+        # Package/staging runtimes must never touch the production endpoint.
+        if str(path) == SOCKET and self.directory.resolve() != Path("/home/codex/.config/codex-linux-control/dot-system-bridge"):
+            raise PermissionError("socket de produção reservado à instância canônica")
+        self.path = Path(path)
+        fd = os.open(str(self.path) + ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+                raise PermissionError("lock inesperado")
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BaseException:
+            os.close(fd)
+            raise
+        self.socket_lock = fd
+        try:
+            await self._bind_socket()
+        except BaseException:
+            os.close(fd)
+            self.socket_lock = None
+            raise
         self.task = asyncio.create_task(self.loop(), name="clc-dot-system-bridge")
+        self.socket_guard = asyncio.create_task(self._guard_socket(), name="clc-dot-socket-guard")
         self.audit("online")
 
     async def close(self):
-        if self.task:
-            self.task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self.task
+        for task in (self.socket_guard, self.task):
+            if task:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
         if self.server:
             self.server.close()
             await self.server.wait_closed()
@@ -229,8 +304,11 @@ class Bridge:
             client.cancel()
         if self.clients:
             await asyncio.gather(*tuple(self.clients), return_exceptions=True)
-        if hasattr(self, "path") and self.path.exists():
+        if self.socket_identity is not None and self._owns_socket():
             self.path.unlink()
+        if self.socket_lock is not None:
+            os.close(self.socket_lock)
+            self.socket_lock = None
         if self.project_relay:
             self.project_relay.db.close()
         self.db.close()
