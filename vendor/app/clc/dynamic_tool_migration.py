@@ -16,7 +16,8 @@ def specs():
     from .lab_lifecycle import LAB_TOOL_SPEC
     from .build_lifecycle import BUILD_TOOL_SPEC
     from .publication_lifecycle import PUBLICATION_TOOL_SPEC
-    return [AUTOMATION_TOOL_SPEC, ANDROID_TOOL_SPEC, LAB_TOOL_SPEC, BUILD_TOOL_SPEC, PUBLICATION_TOOL_SPEC]
+    from .project_lifecycle import PROJECT_TOOL_SPEC
+    return [PROJECT_TOOL_SPEC, AUTOMATION_TOOL_SPEC, ANDROID_TOOL_SPEC, LAB_TOOL_SPEC, BUILD_TOOL_SPEC, PUBLICATION_TOOL_SPEC]
 
 def merge_tools(old):
     if old is None:

@@ -36,6 +36,7 @@ from .lab_lifecycle import LAB_TOOL_SPEC, LabLifecycle, migrate_lab_tools
 from .build_lifecycle import BUILD_TOOL_SPEC, BuildLifecycle, migrate_build_tools
 from .browser_credentials import BrowserCredentialVault, BrowserCredentialVaultError, canonical_secure_origin
 from .publication_lifecycle import PUBLICATION_TOOL_SPEC, PublicationLifecycle, migrate_publication_tools
+from .project_lifecycle import PROJECT_TOOL_SPEC, ProjectLifecycle, migrate_project_tools
 from .dynamic_tool_migration import migrate_rollout_tools
 from .codex_bridge import CodexBridge, CodexRPCError
 from .conversation_search import (
@@ -162,6 +163,7 @@ lab_lifecycle = LabLifecycle(
 )
 build_lifecycle = BuildLifecycle(lab_lifecycle.roots_for_workspace)
 publication_lifecycle = PublicationLifecycle(lab_lifecycle.roots_for_workspace)
+project_lifecycle = ProjectLifecycle(lambda: dot_system_bridge, tool_profiles.thread_project_id)
 conversation_approvals = ConversationApprovalRules(
     settings.resolved_config_dir / "conversation-approval-rules.sqlite3",
     project_path=lambda workspace: (
@@ -176,6 +178,9 @@ browser_credential_vault = BrowserCredentialVault(
 
 
 async def _handle_codex_server_request(workspace: str, message: dict[str, Any]) -> dict[str, Any] | None:
+    result = await project_lifecycle.handle_server_request(workspace, message)
+    if result is not None:
+        return result
     result = await publication_lifecycle.handle_server_request(workspace, message)
     if result is not None:
         return result
@@ -2532,7 +2537,7 @@ async def _thread_start_canary() -> str:
             "approvalPolicy": _thread_approval_policy(project),
             "sandbox": "danger-full-access",
             "serviceName": "codex_linux_control_system_canary",
-            "dynamicTools": [AUTOMATION_TOOL_SPEC, ANDROID_TOOL_SPEC, LAB_TOOL_SPEC, BUILD_TOOL_SPEC, PUBLICATION_TOOL_SPEC],
+            "dynamicTools": [AUTOMATION_TOOL_SPEC, ANDROID_TOOL_SPEC, LAB_TOOL_SPEC, BUILD_TOOL_SPEC, PUBLICATION_TOOL_SPEC, PROJECT_TOOL_SPEC],
         },
         target=system_bridge,
     )
@@ -2570,6 +2575,7 @@ async def startup_event() -> None:
             await asyncio.to_thread(migrate_lab_tools, _system_codex_state_database())
             await asyncio.to_thread(migrate_build_tools, _system_codex_state_database())
             await asyncio.to_thread(migrate_publication_tools, _system_codex_state_database())
+            await asyncio.to_thread(migrate_project_tools, _system_codex_state_database())
         except Exception:
             LOGGER.exception("Não foi possível vincular Android às conversas existentes")
         try:
@@ -6681,7 +6687,7 @@ async def create_thread(request: Request, payload: ThreadCreate) -> Dict[str, An
         "approvalPolicy": _thread_approval_policy(project),
         "sandbox": "danger-full-access" if project.kind == "system" else "workspace-write",
         "serviceName": "codex_linux_control_system" if project.kind == "system" else "codex_linux_control_projects",
-        "dynamicTools": [AUTOMATION_TOOL_SPEC, ANDROID_TOOL_SPEC, LAB_TOOL_SPEC, BUILD_TOOL_SPEC, PUBLICATION_TOOL_SPEC],
+        "dynamicTools": [AUTOMATION_TOOL_SPEC, ANDROID_TOOL_SPEC, LAB_TOOL_SPEC, BUILD_TOOL_SPEC, PUBLICATION_TOOL_SPEC, PROJECT_TOOL_SPEC],
     }
     if payload.model:
         params["model"] = payload.model
@@ -7001,7 +7007,7 @@ async def _run_automation(automation: Dict[str, Any]) -> str:
             "approvalPolicy": _thread_approval_policy(project),
             "sandbox": "danger-full-access" if project.kind == "system" else "workspace-write",
             "serviceName": "codex_linux_control_automations",
-            "dynamicTools": [AUTOMATION_TOOL_SPEC, ANDROID_TOOL_SPEC, LAB_TOOL_SPEC, BUILD_TOOL_SPEC, PUBLICATION_TOOL_SPEC],
+            "dynamicTools": [AUTOMATION_TOOL_SPEC, ANDROID_TOOL_SPEC, LAB_TOOL_SPEC, BUILD_TOOL_SPEC, PUBLICATION_TOOL_SPEC, PROJECT_TOOL_SPEC],
         }
         if automation.get("model"):
             params["model"] = automation["model"]
