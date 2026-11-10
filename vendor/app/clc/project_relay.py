@@ -73,7 +73,7 @@ class ProjectRelay:
         self.db.commit()
         try:
             result=await self.handler('send',payload)
-            status='dispatched'
+            status='queued' if result.get('status')=='busy' else 'dispatched'
         except Exception:
             result={'error':'Entrega não confirmada. Não repetir com outra chave; revisar no Sistema.'}
             status='dispatch_uncertain'

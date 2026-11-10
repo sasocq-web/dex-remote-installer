@@ -10,8 +10,12 @@
   <link rel="manifest" href="/manifest.webmanifest">
   <link rel="icon" href="/icons/codex-remoto-192.png" type="image/png">
   <link rel="apple-touch-icon" href="/icons/codex-remoto-192.png">
-  <link rel="stylesheet" href="/styles.css?v=orientation-collapse-20260909-312-queue-editor313-queue-collapse314-plain-messages315-secure-credential-vault329-automation-menu333-portable">
-  <link rel="stylesheet" href="/workbench.css?v=modern-workbench-20260830-4">
+  <link rel="stylesheet" href="/styles.css?v=disk-progress-20261106-eta-visible-async-questions-v2-20261105-enhancements-polish-20261105-questions-20261105-orientation-collapse-20260909-312-queue-editor313-queue-collapse314-plain-messages315-secure-credential-vault329-automation-menu333-execution343-reading344-portable">
+  <link rel="stylesheet" href="/workbench.css?v=modern-workbench-20260830-4-workspace-v1-reading344">
+  <link rel="stylesheet" href="/rich-ui-20261017/conversation-rich.css?v=reading344">
+  <link rel="stylesheet" href="/rich-ui-20261017/katex.min.css">
+  <link rel="stylesheet" href="/conversation-workspace.css?v=20261017-overview342-reading344-toolbar345-typography347">
+  <link rel="stylesheet" href="/sidebar-shortcuts.css?v=shortcuts346">
 </head>
 <body>
   <div id="app" class="app-shell inspector-collapsed">
@@ -61,21 +65,27 @@
       </section>
 
       <div class="side-footer">
-        <button id="open-pc-data" class="sidebar-pc-button" type="button">
+        <div id="sidebar-shortcuts" class="sidebar-shortcuts">
+          <details id="sidebar-shortcuts-menu" class="sidebar-shortcuts-menu">
+            <summary aria-label="Menu de atalhos" aria-expanded="false" aria-controls="sidebar-shortcuts-list"><span aria-hidden="true">☷</span><span>Menu</span></summary>
+            <nav id="sidebar-shortcuts-list" class="mobile-sidebar-navigation" aria-label="Atalhos do aplicativo">
+              <button data-sidebar-shortcut="pc" data-shortcut-icon="▤" data-shortcut-label="Dados do PC" id="open-pc-data" class="mobile-sidebar-action sidebar-pc-button" type="button">
           <span class="sidebar-pc-icon" aria-hidden="true">▤</span>
-          <span><strong>Dados do PC</strong><small>CPU, memória e SSD</small></span>
+          <span><strong>Dados do PC</strong><small>CPU, memória, SSD e HD</small></span>
           <span aria-hidden="true">›</span>
         </button>
-        <nav class="mobile-sidebar-navigation" aria-label="Navegação do aplicativo">
-          <button class="mobile-sidebar-action" data-operation-view="projects"><span aria-hidden="true">◇</span><span>Projetos</span></button>
-          <button class="mobile-sidebar-action" data-operation-view="queue"><span aria-hidden="true">☷</span><span>Fila</span></button>
-          <button class="mobile-sidebar-action" data-operation-view="automations"><span aria-hidden="true">◷</span><span>Agendamentos</span></button>
-          <button class="mobile-sidebar-action" data-operation-view="plugins"><span aria-hidden="true">⬡</span><span>Plugins</span></button>
-          <button class="mobile-sidebar-action" data-operation-view="sites"><span aria-hidden="true">◎</span><span>Sites acessados</span></button>
-          <button class="mobile-sidebar-action" data-operation-view="remote"><span aria-hidden="true">▣</span><span>Acesso remoto</span></button>
-          <button id="sidebar-open-codex" class="mobile-sidebar-action" data-operation-view="codex"><span aria-hidden="true">›_</span><span>Codex Sistema</span></button>
-          <button id="open-settings" class="mobile-sidebar-action"><span aria-hidden="true">⚙</span><span>Configurações</span></button>
-        </nav>
+              <button data-sidebar-shortcut="projects" data-shortcut-icon="◇" data-shortcut-label="Projetos" class="mobile-sidebar-action" data-operation-view="projects"><span aria-hidden="true">◇</span><span>Projetos</span></button>
+              <button data-sidebar-shortcut="queue" data-shortcut-icon="☷" data-shortcut-label="Fila" class="mobile-sidebar-action" data-operation-view="queue"><span aria-hidden="true">☷</span><span>Fila</span></button>
+              <button data-sidebar-shortcut="automations" data-shortcut-icon="◷" data-shortcut-label="Agendamentos" class="mobile-sidebar-action" data-operation-view="automations"><span aria-hidden="true">◷</span><span>Agendamentos</span></button>
+              <button data-sidebar-shortcut="plugins" data-shortcut-icon="⬡" data-shortcut-label="Plugins" class="mobile-sidebar-action" data-operation-view="plugins"><span aria-hidden="true">⬡</span><span>Plugins</span></button>
+              <button data-sidebar-shortcut="sites" data-shortcut-icon="◎" data-shortcut-label="Sites acessados" class="mobile-sidebar-action" data-operation-view="sites"><span aria-hidden="true">◎</span><span>Sites acessados</span></button>
+              <button data-sidebar-shortcut="remote" data-shortcut-icon="▣" data-shortcut-label="Acesso remoto" class="mobile-sidebar-action" data-operation-view="remote"><span aria-hidden="true">▣</span><span>Acesso remoto</span></button>
+              <button data-sidebar-shortcut="codex" data-shortcut-icon="›_" data-shortcut-label="Codex Sistema" id="sidebar-open-codex" class="mobile-sidebar-action" data-operation-view="codex"><span aria-hidden="true">›_</span><span>Codex Sistema</span></button>
+              <button data-sidebar-shortcut="settings" data-shortcut-icon="⚙" data-shortcut-label="Configurações" id="open-settings" class="mobile-sidebar-action"><span aria-hidden="true">⚙</span><span>Configurações</span></button>
+            </nav>
+          </details>
+          <button id="sidebar-last-shortcut" class="sidebar-last-shortcut" type="button" title="Dados do PC"><span data-shortcut-icon aria-hidden="true">▤</span><span data-shortcut-label>Dados do PC</span></button>
+        </div>
         <button id="install-pwa" class="secondary-button full-width hidden">Instalar no dispositivo</button>
         <button id="open-system" class="hidden" tabindex="-1" aria-hidden="true">Sistema</button>
       </div>
@@ -197,7 +207,7 @@
 
     <aside id="inspector" class="inspector">
       <div class="inspector-header">
-        <div class="tabs inspector-tabs" role="tablist" aria-label="Painel contextual da conversa">
+        <div class="tabs inspector-tabs" role="tablist" aria-label="Painel de conversas e execução">
           <button class="tab active" data-tab="summary" role="tab" aria-selected="true">Resumo <span id="inspector-summary-count" class="badge hidden">0</span></button>
           <button class="tab" data-tab="execution" role="tab" aria-selected="false">Execução <span id="execution-event-count" class="badge hidden">0</span></button>
           <button class="tab" data-tab="screen" role="tab" aria-selected="false">Tela</button>
@@ -614,7 +624,7 @@
     </div>
     <div class="pc-data-scroll">
       <div id="pc-data-content" class="pc-data-content" aria-live="polite">
-        <div class="panel-empty">Carregando CPU, memória e SSD…</div>
+        <div class="panel-empty">Carregando CPU, memória, SSD e HD…</div>
       </div>
       <div class="pc-data-tabs" role="tablist" aria-label="Gerenciadores do PC">
         <button class="active" type="button" role="tab" aria-selected="true" data-pc-tab="overview">Visão geral</button>
@@ -760,10 +770,13 @@
   </dialog>
 
   <div id="toast-container" class="toast-container" aria-live="assertive"></div>
-  <script src="/app.js?v=canvas-auth321-gnome-codex3-secure-credential-vault329-gnome-codex3-device-admin335-gnome-codex3-portable" defer></script>
+  <script src="/rich-ui-20261017/conversation-rich.js" defer></script>
+  <script src="/app.js?v=disk-progress-20261106-eta-visible-async-questions-v2-20261105-enhancements-polish-20261105-questions-20261105-credit-validity-20261105-hd-capacity-20261103-credential-input-stability-20261031-upload-conversation-20261024-canvas-auth321-gnome-codex3-secure-credential-vault329-gnome-codex3-device-admin335-gnome-codex3-rich-conversations-20261017-workspace-v1-menu341-overview342-gnome-codex3-execution343-activity346-follow1-gnome-codex3-portable" defer></script>
   <script src="/sites.js?v=conversation-approval-persistence-20260906-300" defer></script>
   <script src="/automations.js?v=automation-menu333" defer></script>
   <script src="/operations.js?v=queue-reorder-20260908-304-queue-editor313-queue-collapse314-conversation-load317" defer></script>
-  <script src="/workbench.js?v=modern-workbench-20260830-4" defer></script>
+  <script src="/workbench.js?v=modern-workbench-20260830-4-workspace-v1" defer></script>
+  <script src="/conversation-workspace.js?v=20261017-overview342-reading344-toolbar345" defer></script>
+  <script src="/sidebar-shortcuts.js?v=shortcuts346" defer></script>
 </body>
 </html>

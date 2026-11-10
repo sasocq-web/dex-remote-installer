@@ -393,7 +393,7 @@ class AutomationStore:
         with closing(self._connect()) as connection, connection:
             connection.execute(
                 "UPDATE automation_runs SET thread_id=?,status=?,error=?,completed_at=? WHERE id=?",
-                (thread_id, "FAILED" if error else "STARTED", error[:4000], time.time(), run_id),
+                (thread_id, "FAILED" if error else ("STARTED" if thread_id else "CHECKED"), error[:4000], time.time(), run_id),
             )
 
 

@@ -47,12 +47,16 @@ CREDENTIAL_TOOL = {
         "pedido chegar como orientação durante uma execução. Conduza primeiro a página até o campo necessário. "
         "Nunca peça o segredo no chat nem o digite com browser_type/browser_fill_form. "
         "Login e senha salvos são reutilizados somente na mesma origem HTTPS; código temporário nunca é salvo. "
-        "A ferramenta devolve somente o resultado do preenchimento, nunca os valores informados pelo usuário."
+        "A ferramenta devolve somente o resultado do preenchimento, nunca os valores informados pelo usuário. "
+        "http_auth_url atende um desafio HTTP na URL atual do proxy VPN; não usa campos DOM. "
+        "Somente Sistema/Power automate. O contexto fica restrito ao caminho do destino e expira em até 330 segundos. "
+        "authenticated=false não confirma acesso nem senha rejeitada; Negotiate depende do servidor/navegador."
     ),
     "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
         "properties": {
+            "http_auth_url": {"type":"string","maxLength":2000,"description":"URL exata atual do desafio HTTP no proxy VPN. Reutiliza o cofre da mesma origem; fecha o contexto em até 330s. Não misturar com campos DOM."},
             "site": {
                 "type": "string",
                 "description": "Domínio ou nome do serviço mostrado ao usuário.",
@@ -222,6 +226,44 @@ workspace_root = Path.cwd().resolve()
 provide_workspace_root = False
 
 
+# Per-wire IDs make late replies harmless without an unbounded tombstone set.
+pending_calls = {}
+pending_calls_lock = threading.Lock()
+REQUEST_TIMEOUT_SECONDS = 60
+WIRE_PREFIX = "sasocq-wire-"
+
+def _finish_pending(request_id):
+    with pending_calls_lock:
+        entry = pending_calls.pop(request_id, None)
+    if entry:
+        entry[1].cancel()
+    return entry
+
+def _expire_pending(request_id):
+    entry = _finish_pending(request_id)
+    if entry:
+        tool_list_requests.discard(entry[0].get("id"))
+        emit_error(entry[0], "Playwright sem resposta no prazo; resultado desconhecido. Operação não repetida.")
+
+def _fail_pending(generation=None):
+    with pending_calls_lock:
+        ids = [key for key, value in pending_calls.items()
+               if generation is None or value[2] == generation]
+        entries = [pending_calls.pop(key) for key in ids]
+    for message, timer, _generation in entries:
+        timer.cancel()
+        tool_list_requests.discard(message.get("id"))
+        emit_error(message, "Conexão Playwright encerrada; resultado desconhecido. Operação não repetida.")
+
+def _request_timeout(message):
+    params = message.get("params") or {}
+    if params.get("name") == "browser_wait_for":
+        try:
+            return max(REQUEST_TIMEOUT_SECONDS, min(3600, float((params.get("arguments") or {}).get("time", 0)) + 30))
+        except (TypeError, ValueError):
+            pass
+    return REQUEST_TIMEOUT_SECONDS
+
 class BackendUnavailable(RuntimeError):
     pass
 
@@ -230,9 +272,66 @@ class CredentialRoutePending(RuntimeError):
     pass
 
 
+
+# Retain protected values only in this conversation adapter's memory, never
+# in a file. Suppressed internal responses remain available to the fill route.
+_protected_values: set[str] = set()
+_protected_values_lock = threading.Lock()
+
+
+def _remember_protected_values(values: dict[str, Any]) -> None:
+    with _protected_values_lock:
+        _protected_values.update(value for value in values.values() if isinstance(value, str) and value)
+
+
+def _mask_snapshot_inputs(text: str) -> str:
+    lines = text.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        if not re.match(r"^\s*- (?:textbox|searchbox|spinbutton)\b", line):
+            continue
+        quoted = False
+        escaped = False
+        depth = 0
+        for offset, char in enumerate(line):
+            if escaped:
+                escaped = False
+                continue
+            if char == "\\" and quoted:
+                escaped = True
+                continue
+            if char == '"':
+                quoted = not quoted
+            elif not quoted:
+                if char == '[':
+                    depth += 1
+                elif char == ']':
+                    depth = max(0, depth - 1)
+                elif char == ':' and depth == 0:
+                    newline = "\n" if line.endswith("\n") else ""
+                    lines[index] = line[:offset] + ': [REDACTED]' + newline
+                    break
+    return ''.join(lines)
+
+
+def _redact_inspection(value: Any) -> Any:
+    if isinstance(value, str):
+        with _protected_values_lock:
+            secrets = sorted(_protected_values, key=len, reverse=True)
+        for secret in secrets:
+            value = value.replace(secret, '[REDACTED]')
+        # Playwright transport exceptions can embed complete request headers.
+        value = re.sub(r'(?im)((?:cookie|set-cookie|authorization|proxy-authorization)\s*:\s*)[^\r\n]+', r'\1[REDACTED]', value)
+        return _mask_snapshot_inputs(value)
+    if isinstance(value, list):
+        return [_redact_inspection(item) for item in value]
+    if isinstance(value, dict):
+        return {key: ('[REDACTED]' if str(key).casefold() in {'password', 'passwd', 'one_time_code', 'cookie', 'set-cookie', 'authorization', 'proxy-authorization'} else _redact_inspection(item)) for key, item in value.items()}
+    return value
+
+
 def emit(message: object) -> None:
     with emit_lock:
-        sys.stdout.write(json.dumps(message, separators=(",", ":")) + "\n")
+        sys.stdout.write(json.dumps(_redact_inspection(message), separators=(",", ":")) + "\n")
         sys.stdout.flush()
 
 
@@ -242,6 +341,12 @@ def emit_error(message: dict[str, Any], detail: str) -> None:
 
 
 def _deliver(event: dict[str, Any]) -> None:
+    response_id = event.get("id")
+    if "method" not in event and isinstance(response_id, str) and response_id.startswith(WIRE_PREFIX):
+        entry = _finish_pending(response_id)
+        if entry is None:
+            return
+        event = {**event, "id": entry[0]["id"]}
     if event.get("method") == "roots/list" and "id" in event and provide_workspace_root:
         _post({
             "jsonrpc": "2.0",
@@ -306,6 +411,10 @@ def _internal_tool_call(name: str, arguments: dict[str, Any], timeout: float = 3
 
 
 def _credential_schema(arguments: dict[str, Any]) -> tuple[dict[str, Any], list[tuple[str, str, str]]]:
+    if arguments.get("http_auth_url"):
+        if any(arguments.get(k) for k in ("login_target","password_target","one_time_code_target","submit_target")):
+            raise ValueError("autenticação HTTP não aceita campos DOM")
+        return {}, [("login", "http", "textbox"), ("password", "http", "textbox")]
     properties: dict[str, Any] = {}
     requested: list[tuple[str, str, str]] = []
     definitions = (
@@ -401,7 +510,7 @@ def _credential_bridge_json(operation: str, payload: dict[str, Any]) -> dict[str
         raise RuntimeError("a ponte protegida desta release não foi configurada")
     message = json.dumps({"op": operation, **payload}, separators=(",", ":")).encode() + b"\n"
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-        client.settimeout(10)
+        client.settimeout(40 if operation == "poll_http_auth" else 10)
         client.connect(CREDENTIAL_BRIDGE_SOCKET)
         client.sendall(message)
         chunks = bytearray()
@@ -433,6 +542,7 @@ def _request_protected_credentials(
     origin: str = "",
     force_prompt: bool = False,
     prompt_if_missing: bool = False,
+    http_binding: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     deadline = time.monotonic() + 300
     registered = False
@@ -447,6 +557,7 @@ def _request_protected_credentials(
                     "fields": fields,
                     "kind": kind,
                     "origin": origin,
+                    "http_auth_url": (http_binding or {}).get("url", ""),
                     "force_prompt": force_prompt,
                     "prompt_if_missing": prompt_if_missing,
                 },
@@ -457,13 +568,73 @@ def _request_protected_credentials(
     if not registered:
         raise TimeoutError("a conversa não registrou o formulário protegido")
     while time.monotonic() < deadline:
-        answer = _credential_bridge_json("poll", {"request_token": request_token})
+        answer = _credential_bridge_json("poll_http_auth" if http_binding else "poll", {"request_token": request_token, **(http_binding or {})})
         if answer.get("status") == "waiting":
             time.sleep(0.2)
             continue
         return answer
     raise TimeoutError("A solicitação protegida de credenciais expirou após 5 minutos")
 
+
+
+def _http_auth_guard_code(url):
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https" or parsed.netloc != "vpn1.nuclep.gov.br" or parsed.fragment or not re.match(r"^/proxy/[a-fA-F0-9]{8,64}/https?/[a-zA-Z0-9.-]+/", parsed.path):
+        raise ValueError("destino HTTP fora do proxy VPN autorizado")
+    binding={"url":url,"prefix":"/".join(parsed.path.split("/")[:5])+"/"}
+    return """async (page) => {
+      const binding = BINDING_VALUE;
+      const ctx=page.context();
+      const session=await ctx.newCDPSession(page);
+      try {
+        const info=await session.send('Target.getTargetInfo');
+        if(info.targetInfo.url!==binding.url ||
+           (page.url()!==binding.url && page.url()!=='chrome-error://chromewebdata/'))
+          throw Error('http_auth_page_changed');
+        if(ctx.pages().length!==1 || ctx.serviceWorkers().some(w=>!w.url().startsWith('chrome-extension://')))
+          throw Error('http_auth_requires_single_page_without_workers');
+        await ctx.route('**/*', async route=>{
+          // The MCP code sandbox has no URL global. Chromium supplies a
+          // canonical absolute URL; match the full origin+backend prefix.
+          const request=route.request();
+          const supportScripts=[
+            'https://vpn1.nuclep.gov.br/remote/sslvpn_support.js',
+            'https://vpn1.nuclep.gov.br/sslvpn/js/aes.js',
+            'https://vpn1.nuclep.gov.br/sslvpn/js/sslvpn.js',
+            'https://vpn1.nuclep.gov.br/sslvpn/js/sslvpn_util.js'
+          ];
+          // VPN helpers are exact same-origin script subresources only.
+          // Never follow a helper redirect, even into the allowed backend.
+          let previous=request.redirectedFrom(),supportRedirect=false;
+          while(previous){
+            if(supportScripts.includes(previous.url()))supportRedirect=true;
+            previous=previous.redirectedFrom();
+          }
+          const supportScript=request.method()==='GET' &&
+            request.resourceType()==='script' && !request.isNavigationRequest() &&
+            request.frame()===page.mainFrame() && supportScripts.includes(request.url());
+          const backend=request.url().startsWith('https://vpn1.nuclep.gov.br'+binding.prefix);
+          if(!supportRedirect && (backend || (supportScript && !request.redirectedFrom())))
+            await route.continue(); else await route.abort();
+        });
+        await ctx.routeWebSocket('**/*', socket=>socket.close());
+        ctx.on('serviceworker',w=>{if(!w.url().startsWith('chrome-extension://'))ctx.close().catch(()=>{});});
+        void page.waitForTimeout(330000).then(()=>ctx.close()).catch(()=>{});
+        return {target_id:info.targetInfo.targetId,url:info.targetInfo.url};
+      } finally {await session.detach();}
+    }""".replace("BINDING_VALUE",json.dumps(binding))
+
+
+def _prepare_http_auth(url):
+    # This code has no secret input and works while a failed 401 document is
+    # represented as chrome-error:// by the renderer. CDP owns the real URL.
+    code=_http_auth_guard_code(url)
+    result=_internal_tool_call("browser_run_code_unsafe", {"code":code}, timeout=20)
+    texts="\n".join(str(x.get("text", "")) for x in result.get("content",[]) if isinstance(x,dict))
+    match=re.search(r'\{\s*"target_id"\s*:\s*"([a-fA-F0-9]{32})"',texts)
+    if result.get("isError") or not match:
+        raise ValueError("não foi possível vincular o desafio à página isolada")
+    return {"target_id":match.group(1),"url":url}
 
 def _handle_credential_call(message: dict[str, Any]) -> None:
     request_id = message.get("id")
@@ -475,7 +646,8 @@ def _handle_credential_call(message: dict[str, Any]) -> None:
             raise ValueError("parâmetros de credenciais inválidos")
         schema, requested = _credential_schema(arguments)
         fallback_site = str(arguments.get("site") or "este site").strip()[:200]
-        current_url = _current_browser_url()
+        http_binding = _prepare_http_auth(arguments["http_auth_url"]) if arguments.get("http_auth_url") else None
+        current_url = http_binding["url"] if http_binding else _current_browser_url()
         parsed = urllib.parse.urlparse(current_url)
         site = (
             parsed.hostname + (f":{parsed.port}" if parsed.port else "")
@@ -497,12 +669,16 @@ def _handle_credential_call(message: dict[str, Any]) -> None:
             purpose,
             [field for field, _target, _field_type in requested],
             origin=origin,
+            http_binding=http_binding,
             force_prompt=bool(arguments.get("force_prompt", False)),
             prompt_if_missing=(
                 bool(arguments.get("prompt_if_missing", False))
                 or bool(arguments.get("force_prompt", False))
             ),
         )
+        if http_binding and answer.get("ok"):
+            _credential_result(request_id, json.dumps(answer, ensure_ascii=False))
+            return
         if answer.get("action") != "accept":
             if answer.get("missing"):
                 _credential_result(
@@ -518,6 +694,7 @@ def _handle_credential_call(message: dict[str, Any]) -> None:
         if not isinstance(content, dict):
             raise ValueError("o formulário protegido não devolveu conteúdo válido")
         secret_content = content
+        _remember_protected_values(content)
         fields = []
         for field, target, field_type in requested:
             value = content.get(field)
@@ -574,6 +751,7 @@ def _handle_payment_card_call(message: dict[str, Any]) -> None:
         if not isinstance(content, dict):
             raise ValueError("o formulário protegido não devolveu conteúdo válido")
         secret_content = content
+        _remember_protected_values(content)
         fields = []
         limits = {name: int(definition.get("maxLength") or 0) for name, definition in schema["properties"].items()}
         for field, target, field_type in requested:
@@ -615,8 +793,11 @@ def _consume_sse(generation: int, ready: threading.Event) -> None:
                 elif not line:
                     data = "\n".join(data_lines)
                     if event_name == "endpoint" and data:
-                        post_url = urllib.parse.urljoin(BASE_URL, data)
-                        ready.set()
+                        with stream_lock:
+                            if generation != stream_generation:
+                                return
+                            post_url = urllib.parse.urljoin(BASE_URL, data)
+                            ready.set()
                     elif data:
                         try:
                             event = json.loads(data)
@@ -629,18 +810,22 @@ def _consume_sse(generation: int, ready: threading.Event) -> None:
     except Exception:
         pass
     finally:
-        if generation == stream_generation:
-            post_url = ""
-            ready.set()
+        with stream_lock:
+            if generation == stream_generation:
+                post_url = ""
+                ready.set()
+        _fail_pending(generation)
 
 
 def _invalidate_stream() -> None:
     global post_url, stream_generation, stream_thread, stream_ready
     with stream_lock:
+        old_generation = stream_generation
         stream_generation += 1
         post_url = ""
         stream_thread = None
         stream_ready = threading.Event()
+    _fail_pending(old_generation)
 
 
 def _ensure_stream(timeout: float = 10.0) -> None:
@@ -672,9 +857,28 @@ def _post(message: dict[str, Any]) -> None:
         connected = bool(endpoint and stream_thread and stream_thread.is_alive())
     if not connected:
         raise BackendUnavailable("a conexão SSE terminou; é necessário reinicializar a sessão MCP")
+    request_id = message.get("id")
+    with suppressed_lock:
+        internal = request_id in suppressed_responses
+    track = "id" in message and "method" in message and not internal
+    wire_id = None
+    outgoing = message
+    if track:
+        wire_id = WIRE_PREFIX + str(uuid.uuid4())
+        outgoing = {**message, "id": wire_id}
+        timer = threading.Timer(_request_timeout(message), _expire_pending, args=(wire_id,))
+        timer.daemon = True
+        # Serialize registration with invalidation; never register against a
+        # stream which has already been replaced.
+        with stream_lock:
+            if endpoint != post_url:
+                raise BackendUnavailable("a conexão SSE mudou antes do envio")
+            with pending_calls_lock:
+                pending_calls[wire_id] = (message, timer, stream_generation)
+        timer.start()
     request = urllib.request.Request(
         endpoint,
-        data=json.dumps(message, separators=(",", ":")).encode(),
+        data=json.dumps(outgoing, separators=(",", ":")).encode(),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
@@ -682,6 +886,9 @@ def _post(message: dict[str, Any]) -> None:
         with urllib.request.urlopen(request, timeout=10) as response:
             response.read()
     except Exception as exc:
+        if track and _finish_pending(wire_id) is None:
+            # A response/deadline/disconnect already completed this call.
+            return
         raise BackendUnavailable(str(exc)) from exc
 
 

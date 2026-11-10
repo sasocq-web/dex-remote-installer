@@ -111,8 +111,15 @@
     const query = new URLSearchParams({repo:wb.git.repo, scope});
     const data = await api(endpoint(`/git/diff?${query}`));
     wb.git.diff = data.diff || "";
-    content.innerHTML = `<div class="workbench-toolbar"><button data-workbench-open="git">← Voltar</button><strong>${escape(scope)}</strong></div><pre class="workbench-diff">${escape(wb.git.diff || "Nenhuma diferença neste escopo.")}</pre>`;
+    content.innerHTML = `<div class="workbench-toolbar"><button data-workbench-open="git">← Voltar</button><strong>${escape(scope)}</strong></div>${window.DexConversationWorkspace ? window.DexConversationWorkspace.diffHTML(wb.git.diff || "Nenhuma diferença neste escopo.") : `<pre class="workbench-diff">${escape(wb.git.diff)}</pre>`}`;
   }
+
+  content.addEventListener("click", event => {
+    const target = event.target.closest('[data-cw-action="comment"]');
+    if (!target) return;
+    event.stopPropagation();
+    window.DexConversationWorkspace?.commentForm(target, projectId(), wb.git.repo);
+  });
 
   function selectedGitPaths() { return [...content.querySelectorAll("[data-git-path]:checked")].map(input => input.dataset.gitPath); }
 

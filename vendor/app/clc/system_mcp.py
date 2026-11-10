@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 from typing import Any, Callable, Dict
 
@@ -120,6 +121,34 @@ def _call(action: str, params: dict[str, Any]) -> Any:
     return result
 
 
+def _support_test_gate(args: dict[str, Any]) -> dict[str, Any] | None:
+    """Known support-test invocations use the existing bounded qualification gate.
+
+    No arbitrary command is classified as read-only and no failed request is
+    replayed. The gate validates protected staging and runs the complete suite.
+    """
+    match = re.fullmatch(r"/opt/codex-linux-control/staging/([A-Za-z0-9][A-Za-z0-9._-]{0,49})/support", str(args.get("cwd", "")))
+    argv = args.get("argv")
+    if not match or not isinstance(argv, list) or not all(isinstance(x, str) for x in argv):
+        return None
+    command = list(argv)
+    if command and command[0] in ("runuser", "/usr/sbin/runuser"):
+        if command[1:5] != ["-u", "codex-worker", "--", "python3"] and command[1:5] != ["-u", "codex-worker", "--", "/usr/bin/python3"]:
+            return None
+        command = command[4:]
+    if not command or command[0] not in ("python3", "/usr/bin/python3"):
+        return None
+    command = command[1:]
+    if command[:1] == ["-B"]:
+        command = command[1:]
+    if command[:2] != ["-m", "unittest"]:
+        return None
+    if args.get("environment") or args.get("input_text"):
+        raise ValueError("Testes de suporte com ambiente/entrada personalizados exigem qualificação explícita pelo prepare-rollout --check-only")
+    return {"operation": "exec", "argv": ["/usr/lib/codex-linux-control/prepare-rollout", match[1],
+            "--support-source", args["cwd"], "--check-only"], "timeout": 90}
+
+
 def _dispatch(name: str, args: dict[str, Any]) -> Any:
     if name == "sasocq_host_overview":
         return _call("system", {"operation": "overview"})
@@ -146,6 +175,10 @@ def _dispatch(name: str, args: dict[str, Any]) -> Any:
     if name == "sasocq_physical_session":
         return _call("physical", args or {"operation": "status"})
     if name == "sasocq_host_exec":
+        gate = _support_test_gate(args)
+        if gate is not None:
+            output = _call("host-admin", gate)
+            return "Diagnóstico de suporte encaminhado ao gate completo isolado (sem publicação).\n" + str(output)
         return _call("host-admin", {"operation": "exec", **args})
     if name == "sasocq_host_read_file":
         return _call("host-admin", {"operation": "read-file", **args})

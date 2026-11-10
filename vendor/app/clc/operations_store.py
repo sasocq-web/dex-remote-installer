@@ -185,6 +185,23 @@ class OperationsStore:
             self._write(data)
             return dict(item)
 
+    def mark_thread_read(self, thread_id: str, turn_id: str) -> dict[str, Any]:
+        with self._lock:
+            data = self._read()
+            item = data.setdefault("threads", {}).setdefault(thread_id, {})
+            completed = (item.get("execution_timing") or {}).get("last_completed_turn_id")
+            if not completed or completed != turn_id:
+                raise ValueError("A resposta mudou; aguarde a conversa atualizar.")
+            item["read_turn_id"] = completed
+            self._write(data)
+            return {"completed_turn_id": completed, "read_turn_id": completed}
+
+    def thread_read_states(self) -> dict[str, Any]:
+        with self._lock:
+            return {key: {"completed_turn_id": (item.get("execution_timing") or {}).get("last_completed_turn_id", ""),
+                          "read_turn_id": item.get("read_turn_id", "")}
+                    for key, item in self._read().get("threads", {}).items()}
+
     def record_thread_execution(
         self,
         thread_id: str,

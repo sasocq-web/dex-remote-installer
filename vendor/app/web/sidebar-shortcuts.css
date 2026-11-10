@@ -1,0 +1,72 @@
+/* Compact destinations below project options, on desktop and Android. */
+.sidebar-shortcuts {
+  position: relative;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px;
+  flex-shrink: 0;
+}
+.sidebar-shortcuts-menu { min-width: 0; }
+.sidebar-shortcuts-menu > summary,
+.sidebar-last-shortcut,
+.sidebar-shortcuts .mobile-sidebar-action {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  min-height: 46px;
+  padding: 9px 10px;
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  background: var(--surface-2);
+  color: var(--text);
+  font: inherit;
+  font-size: .8125rem;
+  font-weight: 700;
+  text-align: left;
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+.sidebar-shortcuts-menu > summary { height: 100%; list-style: none; }
+.sidebar-shortcuts-menu > summary::-webkit-details-marker { display: none; }
+.sidebar-shortcuts-menu > summary::after { content: '⌃'; margin-left: auto; }
+.sidebar-shortcuts-menu[open] > summary::after { content: '⌄'; }
+.sidebar-shortcuts-menu > summary > span:first-child,
+.sidebar-last-shortcut > span:first-child,
+.sidebar-shortcuts .mobile-sidebar-action > span:first-child { color: var(--accent); font-size: 1.125rem; flex-shrink: 0; }
+.sidebar-shortcuts-menu > summary:focus-visible,
+.sidebar-last-shortcut:focus-visible,
+.sidebar-shortcuts .mobile-sidebar-action:focus-visible { outline: 2px solid var(--accent); outline-offset: -3px; }
+.sidebar-shortcuts .mobile-sidebar-navigation {
+  position: absolute;
+  z-index: 30;
+  bottom: calc(100% + 8px);
+  left: 0;
+  right: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px;
+  max-height: min(60dvh, 430px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 13px;
+  background: var(--surface);
+  box-shadow: 0 8px 24px #0005;
+}
+.sidebar-shortcuts-menu:not([open]) > .mobile-sidebar-navigation { display: none; }
+.sidebar-shortcuts .mobile-sidebar-action small { display: none; }
+.sidebar-shortcuts .mobile-sidebar-action strong { font: inherit; }
+.sidebar-shortcuts .sidebar-pc-icon { width: auto; height: auto; padding: 0; background: none; border-radius: 0; }
+.sidebar-shortcuts .mobile-sidebar-action > span:last-child:not(:nth-child(2)) { display: none; }
+
+/* A narrow drawer or enlarged global type needs full-width menu items. */
+.sidebar-shortcuts { container-type: inline-size; container-name: sidebar-shortcuts; }
+.sidebar-last-shortcut > [data-shortcut-label],
+.sidebar-shortcuts-menu > summary > span:last-of-type {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+@container sidebar-shortcuts (max-width: 20rem) {
+  .sidebar-shortcuts .mobile-sidebar-navigation { grid-template-columns: minmax(0, 1fr); }
+}

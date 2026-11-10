@@ -211,7 +211,7 @@ PY
   fi
   curl -fsS -b "$cookies" "http://127.0.0.1:$port/api/health" >"$health"
   curl -fsS -b "$cookies" "http://127.0.0.1:$port/api/projects" >"$projects"
-  curl -fsS "http://127.0.0.1:$port/" | grep -q '<title>Codex Linux Control</title>'
+  curl -fsS "http://127.0.0.1:$port/" | grep '<title>Codex Linux Control</title>' >/dev/null
   mkdir -p "$TEST_ROOT/mock-bin"
   cat >"$TEST_ROOT/mock-bin/xdg-open" <<'EOF'
 #!/bin/sh
@@ -290,7 +290,7 @@ PY
 fi
 
 if rg -n --hidden --glob '!*.png' --glob '!test-package.sh' \
-  'BEGIN (RSA|OPENSSH|EC|PGP) PRIVATE KEY|sk-[A-Za-z0-9_-]{20,}|ghp_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|[A-Za-z0-9._%+-]+@(gmail|hotmail|outlook)\.' \
+  'BEGIN (RSA|OPENSSH|EC|PGP) PRIVATE KEY|\bsk-[A-Za-z0-9_-]{20,}|ghp_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|[A-Za-z0-9._%+-]+@(gmail|hotmail|outlook)\.' \
   "$EXTRACT"; then
   echo "Possível credencial ou identidade pessoal encontrada no pacote" >&2
   exit 1

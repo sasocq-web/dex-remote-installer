@@ -13,11 +13,14 @@ MAX_META = 16 * 1024 * 1024
 def specs():
     from .automations import AUTOMATION_TOOL_SPEC
     from .android_lifecycle import ANDROID_TOOL_SPEC
+    from .feedback_source_lifecycle import SOURCE_TOOL_SPEC
     from .lab_lifecycle import LAB_TOOL_SPEC
     from .build_lifecycle import BUILD_TOOL_SPEC
     from .publication_lifecycle import PUBLICATION_TOOL_SPEC
     from .project_lifecycle import PROJECT_TOOL_SPEC
-    return [PROJECT_TOOL_SPEC, AUTOMATION_TOOL_SPEC, ANDROID_TOOL_SPEC, LAB_TOOL_SPEC, BUILD_TOOL_SPEC, PUBLICATION_TOOL_SPEC]
+    from .system_request_lifecycle import SYSTEM_REQUEST_TOOL_SPEC
+    from .service_browser_lifecycle import SERVICE_BROWSER_TOOL_SPEC
+    return [SYSTEM_REQUEST_TOOL_SPEC, PROJECT_TOOL_SPEC, AUTOMATION_TOOL_SPEC, ANDROID_TOOL_SPEC, SOURCE_TOOL_SPEC, LAB_TOOL_SPEC, BUILD_TOOL_SPEC, PUBLICATION_TOOL_SPEC, SERVICE_BROWSER_TOOL_SPEC]
 
 def merge_tools(old):
     if old is None:

@@ -43,7 +43,12 @@ apenas a limitação e mantenha os detalhes nesta conversa do Sistema.
 """
 
 class Bridge:
-    def __init__(self, directory: Path, runner, ready, owner_uid=None, worker_uid=1001, project_handler=None):
+    def __init__(self, directory: Path, runner, ready, owner_uid=None, worker_uid=1001, project_handler=None, queue_limit=50, hourly_limit=60, thread_probe=None):
+        if not 1 <= queue_limit <= 500 or not 1 <= hourly_limit <= 1000:
+            raise ValueError("limites de fila inválidos")
+        self.queue_limit, self.hourly_limit = queue_limit, hourly_limit
+        self.thread_probe = thread_probe
+        self._last_reconcile = 0.0
         self.directory = Path(directory)
         self.runner, self.ready = runner, ready
         self.owner_uid = os.getuid() if owner_uid is None else owner_uid
@@ -76,7 +81,42 @@ class Bridge:
         return dict(row)
 
     def public(self, row):
-        return {k: row[k] for k in ("id", "topic", "mode", "title", "created", "updated", "status", "thread_id", "result")}
+        value = {k: row[k] for k in ("id", "topic", "mode", "title", "created", "updated", "status", "thread_id", "result")}
+        value["state_label"] = {"queued":"Registrado; aguardando execução", "dispatching":"Iniciando execução", "running":"Em execução", "waiting_operator":"Aguardando operador", "dispatch_uncertain":"Despacho incerto; revisão necessária", "blocked":"Dependência ou revisão necessária"}.get(row["status"], row["status"])
+        return value
+
+    def counts(self):
+        return {r[0]: r[1] for r in self.db.execute("SELECT status,count(*) FROM requests GROUP BY status")}
+
+    def conflict_scope(self, row):
+        # Authenticated native provenance, never derive authority from request text.
+        if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='native_request_origins'").fetchone():
+            origin = self.db.execute("SELECT project FROM native_request_origins WHERE id=?", (row["id"],)).fetchone()
+            if origin:
+                return (origin[0], row["topic"])
+        return ("legacy", row["topic"])
+
+    async def reconcile(self):
+        # A finished turn is not proof the requested work succeeded. Never replay.
+        if self.thread_probe is None or time.monotonic() - self._last_reconcile < 60:
+            return
+        self._last_reconcile = time.monotonic()
+        rows = self.db.execute("SELECT * FROM requests WHERE status='running' AND updated<? ORDER BY updated LIMIT 1", (time.time()-60,)).fetchall()
+        for row in rows:
+            if not row["thread_id"]:
+                continue
+            try:
+                state = await asyncio.wait_for(self.thread_probe(row["thread_id"]), 10)
+            except Exception:
+                return  # Unknown execution remains protected.
+            if state != "inactive":
+                continue
+            changed = self.db.execute("UPDATE requests SET status='blocked', updated=?, result=? WHERE id=? AND status='running' AND updated=?",
+                (time.time(), "Executor sem turno ativo; resultado não conciliado. Revisar antes de retomar; nenhuma repetição automática.", row["id"], row["updated"])).rowcount
+            self.db.commit()
+            if changed:
+                self.audit("inactive_executor_reconciled", id=row["id"], status="blocked")
+
 
     def handle(self, uid, data):
         if uid not in (self.owner_uid, self.worker_uid):
@@ -96,9 +136,10 @@ class Bridge:
             return {"version": 1, "ready": bool(self.ready()), "topics": TOPICS,
                     "identity": "codex-worker -> Codex Sistema via Dex",
                     "broker_access": False, "shared_with": "all processes of codex-worker",
+                    "queue_limit": self.queue_limit, "execution_limit": 1, "counts": self.counts(),
                     "pending": self.db.execute("SELECT count(*) FROM requests WHERE status IN (?,?,?,?,?)", ACTIVE).fetchone()[0]}
         if op == "list":
-            return {"requests": [self.public(dict(r)) for r in self.db.execute("SELECT * FROM requests ORDER BY created DESC LIMIT 30")]}
+            return {"requests": [self.public(dict(r)) for r in self.db.execute("SELECT * FROM requests ORDER BY created DESC LIMIT 100")]}
         if op == "get":
             return self.public(self.record(str(data.get("id", ""))))
         if op == "complete":
@@ -112,7 +153,7 @@ class Bridge:
                 raise ValueError("estado inválido")
             if not isinstance(result, str) or not 1 <= len(result) <= 8000:
                 raise ValueError("resumo deve ter 1..8000 caracteres")
-            if current["status"] not in ACTIVE:
+            if current["status"] not in ACTIVE and not (current["status"] == "blocked" and current["result"].startswith("Executor sem turno ativo;")):
                 raise ValueError("pedido já encerrado")
             self.db.execute("UPDATE requests SET status=?, result=?, updated=? WHERE id=?", (status_value, result, time.time(), rid))
             self.db.commit()
@@ -134,10 +175,10 @@ class Bridge:
             if old["digest"] != digest:
                 raise ValueError("key já usada com conteúdo diferente")
             return self.public(dict(old))
-        if self.db.execute("SELECT count(*) FROM requests WHERE status IN (?,?,?,?,?)", ACTIVE).fetchone()[0] >= 3:
-            raise ValueError("fila cheia: aguarde os pedidos existentes")
-        if self.db.execute("SELECT count(*) FROM requests WHERE created>?", (time.time()-3600,)).fetchone()[0] >= 6:
-            raise ValueError("limite de 6 pedidos por hora")
+        if self.db.execute("SELECT count(*) FROM requests WHERE status IN (?,?,?,?,?)", ACTIVE).fetchone()[0] >= self.queue_limit:
+            raise ValueError("fila global cheia: pedido não registrado. Preserve a mesma chave e conteúdo; consulte lookup antes de tentar novamente.")
+        if self.db.execute("SELECT count(*) FROM requests WHERE created>?", (time.time()-3600,)).fetchone()[0] >= self.hourly_limit:
+            raise ValueError(f"limite global de {self.hourly_limit} pedidos por hora: pedido não registrado; preserve chave e conteúdo.")
         rid, now = uuid.uuid4().hex, time.time()
         self.db.execute("INSERT INTO requests (id,request_key,digest,topic,mode,title,request,uid,created,updated,status) VALUES (?,?,?,?,?,?,?,?,?,?,?)", (rid,key,digest,topic,mode,title,request,uid,now,now,"queued"))
         self.db.commit()
@@ -147,9 +188,13 @@ class Bridge:
     async def dispatch_one(self):
         if not self.ready():
             return
-        if self.db.execute("SELECT count(*) FROM requests WHERE status IN ('dispatching','running','waiting_operator','dispatch_uncertain')").fetchone()[0]:
+        await self.reconcile()
+        if not self.ready():
             return
-        row = self.db.execute("SELECT * FROM requests WHERE status='queued' ORDER BY created LIMIT 1").fetchone()
+        if self.db.execute("SELECT count(*) FROM requests WHERE status IN ('dispatching','running','dispatch_uncertain')").fetchone()[0]:
+            return
+        held = {self.conflict_scope(r) for r in self.db.execute("SELECT * FROM requests WHERE (status='waiting_operator' OR (status='blocked' AND result LIKE 'Executor sem turno ativo;%'))")}
+        row = next((r for r in self.db.execute("SELECT * FROM requests WHERE status='queued' ORDER BY created,id") if r["mode"] == "inspect" or self.conflict_scope(r) not in held), None)
         if row is None:
             return
         row = dict(row)
@@ -178,7 +223,10 @@ class Bridge:
         while True:
             if self.project_relay:
                 await self.project_relay.dispatch_one()
-            await self.dispatch_one()
+            try:
+                await self.dispatch_one()
+            except Exception as exc:
+                self.audit("dispatch_loop_error", error_type=type(exc).__name__)
             await asyncio.sleep(3)
 
     async def connection(self, reader, writer):

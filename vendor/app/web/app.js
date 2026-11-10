@@ -418,16 +418,87 @@ function renderPCResources(data) {
   const diskDanger = diskFree < 5 * 1024 ** 3 || health.diskRatio < .05;
   const hottest = (data.temperatures || []).reduce((best, item) => Number(item.celsius || 0) > Number(best.celsius || 0) ? item : best, {});
   const hardware = data.hardware || {};
-  const disk = (hardware.internal_disks || hardware.disks || [])[0] || {};
+  const disks = hardware.disks || hardware.internal_disks || [];
+  const disk = disks.find(item => item.rotational === false) || {};
+  const hdds = disks.filter(item => item.rotational === true);
   const uptimeDays = Number(data.uptime_seconds || 0) / 86400;
   selectors.pcDataContent.innerHTML = `
     <article class="pc-resource-card ${resourceCardClass(health.cpuPercent >= 85, health.cpuPercent >= 95)}"><span>CPU atual</span><strong>${escapeHTML(health.cpuPercent.toFixed(1))}%</strong><small>${escapeHTML(data.cpu?.logical || "—")} threads${hottest.celsius ? ` • ${escapeHTML(hottest.celsius)} °C` : ""}</small></article>
     <article class="pc-resource-card ${resourceCardClass(ramWarning, ramDanger)}"><span>RAM disponível</span><strong>${formatBytes(memoryAvailable)}</strong><small>${formatBytes(Number(health.memory.used || 0))} em uso de ${formatBytes(memoryTotal)}</small></article>
     <article class="pc-resource-card ${resourceCardClass(diskWarning, diskDanger)}"><span>SSD livre</span><strong>${formatBytes(diskFree)}</strong><small>${escapeHTML(health.rootDisk.percent ?? "—")}% usado de ${formatBytes(diskTotal)}</small></article>
+    ${hdds.map(item => `<button type="button" class="pc-resource-card pc-disk-button" data-pc-disk="${escapeHTML(item.serial || "")}" ${item.serial ? "" : "disabled"}><span>HD total</span><strong>${formatBytes(item.size)}</strong><small>${escapeHTML(item.model || "HD")}</small><small>Ver atividade</small></button>`).join("")}
+    <section id="pc-disk-activity" class="pc-disk-activity" aria-live="polite"></section>
     <div class="pc-data-details"><strong>${escapeHTML(data.hostname || "Mini PC SASOCQ")}</strong><span>${escapeHTML(hardware.cpu?.model || data.platform || "Processador não identificado")}</span><span>${escapeHTML(disk.model || "SSD interno")} • kernel ${escapeHTML(data.kernel || "—")} • ligado há ${escapeHTML(uptimeDays.toFixed(1))} dia(s)</span></div>`;
+  renderPCDiskActivity();
   const updated = el("pc-data-updated");
   if (updated) updated.textContent = `Atualizado em ${formatTime(data.checked_at || Date.now() / 1000)}`;
   renderPCDataPanel();
+}
+
+
+let pcSelectedDisk = "";
+let pcDiskActivities = [];
+let pcDiskActivityTimer = null;
+let pcDiskActivityBusy = false;
+let pcDiskActivityError = "";
+function diskDuration(seconds) {
+  if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds < 0) return null;
+  const minutes = Math.max(1, Math.ceil(seconds / 60));
+  const hours = Math.floor(minutes / 60);
+  return hours ? `${hours} h ${minutes % 60} min` : `${minutes} min`;
+}
+function diskETA(job) {
+  if (job.status !== "running") return "";
+  const stage = diskDuration(job.stage_eta_seconds);
+  const total = diskDuration(job.eta_seconds);
+  const finish = typeof job.eta_at === "number" && Number.isFinite(job.eta_at)
+    ? new Date(job.eta_at * 1000).toLocaleString("pt-BR") : null;
+  return `<p>${total && finish ? `Conclusão estimada do teste: ${escapeHTML(finish)} • Faltam aproximadamente ${total}` : "Previsão do teste: calculando ou aguardando avanço…"}</p>
+    ${stage ? `<p>Etapa atual: cerca de ${stage} restantes${job.phase && job.total_phases ? ` (etapa ${job.phase} de ${job.total_phases})` : ""}.</p>` : ""}
+    <small>Estimativa pela velocidade recente; pode variar entre escrita e leitura ou com erros. Não inclui a formatação posterior.</small>`;
+}
+function renderPCDiskActivity() {
+  const target = el("pc-disk-activity");
+  if (!target) return;
+  if (!pcSelectedDisk) { target.innerHTML = ""; return; }
+  const jobs = pcDiskActivities.filter(item => item.serial === pcSelectedDisk);
+  const labels = {running:"Em execução", interrupted:"Interrompido", failed:"Falhou", completed:"Concluído", unknown:"Estado indisponível"};
+  target.innerHTML = '<h3>Atividade do HD</h3>' + (pcDiskActivityError
+    ? '<p>Não foi possível atualizar a atividade. Tentando novamente…</p>'
+    : jobs.length ? jobs.map(job => {
+      const percent = typeof job.percent === "number" && Number.isFinite(job.percent) ? Math.min(100, Math.max(0, job.percent)) : null;
+      return `<article><strong>${escapeHTML(job.title)}</strong><p>${escapeHTML(labels[job.status] || labels.unknown)}</p>
+        ${diskETA(job)}
+        <progress max="100" ${percent === null ? "" : `value="${percent}"`} aria-label="Progresso da etapa da atividade"></progress>
+        <p>${percent === null ? "Percentual não informado" : `${percent.toFixed(2)}% da etapa`}${job.elapsed ? ` • Tempo decorrido: ${escapeHTML(job.elapsed)}` : ""}</p>
+        <small>O percentual é da etapa atual; não representa necessariamente o trabalho completo.</small></article>`;
+    }).join("") : '<p>Nenhuma atividade registrada para este HD.</p>');
+}
+async function loadPCDiskActivity() {
+  if (pcDiskActivityBusy || !pcSelectedDisk || !selectors.pcDataDialog?.open) return;
+  pcDiskActivityBusy = true;
+  try {
+    const data = await api("/api/control/disk-activities");
+    pcDiskActivities = data.activities || [];
+    pcDiskActivityError = "";
+  } catch (error) { pcDiskActivityError = error.message; }
+  finally { pcDiskActivityBusy = false; renderPCDiskActivity(); }
+}
+function stopPCDiskActivityRefresh() {
+  clearInterval(pcDiskActivityTimer);
+  pcDiskActivityTimer = null;
+}
+function openPCDiskActivity(serial) {
+  pcSelectedDisk = serial;
+  renderPCDiskActivity();
+  stopPCDiskActivityRefresh();
+  void loadPCDiskActivity().then(() => {
+    if (pcSelectedDisk === serial && selectors.pcDataDialog?.open)
+      el("pc-disk-activity")?.scrollIntoView({block: "start", behavior: "smooth"});
+  });
+  pcDiskActivityTimer = setInterval(() => {
+    if (document.visibilityState === "visible") void loadPCDiskActivity();
+  }, 5000);
 }
 
 async function loadPCResources({openDialog = false, announce = false} = {}) {
@@ -732,8 +803,8 @@ function codexUsageHTML(accountData, limitsData, workspace = "system") {
   return `<article class="maintenance-card quota-card">
     <div class="quota-card-heading"><div><h3>Plano e cotas do Codex</h3><p>Plano ChatGPT ${escapeHTML(formatPlanName(plan))}</p></div><button class="secondary-button" data-settings-action="refresh-codex-usage">Atualizar</button></div>
     <div class="quota-grid">${windowRows || '<span class="quota-muted">Nenhuma janela de uso foi informada.</span>'}</div>
-    <div class="quota-extras"><div><span>Créditos adicionais</span>${creditsSummaryHTML(limitsData.credits ?? defaultBucket.credits)}</div><div><span>Redefinições de cota</span><strong>${resetCount == null ? "Não informado" : escapeHTML(resetCount)}</strong><small>${escapeHTML(resetExpiry.replace(/^ • /, ""))}</small>${quotaResetControlHTML(accountData, resetCount, workspace)}</div></div>
-    <p class="quota-footnote">As datas acima são de reposição das cotas. A data de cobrança ou renovação da assinatura não é fornecida pelo Codex App Server e deve ser consultada no gerenciamento do plano ChatGPT.</p>
+    <div class="quota-extras"><div><span>Créditos adicionais</span>${creditsSummaryHTML(limitsData.credits ?? defaultBucket.credits)}<small class="quota-credit-validity">Validade dos créditos comprados: 12 meses após cada compra.</small><small class="quota-credit-expiry">Vencimento dos créditos: não informado pela OpenAI.</small></div><div><span>Redefinições de cota</span><strong>${resetCount == null ? "Não informado" : escapeHTML(resetCount)}</strong><small>${escapeHTML(resetExpiry.replace(/^ • /, ""))}</small>${quotaResetControlHTML(accountData, resetCount, workspace)}</div></div>
+    <p class="quota-footnote">As datas de “Renova em” indicam a reposição das cotas, não o vencimento dos créditos adicionais. A data de cobrança ou renovação da assinatura não é fornecida pelo Codex App Server e deve ser consultada no gerenciamento do plano ChatGPT.</p>
   </article>`;
 }
 
@@ -2535,7 +2606,7 @@ async function handleSetupAction(action) {
   if (action === "install-codex") return startBackgroundTask("/api/setup/codex/install");
   if (action === "install-full-experience") return startBackgroundTask("/api/setup/full-experience/install");
   if (action === "login-codex-system") return startDeviceLogin("system");
-  if (action === "login-codex-projects") return api("/api/account/share-projects", {method:"POST"});
+  if (action === "login-codex-projects") return startDeviceLogin("projects");
   if (action === "add-project") return addProjectGraphically(true);
   if (action === "cloud-install") return startBackgroundTask("/api/cloud/install");
   if (action === "cloud-google-help") { window.open("https://rclone.org/drive/#making-your-own-client-id", "_blank", "noopener"); return; }
@@ -3418,7 +3489,7 @@ function threadActivityTimestamp(thread) {
 
 function threadStatus(thread) {
   const status = thread.status || {};
-  if (status.type === "active" && threadWaitingKind(status) && pendingUserActionForThread(thread.id)) return "waiting";
+  if (status.type === "active" && threadWaitingKind(status)) return "waiting";
   if (status.type === "active") return "active";
   if (["failed", "error", "stopped"].includes(String(status.type || "").toLowerCase())) return "failed";
   if (thread?.clc?.awaiting_user_action) return "waiting";
@@ -3475,7 +3546,7 @@ function syncThreadExecutionTicker() {
 }
 
 function threadUserActionLabel(thread) {
-  return String(thread?.clc?.awaiting_user_action_label || "Responder ao Codex");
+  return String(thread?.clc?.awaiting_user_action_label || (threadWaitingKind(thread) === "approval" ? "Aguardando aprovação" : "Responder ao Codex"));
 }
 
 function setThreadAwaitingUserAction(threadId, waiting, label = "") {
@@ -4066,6 +4137,7 @@ function handleThreadSearchInput() {
 }
 
 function renderThreads() {
+  window.DexConversationWorkspace?.refreshOverview();
   const searchInput = el("thread-search");
   if (!searchInput) return;
   const query = normalizeThreadSearchText(searchInput.value);
@@ -4106,6 +4178,7 @@ function renderThreads() {
     const button = document.createElement("button");
     button.className = `nav-item recent-thread-card ${state.activeThreadId === thread.id ? "active" : ""}`;
     button.dataset.threadId = thread.id;
+    button.classList.toggle("thread-unread", Boolean(window.DexReadStates?.[thread.id]?.completed_turn_id && window.DexReadStates?.[thread.id].completed_turn_id !== window.DexReadStates?.[thread.id].read_turn_id));
     const title = conversationTitle(thread);
     const cleanedPreview = visibleConversationText(thread.clc?.request_preview || thread.preview);
     const matchedPreview = query ? String(thread.search?.snippet || "").trim() : "";
@@ -4142,6 +4215,7 @@ async function openThread(threadId) {
   state.conversationScrollInteractionVersion += 1;
   state.threadLoadId = loadId;
   state.activeThreadId = threadId;
+  state.conversationHistoryFocus = null;
   state.messageRenderLimit = 100;
   state.threadHistory = null;
   state.threadHistoryLoading = null;
@@ -4170,8 +4244,7 @@ async function openThread(threadId) {
     if (state.threadLoadId !== loadId || state.activeThreadId !== threadId) return;
     state.threadDetails.set(threadId, data.thread || {});
     hydrateThread(data.thread || {});
-    api(`/api/threads/${encodeURIComponent(threadId)}/resume?project_id=${encodeURIComponent(projectId)}`, {method:"POST"})
-      .catch(error => toast(`A conversa foi aberta, mas não pôde ser retomada: ${error.message}`, "error"));
+    // Reading persisted history must not load an execution environment.
   } catch (error) { toast(error.message, "error"); }
 }
 
@@ -4183,6 +4256,7 @@ function hydrateThread(thread) {
   state.activeTurnStartedAt = 0;
   state.executionActivityAt = 0;
   selectors.title.textContent = conversationTitle(thread);
+  for (const question of thread.async_questions || []) handleEvent(question);
   const turns = thread.turns || [];
   const threadId = thread.id || state.activeThreadId;
   let terminal = state.threadTerminalStatuses.get(threadId);
@@ -4502,14 +4576,14 @@ function itemCard(item) {
     const text = visibleConversationText(extractContent(item));
     cls = "user"; label = "Você"; body = `<div class="message-text">${escapeHTML(text)}</div>${messageAttachmentsHTML(item)}`;
   } else if (["agentMessage", "assistantMessage", "agent_message"].includes(type)) {
-    cls = "assistant"; label = "Codex"; body = escapeHTML(extractContent(item));
+    cls = "assistant"; label = "Codex"; body = typeof DexRichContent !== "undefined" ? DexRichContent.render(extractContent(item), id) : escapeHTML(extractContent(item));
   } else if (type === "reasoning") {
     const reasoning = extractContent(item);
     cls = "reasoning";
     label = "Contexto";
     body = `<details class="reasoning-details"><summary>${escapeHTML(compactReasoningPreview(reasoning))}</summary><div>${escapeHTML(reasoning)}</div></details>`;
   } else if (type === "plan") {
-    cls = "assistant"; label = "Plano"; body = escapeHTML(extractContent(item));
+    cls = "assistant"; label = "Plano"; body = typeof DexRichContent !== "undefined" ? DexRichContent.render(extractContent(item), id) : escapeHTML(extractContent(item));
   } else if (type === "commandExecution") {
     label = "Atividade";
     const status = item.status || "inProgress";
@@ -4536,14 +4610,15 @@ function itemCard(item) {
   } else if (type === "imageView") {
     label = "Imagem analisada"; body = escapeHTML(item.path || "");
   } else if (type === "error") {
-    cls = "error"; label = "Erro"; body = escapeHTML(item.message || extractContent(item));
+    cls = "error"; label = "Erro"; body = escapeHTML(item.message || extractContent(item)) + blockExplanationHTML(item.message || extractContent(item));
   } else {
     const text = extractContent(item);
     label = "Atividade";
     body = technicalDetails(`<pre class="tool-output">${escapeHTML(text || JSON.stringify(item, null, 2))}</pre>`);
   }
+  if (typeof DexRichContent !== "undefined" && ["mcpToolCall", "dynamicToolCall", "imageView"].includes(type)) body += DexRichContent.media(item);
   const handledFailureClass = item._failureHandled ? " handled-failure" : "";
-  return `<article class="message-card ${cls}${handledFailureClass}" data-item-id="${escapeHTML(id)}"><div class="message-meta"><span>${escapeHTML(label)}</span>${item.status ? `<span>${escapeHTML(item.status)}</span>` : ""}</div><div class="message-body">${body}</div></article>`;
+  return `<article class="message-card ${cls}${handledFailureClass}" data-item-id="${escapeHTML(id)}"><div class="message-meta"><span>${escapeHTML(label)}</span>${item.status ? `<span>${escapeHTML(item.status)}</span>` : ""}${cls === "assistant" ? `<button type="button" class="secondary-button" data-comment-excerpt>Comentar trecho</button>` : ""}</div><div class="message-body">${body}</div></article>`;
 }
 
 function executionStatusSummary() {
@@ -4636,8 +4711,46 @@ function executionIsActive() {
   return state.turnSubmissionPending || Boolean(state.activeThreadId && state.activeTurnId);
 }
 
+function executionStatusDisclosureKey() {
+  state.executionStatusDisclosures ||= new Map();
+  const scope = {project:state.activeProject?.id || "", thread:state.activeThreadId || "new", turn:state.activeTurnId || "pending"};
+  const key = JSON.stringify(scope);
+  const previous = state.executionStatusDisclosureScope;
+  if (previous?.turn === "pending" && scope.turn !== "pending" && previous.project === scope.project && (previous.thread === scope.thread || previous.thread === "new")) {
+    const previousKey = JSON.stringify(previous);
+    if (state.executionStatusDisclosures.has(previousKey)) {
+      state.executionStatusDisclosures.set(key, state.executionStatusDisclosures.get(previousKey));
+      state.executionStatusDisclosures.delete(previousKey);
+    }
+  }
+  state.executionStatusDisclosureScope = scope;
+  while (state.executionStatusDisclosures.size > 200) state.executionStatusDisclosures.delete(state.executionStatusDisclosures.keys().next().value);
+  return key;
+}
+
+function toggleExecutionStatusDetails(card) {
+  if (!executionIsActive() || !card?.matches('[data-execution-status-toggle]')) return;
+  const key = executionStatusDisclosureKey();
+  if (card.dataset.executionScope !== key) return;
+  const expanded = card.getAttribute("aria-expanded") !== "true";
+  state.executionStatusDisclosures.set(key, expanded);
+  card.setAttribute("aria-expanded", String(expanded));
+  card.querySelector(".execution-status-details").hidden = !expanded;
+  const action = expanded ? "Recolher detalhes e acompanhar a execução" : "Expandir detalhes e acompanhar a execução";
+  card.title = action;
+  card.setAttribute("aria-label", `${card.querySelector("strong").textContent}. ${action}`);
+  const restoreFocus = card === document.activeElement;
+  resumeConversationAutoFollow();
+  if (restoreFocus) selectors.messageList.querySelector('[data-execution-status-toggle]')?.focus({preventScroll:true});
+}
+
 function executionStatusHTML() {
-  if (!executionIsActive()) return "";
+  if (!executionIsActive()) {
+    const previous = state.executionStatusDisclosureScope;
+    if (previous?.turn === "pending") state.executionStatusDisclosures?.delete(JSON.stringify(previous));
+    state.executionStatusDisclosureScope = null;
+    return "";
+  }
   const waiting = executionWaitingState();
   const now = Date.now();
   const startedAt = state.activeTurnStartedAt || now;
@@ -4648,12 +4761,17 @@ function executionStatusHTML() {
       ? (quietSeconds < 15 ? "Recebendo atualizações" : `Aguardando a próxima atualização há ${compactElapsed(now - activityAt)}`)
       : "Reconectando ao acompanhamento; a execução pode continuar no servidor";
   const title = waiting ? activeUserActionLabel() : "Codex está trabalhando";
-  return `<section class="execution-status-card ${waiting ? "waiting" : ""}" role="button" tabindex="0" aria-live="polite" aria-label="${escapeHTML(title)}. Clique para voltar a acompanhar o topo." title="Voltar a acompanhar o topo">
+  const key = executionStatusDisclosureKey();
+  const expanded = state.executionStatusDisclosures.get(key) === true;
+  const action = expanded ? "Recolher detalhes e acompanhar a execução" : "Expandir detalhes e acompanhar a execução";
+  return `<section class="execution-status-card ${waiting ? "waiting" : ""}" data-execution-status-toggle data-execution-scope="${escapeHTML(key)}" role="button" tabindex="0" aria-expanded="${expanded}" aria-controls="execution-status-details" aria-live="polite" aria-label="${escapeHTML(title)}. ${action}" title="${action}">
     <span class="execution-status-pulse" aria-hidden="true"></span>
     <div class="execution-status-copy">
-      <strong>${escapeHTML(title)}</strong>
-      <p>${escapeHTML(executionStatusSummary())}</p>
-      <small><span data-execution-elapsed>Em execução há ${escapeHTML(compactElapsed(now - startedAt))}</span> • <span data-execution-connection>${escapeHTML(connection)}</span></small>
+      <div class="execution-status-heading"><strong>${escapeHTML(title)}</strong><span class="execution-status-compact-time" data-execution-compact-elapsed title="Em execução há ${escapeHTML(compactElapsed(now - startedAt))}">${escapeHTML(compactElapsed(now - startedAt))}</span><span class="execution-status-chevron" aria-hidden="true">›</span></div>
+      <div id="execution-status-details" class="execution-status-details" ${expanded ? "" : "hidden"}>
+        <p>${escapeHTML(executionStatusSummary())}</p>
+        <small><span data-execution-elapsed>Em execução há ${escapeHTML(compactElapsed(now - startedAt))}</span> • <span data-execution-connection>${escapeHTML(connection)}</span></small>
+      </div>
     </div>
   </section>`;
 }
@@ -4680,6 +4798,10 @@ function refreshExecutionStatusClock() {
   const startedAt = state.activeTurnStartedAt || now;
   const activityAt = state.executionActivityAt || startedAt;
   const quietSeconds = Math.max(0, Math.floor((now - activityAt) / 1000));
+  document.querySelectorAll("[data-execution-compact-elapsed]").forEach(node => {
+    node.textContent = compactElapsed(now - startedAt);
+    node.title = `Em execução há ${compactElapsed(now - startedAt)}`;
+  });
   document.querySelectorAll("[data-execution-elapsed]").forEach(node => {
     node.textContent = `Em execução há ${compactElapsed(now - startedAt)}`;
   });
@@ -4820,6 +4942,7 @@ function deferConversationRenderUntilScrollStops() {
 }
 
 function renderMessages() {
+  window.DexConversationWorkspace?.syncVisibility();
   syncConversationScrollAnchoring();
   if (!state.conversationAutoFollow && Date.now() < state.conversationScrollInteractionUntil) {
     deferConversationRenderUntilScrollStops();
@@ -4830,7 +4953,11 @@ function renderMessages() {
   const scrollState = captureMessageScrollState();
   const items = groupTechnicalActivities(groupAndroidActivities(groupBrowserActivities(groupCompletedTurnActivities(conversationItemsForDisplay([...state.items.values()].reverse())))));
   state.browserPreviewGroupId = items.find(item => item?.type === "browserActivityGroup")?.id || "";
-  const visibleItems = items.slice(0, state.messageRenderLimit);
+  if (state.conversationAutoFollow) state.conversationHistoryFocus = null;
+  const focus = state.conversationHistoryFocus;
+  const focusedItem = focus?.threadId === state.activeThreadId ? state.items.get(focus.itemId) : null;
+  const focusIndex = focusedItem ? items.findIndex(item => item.id === focus.itemId || item.id === `history-steps-${focusedItem._historyTurnId}`) : -1;
+  const visibleItems = focusIndex >= 0 ? items.slice(Math.max(0, focusIndex - 20), Math.max(0, focusIndex - 20) + 100) : items.slice(0, state.messageRenderLimit);
   selectors.empty.classList.toggle("hidden", items.length > 0);
   const activeApprovals = [...state.approvals.values()]
     .filter(approval => !approval.resolved && approvalBelongsToActiveThread(approval))
@@ -4851,8 +4978,24 @@ function renderMessages() {
   const credentialModal = credentialApprovals.length
     ? `<div class="credential-modal-layer" role="dialog" aria-label="Credenciais protegidas"><div class="credential-modal-stack">${credentialApprovals.map(approval => approvalCardHTML(approval, true)).join("")}</div></div>`
     : "";
-  selectors.messageList.innerHTML = [credentialModal, attentionStack, ...visibleItems.map(itemCard), older].filter(Boolean).join("");
+  if (typeof DexRichContent !== "undefined") DexRichContent.beforeRender(selectors.messageList);
+  // Keep the live protected form attached while conversation events stream.
+  // Secrets stay only in its inputs; never copy them into drafts or storage.
+  const existingCredentials = selectors.messageList.querySelector(":scope > .credential-modal-layer");
+  const bodyHTML = [attentionStack, ...visibleItems.map(itemCard), older].filter(Boolean).join("");
+  if (credentialModal && existingCredentials?._dexMarkup === credentialModal) {
+    for (const child of [...selectors.messageList.childNodes]) {
+      if (child !== existingCredentials) child.remove();
+    }
+    selectors.messageList.insertAdjacentHTML("beforeend", bodyHTML);
+  } else {
+    selectors.messageList.innerHTML = credentialModal + bodyHTML;
+    const credentials = selectors.messageList.querySelector(":scope > .credential-modal-layer");
+    if (credentials) credentials._dexMarkup = credentialModal;
+  }
   armBrowserSessionPreviews();
+  if (typeof DexRichContent !== "undefined") DexRichContent.enhance(selectors.messageList);
+  window.DexConversationWorkspace?.enhance(selectors.messageList);
   // Restore before the browser paints the replaced list. Waiting only for the
   // next frame exposes one displaced frame and makes the top appear to jump
   // while streaming updates arrive. Keep just one follow-up correction for
@@ -5119,6 +5262,8 @@ async function notifyTurnCompletionFallback(workspace, params = {}) {
 }
 
 function handleEvent(event) {
+  if (event.async_question) handleEvent(event.async_question);
+  queueMicrotask(() => window.dispatchEvent(new CustomEvent("dex-conversation-event", {detail:event})));
   const rawWorkspace = event.workspace || "system";
   const workspace = workspaceGroup(rawWorkspace);
   const active = rawWorkspace === activeEventWorkspace() || (rawWorkspace === "projects" && workspace === activeWorkspace());
@@ -5176,6 +5321,11 @@ function handleEvent(event) {
     if (requestThreadId === state.activeThreadId) renderMessages();
     updateRunningUI();
     return;
+  }
+  if (event.kind === "notification" && event.notification?.method === "serverRequest/resolved") {
+    const approval = state.approvals.get(`${rawWorkspace}:${String(event.notification.params?.requestId)}`);
+    if (approval) approval.resolved = true;
+    renderApprovals();
   }
   if (event.kind !== "notification") return;
   const notification = event.notification;
@@ -5253,7 +5403,6 @@ function handleEvent(event) {
         el("login-status").textContent = `Autenticação concluída em ${workspaceLabel(workspace)}.`;
         setTimeout(() => selectors.loginDialog.close(), 800);
         toast(`Conta conectada em ${workspaceLabel(workspace)}.`, "success");
-        if (workspace === "system") shareCodexAccount({silent:true}).catch(error => toast(error.message, "error"));
       } else if (params.error && state.loginWorkspace === workspace) el("login-status").textContent = params.error;
     } else if (method === "account/rateLimits/updated") loadRateLimits(workspaceGroup(rawWorkspace));
     return;
@@ -5328,7 +5477,6 @@ function handleEvent(event) {
         el("login-status").textContent = `Autenticação concluída em ${workspaceLabel(workspace)}.`;
         setTimeout(() => selectors.loginDialog.close(), 800);
         toast(`Conta conectada em ${workspaceLabel(workspace)}.`, "success");
-        if (workspace === "system") shareCodexAccount({silent:true}).catch(error => toast(error.message, "error"));
         loadModels(workspaceGroup(rawWorkspace));
         if (state.setup.active) refreshSetupState();
       } else if (params.error) el("login-status").textContent = params.error;
@@ -5399,9 +5547,13 @@ function approvalTitle(method, params) {
 function mcpApprovalIdentity(params = {}) {
   const message = String(params.message || "");
   const parsed = message.match(/Allow the\s+(.+?)\s+MCP server\s+to run tool\s+["']([^"']+)["']/i);
+  const connector = params.serverName === "codex_apps" && params._meta?.codex_approval_kind === "mcp_tool_call"
+    && params._meta?.source === "connector" && params._meta?.connector_id
+    ? message.match(/^Allow (.+) to run tool "([A-Za-z0-9_.-]+)"\?$/) : null;
+  const connectorTool = connector && params._meta.connector_name === connector[1] ? connector[2] : "";
   return {
     server:String(params.serverName || params.server || parsed?.[1] || "MCP").trim(),
-    tool:String(params.toolName || params.tool || parsed?.[2] || "ferramenta não identificada").trim(),
+    tool:String(connectorTool || params.toolName || params.tool || parsed?.[2] || "ferramenta não identificada").trim(),
   };
 }
 
@@ -5682,15 +5834,23 @@ function mcpApprovalExplanationHTML(approval) {
   </div>`;
 }
 
+function questionMarkdown(value) {
+  if (typeof DexRichContent === "undefined") return escapeHTML(value || "");
+  const template = document.createElement("template");
+  template.innerHTML = DexRichContent.render(String(value || ""), "question");
+  template.content.querySelectorAll(".dex-response-actions").forEach(node => node.remove());
+  return template.innerHTML;
+}
+
 function userInputQuestionsHTML(approval) {
   const key = `${approval.workspace || "system"}:${String(approval.id)}`;
   return (approval.params.questions || []).map(question => {
     const name = `user-input-${key}-${question.id}`;
-    const options = (question.options || []).map(option => `<label class="user-input-option"><input type="radio" name="${escapeHTML(name)}" value="${escapeHTML(option.label)}" data-user-input-option="${escapeHTML(question.id)}"><span><strong>${escapeHTML(option.label)}</strong><small>${escapeHTML(option.description || "")}</small></span></label>`).join("");
-    const freeInput = question.isOther || !question.options?.length
+    const options = (question.options || []).map(option => `<label class="user-input-option"><input type="radio" name="${escapeHTML(name)}" value="${escapeHTML(option.label)}" data-user-input-option="${escapeHTML(question.id)}"><span><strong>${questionMarkdown(option.label)}</strong><small>${questionMarkdown(option.description || "")}</small></span></label>`).join("");
+    const freeInput = true
       ? `<label class="user-input-free"><span>${question.options?.length ? "Outra resposta" : "Resposta"}</span><input ${question.isSecret ? 'type="password"' : 'type="text"'} data-user-input-free="${escapeHTML(question.id)}" autocomplete="off"></label>`
       : "";
-    return `<fieldset class="user-input-question"><legend>${escapeHTML(question.header || "Resposta")}</legend><p>${escapeHTML(question.question || "")}</p>${options}${freeInput}</fieldset>`;
+    return `<fieldset class="user-input-question"><legend>${escapeHTML(question.header || "Resposta")}</legend><div class="question-markdown">${questionMarkdown(question.question || "")}</div>${options}${freeInput}</fieldset>`;
   }).join("");
 }
 
@@ -5710,6 +5870,20 @@ function isCredentialElicitation(approval) {
 function isFormElicitation(approval) {
   if (approval?.method !== "mcpServer/elicitation/request" || isCredentialElicitation(approval)) return false;
   const p = approval.params || {};
+  // Codex tool permission envelopes use form mode with no input fields.
+  // Match the backend strictly; actual forms and authentication remain interactive.
+  const schema = p.requestedSchema;
+  const match = String(p.message || "").match(/^Allow the ([A-Za-z0-9_.-]+) MCP server to run tool "([A-Za-z0-9_.-]+)"\?$/);
+  const toolPermission = p._meta?.codex_approval_kind === "mcp_tool_call"
+    && p.mode === "form" && !p.url && schema?.type === "object"
+    && schema.properties && typeof schema.properties === "object" && !Array.isArray(schema.properties)
+    && Object.keys(schema.properties).length === 0 && !(schema.required?.length)
+    && ((match && p.serverName === match[1]) || (() => {
+      const connector = String(p.message || "").match(/^Allow (.+) to run tool "([A-Za-z0-9_.-]+)"\?$/);
+      return connector && p.serverName === "codex_apps" && p._meta.source === "connector"
+        && p._meta.connector_id && p._meta.connector_name === connector[1];
+    })());
+  if (toolPermission) return false;
   return p.mode === "form" || p.mode === "url" || Object.keys(p.requestedSchema?.properties || {}).length > 0;
 }
 
@@ -6037,7 +6211,31 @@ function approvalButtons(approval) {
   return `<button class="danger-button" data-approval="${id}" data-action="cancel">Cancelar</button>`;
 }
 
+const dismissedQuestionPopups = new Set();
+function renderQuestionPopup() {
+  let dialog = document.getElementById("question-popup");
+  const pending = [...state.approvals.values()].filter(a => !a.resolved && a.method === "item/tool/requestUserInput");
+  const current = dialog?.dataset.questionKey;
+  if (current && pending.some(a => `${a.workspace || "system"}:${a.id}` === current)) return;
+  if (dialog) { dialog.close(); dialog.remove(); }
+  const next = pending.find(a => !dismissedQuestionPopups.has(`${a.workspace || "system"}:${a.id}`));
+  if (!next || document.querySelector("dialog[open]")) return;
+  const key = `${next.workspace || "system"}:${next.id}`;
+  dialog = document.createElement("dialog");
+  dialog.id = "question-popup";
+  dialog.className = "question-popup";
+  dialog.dataset.questionKey = key;
+  dialog.setAttribute("aria-label", "Pergunta do Codex");
+  dialog.innerHTML = `<button type="button" class="secondary-button" data-dismiss-question>Responder depois</button>` + approvalCardHTML(next);
+  const dismiss = () => { dismissedQuestionPopups.add(key); dialog.close(); dialog.remove(); };
+  dialog.querySelector("[data-dismiss-question]").addEventListener("click", dismiss);
+  dialog.addEventListener("cancel", event => { event.preventDefault(); dismiss(); });
+  document.body.append(dialog);
+  dialog.showModal();
+}
+
 function renderApprovals() {
+  renderQuestionPopup();
   const pending = activeInspectorApprovals();
   selectors.approvalCount.textContent = String(pending.length);
   selectors.approvalList.innerHTML = pending.map(item => approvalCardHTML(item)).join("");
@@ -6127,7 +6325,7 @@ async function respondApproval(key, action, options = {}) {
     if (payload.result?.content) payload.result.content = {};
   }
   try {
-    const endpoint = ["browser/credentials/request", "browser/payment-card/request"].includes(approval.method) ? "/api/browser-credentials/respond" : "/api/approvals/respond";
+    const endpoint = approval.params?.asyncMessage ? "/api/async-questions/respond" : ["browser/credentials/request", "browser/payment-card/request"].includes(approval.method) ? "/api/browser-credentials/respond" : "/api/approvals/respond";
     const response = await api(endpoint, {method:"POST", body:serializedPayload || JSON.stringify(payload)});
     if (rememberConversation) rememberConversationApprovalRule(approval);
     approval.resolved = true;
@@ -6534,8 +6732,8 @@ function renderSettings(data) {
       <div class="settings-section-title"><div><h3>Codex e conta</h3><p>Instalação, atualização e autenticação sem terminal.</p></div></div>
       <div class="maintenance-grid">
         <article class="maintenance-card"><h3>${codex.installed ? "Codex instalado" : "Codex ausente"}</h3><p>${escapeHTML(codex.path || "Instale pelo botão")}</p><span class="value">${escapeHTML(codex.version || "—")}</span><div class="card-actions"><button class="primary-button" data-settings-action="update-codex">${codex.installed ? "Atualizar Codex" : "Instalar Codex"}</button></div></article>
-        <article class="maintenance-card"><h3>Conta única do Codex</h3><p>${escapeHTML(accountLabel(systemAccount, systemBridge))}</p><span class="value">${systemAccount?.account ? "✓ Autenticado e conectado ao Control Plane; conta compartilhada com Projetos" : systemBridge.initialized ? "Control Plane pronto; login pendente" : escapeHTML(systemBridge.last_error || "Indisponível")}</span><div class="card-actions">${systemAccount?.account ? '<span class="account-connected" role="status">Login concluído</span><button class="danger-button" data-settings-action="logout-codex-system">Sair da conta única</button>' : `<button class="primary-button" data-settings-action="login-codex-system" ${!systemBridge.initialized ? "disabled" : ""}>Entrar no Codex</button>`}</div></article>
-        <article class="maintenance-card"><h3>Codex de Projetos</h3><p>Usa a mesma conta do Codex do Sistema, mantendo processos, arquivos e permissões isolados.</p><span class="value">${projectsAccount?.account ? `✓ Autenticado; workers independentes conectados • ${escapeHTML(accountLabel(projectsAccount, projectsBridge))}` : systemAccount?.account ? "Conta do Sistema pronta para ser aplicada" : "Aguardando login na conta única"}</span><div class="card-actions">${systemAccount?.account ? `<button class="${projectsAccount?.account ? "secondary-button" : "primary-button"}" data-settings-action="share-codex-account">${projectsAccount?.account ? "Reaplicar conta única" : "Usar conta do Sistema"}</button>` : ""}</div></article>
+        <article class="maintenance-card"><h3>Codex do Sistema</h3><p>${escapeHTML(accountLabel(systemAccount, systemBridge))}</p><span class="value">${systemAccount?.account ? "✓ Autenticado e conectado ao Control Plane" : systemBridge.initialized ? "Control Plane pronto; login pendente" : escapeHTML(systemBridge.last_error || "Indisponível")}</span><div class="card-actions">${systemAccount?.account ? '<span class="account-connected" role="status">Login concluído</span><button class="danger-button" data-settings-action="logout-codex-system">Sair do Sistema e Projetos</button>' : `<button class="primary-button" data-settings-action="login-codex-system" ${!systemBridge.initialized ? "disabled" : ""}>Entrar no Codex</button>`}</div></article>
+        <article class="maintenance-card"><h3>Codex de Projetos e Dot</h3><p>Entre com a mesma conta usada no Sistema. A sessão própria mantém a renovação de acesso independente.</p><span class="value">${projectsAccount?.account ? `Conta configurada • ${escapeHTML(accountLabel(projectsAccount, projectsBridge))}` : "Login de Projetos pendente"}</span><div class="card-actions"><button class="${projectsAccount?.account ? "secondary-button" : "primary-button"}" data-settings-action="share-codex-account">${projectsAccount?.account ? "Reconectar Projetos e Dot" : "Conectar Projetos e Dot"}</button></div></article>
         <article class="maintenance-card"><h3>Codex / Upstream</h3><p>${upstream.last_checked_at ? `Verificado em ${escapeHTML(formatTime(upstream.last_checked_at))}` : "Primeira verificação ainda não executada"}</p><span class="value">${escapeHTML(upstreamCurrent.codex_version || codex.version || "Codex detectado")} • schema ${upstreamSchema.ok ? escapeHTML(String(upstreamSchema.hash || "").slice(0, 12)) : "pendente"} • ${upstreamChangeCount} mudança(s)</span><div class="card-actions"><button class="primary-button" data-settings-action="check-codex-upstream">Verificar agora</button><a class="secondary-button" href="https://learn.chatgpt.com/docs/changelog" target="_blank" rel="noopener">Changelog oficial</a></div></article>
         <article class="maintenance-card"><h3>Capacidades descobertas</h3><p>${upstreamCapabilityCount} item(ns) em modelos, recursos experimentais, permissões, modos, skills e hooks.</p><span class="value">${upstreamSchema.methods?.length || 0} método(s) no protocolo • promoção automática desativada</span></article>
         <article class="maintenance-card"><h3>ChatGPT Desktop oficial</h3><p>${upstreamDesktop.installed ? `Instalado • ${escapeHTML(upstreamDesktop.version || "versão detectada")}` : "Não instalado neste mini PC"}</p><span class="value">Interface oficial usa os mesmos projetos e arquivos; recursos internos sem API continuam exclusivos do Desktop.</span><div class="card-actions"><button class="secondary-button" data-settings-action="open-chatgpt-desktop" ${!remoteDesktop.available ? "disabled" : ""}>Abrir sessão gráfica</button></div></article>
@@ -7052,12 +7250,9 @@ async function startDeviceLogin(workspace = activeWorkspace()) {
   } catch (error) { toast(error.message, "error"); }
 }
 
-async function shareCodexAccount({silent = false} = {}) {
-  await api("/api/account/share-projects", {method:"POST"});
-  await loadAccount({}, "system");
-  await loadAccount({}, "projects");
-  await loadStatus();
-  if (!silent) toast("A mesma conta foi aplicada ao Codex de Projetos.", "success");
+async function shareCodexAccount() {
+  // Same account, independently issued session; never clone refresh tokens.
+  return startDeviceLogin("projects");
 }
 
 async function renameActiveThread() {
@@ -9207,6 +9402,8 @@ function bindEvents() {
   el("refresh-threads").addEventListener("click", loadThreads);
   el("thread-search")?.addEventListener("input", handleThreadSearchInput);
   selectors.messageList.addEventListener("click", event => {
+    const executionCard = event.target.closest("[data-execution-status-toggle]");
+    if (executionCard) { toggleExecutionStatusDetails(executionCard); return; }
     if (event.target.closest(".execution-status-card")) {
       resumeConversationAutoFollow();
       return;
@@ -9246,6 +9443,9 @@ function bindEvents() {
   selectors.messageList.addEventListener("keydown", event => {
     if (!["Enter", " "].includes(event.key) || !event.target.closest(".execution-status-card")) return;
     event.preventDefault();
+    if (event.repeat) return;
+    const executionCard = event.target.closest("[data-execution-status-toggle]");
+    if (executionCard) { toggleExecutionStatusDetails(executionCard); return; }
     resumeConversationAutoFollow();
   });
   el("add-project").addEventListener("click", () => openProjectManager("manage").catch(error => toast(error.message, "error")));
@@ -9368,6 +9568,11 @@ function bindEvents() {
   const closePCData = () => { stopPCActivityRefresh(); selectors.pcDataDialog?.close(); };
   el("close-pc-data")?.addEventListener("click", closePCData);
   selectors.pcDataDialog?.addEventListener("close", stopPCActivityRefresh);
+  selectors.pcDataDialog?.addEventListener("close", stopPCDiskActivityRefresh);
+  selectors.pcDataContent?.addEventListener("click", event => {
+    const button = event.target.closest("[data-pc-disk]");
+    if (button?.dataset.pcDisk) openPCDiskActivity(button.dataset.pcDisk);
+  });
   selectors.pcDataTabs?.addEventListener("click", event => {
     const tab = event.target.closest("[data-pc-tab]")?.dataset.pcTab;
     if (tab) selectPCDataTab(tab).catch(error => toast(error.message, "error"));
@@ -9776,6 +9981,78 @@ window.dexAddReference = reference => {
   return true;
 };
 
+// Narrow bridge for the conversation workspace; sending retains normal APIs,
+// project routing, draft isolation and approval policies.
+window.dexConversationOverview = () => state.threads.map(thread => ({id:thread.id, title:conversationTitle(thread), uiStatus:threadStatus(thread), updatedAt:thread.updatedAt, clc:thread.clc}));
+window.dexOpenOverview = () => setDesktopPanel("inspector", true);
+window.dexConversationIdentity = () => ({projectId:state.activeProject?.id, threadId:state.activeThreadId});
+window.dexConversationContext = () => ({
+  ...window.dexWorkbenchContext(),
+  draft:selectors.prompt.value || "",
+  references:(state.references || []).map(item => ({...item})),
+  items:[...state.items.values()].map(item => ({...item, text:visibleConversationText(extractContent(item))})),
+  threads:state.threads.map(thread => ({...thread, title:conversationTitle(thread), uiStatus:threadStatus(thread)})),
+  payload:{project_id:state.activeProject?.id, model:selectors.model.value || null,
+    effort:selectors.effort.value || null, service_tier:selectors.speed.value || null,
+    network_access:selectors.network.value === "enabled", tools:state.toolProfile},
+});
+window.dexConversationNavigate = async (threadId, projectId) => {
+  const summary = state.threads.find(thread => thread.id === threadId);
+  const targetProject = projectId || summary?._projectId;
+  if (targetProject && state.activeProject?.id !== targetProject) await selectProject(targetProject);
+  if (!state.threads.some(thread => thread.id === threadId) && targetProject)
+    state.threads.push({id:threadId, _projectId:targetProject});
+  await openThread(threadId);
+};
+window.dexConversationReturnLive = () => { state.conversationHistoryFocus = null; resumeConversationAutoFollow(); };
+window.dexConversationJump = async (itemId, query, context) => {
+  const threadId = context.threadId;
+  if (state.activeThreadId !== threadId || state.activeProject?.id !== context.project?.id)
+    throw new Error("A conversa mudou durante a busca; abra novamente o resultado.");
+  if (!state.items.has(itemId)) {
+    const result = await api(`/api/conversation/${encodeURIComponent(context.project.id)}/threads/${encodeURIComponent(threadId)}/item?item_id=${encodeURIComponent(itemId)}`);
+    if (state.activeThreadId !== threadId || state.activeProject?.id !== context.project.id) throw new Error("A conversa mudou durante o carregamento.");
+    state.items.set(itemId, result.item);
+    state.items = new Map([...state.items].sort((a,b) => (a[1]._historyOrder ?? Infinity) - (b[1]._historyOrder ?? Infinity)));
+  }
+  const item = state.items.get(itemId);
+  if (!item) throw new Error("Não foi possível carregar esta mensagem; tente novamente.");
+  pauseConversationAutoFollow();
+  state.conversationScrollInteractionUntil = 0;
+  state.conversationHistoryFocus = {threadId, itemId};
+  if (item._historyTurnId) state.expandedHistoryGroups.add(`history-steps-${item._historyTurnId}`);
+  renderMessages();
+  await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  if (state.activeThreadId !== threadId) return;
+  let card = [...selectors.messageList.querySelectorAll("[data-item-id]")].find(node => node.dataset.itemId === itemId);
+  if (!card) {
+    // A compact technical group may omit an individual log. Explicit search
+    // results can reveal that one item without changing normal grouping.
+    const holder = document.createElement("div"); holder.innerHTML = itemCard(item);
+    card = holder.firstElementChild;
+    const group = [...selectors.messageList.querySelectorAll("[data-item-id]")].find(node => node.dataset.itemId === `history-steps-${item._historyTurnId}`);
+    if (group) group.after(card); else selectors.messageList.append(card);
+    window.DexRichContent?.enhance(card); window.DexConversationWorkspace?.enhance(selectors.messageList);
+  }
+  for (let parent = card.parentElement; parent && parent !== selectors.messageList; parent = parent.parentElement)
+    if (parent.tagName === "DETAILS") parent.open = true;
+  card.classList.add("cw-jump");
+  card.setAttribute("tabindex", "-1"); card.focus({preventScroll:true});
+  if (query) {
+    const walker = document.createTreeWalker(card, NodeFilter.SHOW_TEXT);
+    let node;
+    while ((node = walker.nextNode())) {
+      if (node.parentElement.closest("button,script,style")) continue;
+      const position = node.textContent.toLocaleLowerCase().indexOf(query.toLocaleLowerCase());
+      if (position < 0) continue;
+      const range = document.createRange();range.setStart(node, position);range.setEnd(node, position + query.length);
+      const mark = document.createElement("mark");range.surroundContents(mark);break;
+    }
+  }
+  card.scrollIntoView({block:"center", behavior:"instant"});
+  setTimeout(() => card.classList.remove("cw-jump"), 15000);
+};
+
 bindEvents();
 restoreDesktopPanels();
 desktopLayout.addEventListener?.("change", restoreDesktopPanels);
@@ -9784,3 +10061,130 @@ installConversationScrollControl();
 installComposerSizing();
 installMobileBackNavigation();
 bootstrap();
+
+// Shared presentation for System and Projects; follow-ups stay in the normal composer.
+if (typeof DexRichContent !== "undefined") DexRichContent.configure({
+  context:() => ({project:state.activeProject, threadId:state.activeThreadId}),
+  notify:(message,kind) => toast(message,kind),
+  layout:mutation => { const saved = captureMessageScrollState(); mutation(); restoreMessageScrollState(saved); },
+  ask:text => {
+    if (!state.activeProject || !state.activeThreadId) return;
+    const current = selectors.prompt.value || "";
+    selectors.prompt.value = current ? current + "\n\n" + text : text;
+    selectors.prompt.dispatchEvent(new Event("input", {bubbles:true}));
+    selectors.prompt.focus();
+  },
+});
+
+
+// Additive UI features: no automatic sends, retries, or permission changes.
+window.DexReadStates = {};
+let dexReadSyncBusy = false;
+function dexFeatureDialog(title) {
+  const dialog = document.createElement('dialog');
+  dialog.className = 'dex-enhancement-dialog';
+  dialog.setAttribute('aria-label', title);
+  const heading = document.createElement('h2'); heading.textContent = title;
+  dialog.append(heading);
+  const close = document.createElement('button'); close.type='button'; close.className='secondary-button'; close.textContent='Fechar';
+  close.onclick=()=>dialog.close(); dialog.append(close);
+  dialog.addEventListener('close',()=>dialog.remove(),{once:true});
+  document.body.append(dialog); dialog.showModal(); return dialog;
+}
+function dexDraft(text) {
+  selectors.prompt.value = [selectors.prompt.value.trim(), text].filter(Boolean).join('\n\n');
+  selectors.prompt.dispatchEvent(new Event('input',{bubbles:true}));
+  selectors.prompt.focus();
+}
+function commentExcerpt(button) {
+  const card=button.closest('[data-item-id]');
+  const selection=window.getSelection();
+  const body=card?.querySelector('.message-body');
+  if (!selection?.rangeCount || selection.isCollapsed || !body?.contains(selection.anchorNode) || !body.contains(selection.focusNode)) {
+    return toast('Selecione um trecho da resposta antes de comentar.','error');
+  }
+  const quote=selection.toString().trim().slice(0,12000);
+  const thread=state.activeThreadId, item=card.dataset.itemId;
+  if(!quote||!thread)return;
+  const dialog=dexFeatureDialog('Comentar trecho');
+  const quoted=document.createElement('blockquote');quoted.textContent=quote;
+  const note=document.createElement('textarea');note.setAttribute('aria-label','Seu comentário');note.placeholder='O que deseja alterar ou esclarecer neste trecho?';
+  const storageKey=`dex-excerpt:${thread}:${item}`;
+  try{note.value=sessionStorage.getItem(storageKey)||'';}catch{}
+  note.oninput=()=>{try{sessionStorage.setItem(storageKey,note.value);}catch{}};
+  const add=document.createElement('button');add.type='button';add.className='primary-button';add.textContent='Adicionar ao rascunho';
+  add.onclick=()=>{
+    if(state.activeThreadId!==thread)return toast('Volte à conversa de origem para adicionar este comentário.','error');
+    if(!note.value.trim())return note.focus();
+    const text=`Sobre o trecho da resposta ${item}:\n${quote.split('\n').map(line=>'> '+line).join('\n')}\n\nMeu comentário: ${note.value.trim()}`;
+    dialog.close();dexDraft(text);try{sessionStorage.removeItem(storageKey);}catch{}
+  };
+  dialog.append(quoted,note,add); note.focus();
+}
+function blockExplanation(message) {
+  const text=String(message||'');
+  if(/approval.*review|automatic approval|auto.?review|guardian/i.test(text))return {reason:'A revisão automática recusou esta ação. O motivo original aparece acima.',prompt:'Explique o motivo da recusa da revisão automática e proponha uma alternativa permitida, preservando as proteções existentes.'};
+  if(/permission denied|not permitted|forbidden|sandbox|aprova.*recus|denied|policy|política/i.test(text))return {reason:'A ação encontrou uma restrição de permissão ou política. O erro original aparece acima.',prompt:'Explique a restrição indicada no erro e proponha uma alternativa dentro das permissões atuais.'};
+  return null;
+}
+function blockExplanationHTML(message) {
+  const info=blockExplanation(message);
+  return info ? `<div class="block-explanation"><p>${escapeHTML(info.reason)}</p><button type="button" class="secondary-button" data-safe-followup="${escapeHTML(info.prompt)}">Preparar pedido de alternativa</button></div>` : '';
+}
+async function dexConnectionCheck() {
+  const dialog=dexFeatureDialog('Diagnóstico de conexão');
+  const output=document.createElement('p');output.setAttribute('role','status');output.textContent='Verificando sessão, servidor e canal de eventos…';dialog.append(output);
+  const start=performance.now();let http='';let ws='';
+  try{
+    const response=await fetch('/api/connection-check',{credentials:'same-origin',cache:'no-store',signal:AbortSignal.timeout(8000)});
+    if(!response.ok)throw new Error([401,403].includes(response.status)?'Sessão precisa de autenticação.':`Servidor respondeu HTTP ${response.status}.`);
+    const result=await response.json();if(result.ok!==true)throw Error('Resposta inesperada do servidor.');
+    http=`Servidor e sessão responderam em ${Math.round(performance.now()-start)} ms.`;
+  }catch(error){http=`Falha HTTP: ${error.message}`;}
+  ws=await new Promise(resolve=>{
+    let socket; let done=false;
+    const finish=text=>{if(done)return;done=true;clearTimeout(timer);socket?.close();resolve(text);};
+    const timer=setTimeout(()=>finish('WebSocket não respondeu em 8 segundos.'),8000);
+    try{socket=new WebSocket(`${location.protocol==='https:'?'wss:':'ws:'}//${location.host}/api/events`);socket.onopen=()=>finish('WebSocket conectado.');socket.onerror=()=>finish('Falha no WebSocket; verifique sessão, rede e proxy.');socket.onclose=()=>finish('WebSocket fechado antes de conectar.');}catch(error){finish(`Falha no WebSocket: ${error.message}`);}
+  });
+  output.textContent=`${http} ${ws} ${navigator.onLine?'':'O navegador informa que está offline.'}`;
+}
+async function syncDexReadStates() {
+  if(dexReadSyncBusy||document.visibilityState!=='visible'||(!state.activeThreadId&&!state.threads?.length))return;
+  dexReadSyncBusy=true;
+  try {
+    const data=await api('/api/thread-read-states');
+    window.DexReadStates=data.threads||{};
+    const thread=state.activeThreadId, receipt=window.DexReadStates[thread];
+    if(receipt?.completed_turn_id && receipt.read_turn_id!==receipt.completed_turn_id && !executionIsActive()) {
+      const visible=[...document.querySelectorAll('.message-card.assistant[data-item-id]')].some(card=>{
+        const item=state.items.get(card.dataset.itemId), rect=card.getBoundingClientRect();
+        return item?._historyTurnId===receipt.completed_turn_id && rect.top<innerHeight && rect.bottom>0 && rect.width>0;
+      });
+      if(visible && document.hasFocus() && state.activeThreadId===thread) {
+        const result=await api(`/api/threads/${encodeURIComponent(thread)}/read`,{method:'POST',body:JSON.stringify({turn_id:receipt.completed_turn_id})});
+        window.DexReadStates[thread]=result;
+      }
+    }
+    for(const button of document.querySelectorAll('[data-thread-id]')) {
+      const r=window.DexReadStates[button.dataset.threadId];
+      button.classList.toggle('thread-unread',Boolean(r?.completed_turn_id&&r.completed_turn_id!==r.read_turn_id));
+      button.querySelector('.dex-unread-label')?.remove();
+      if(r?.completed_turn_id&&r.completed_turn_id!==r.read_turn_id){const label=document.createElement('span');label.className='dex-unread-label';label.textContent=' • Nova resposta';button.querySelector('.nav-title')?.append(label);}
+    }
+  }catch(error){console.debug('Sincronização de leitura adiada:',error.message);}finally{dexReadSyncBusy=false;}
+}
+document.addEventListener('click',event=>{
+  const excerpt=event.target.closest('[data-comment-excerpt]');if(excerpt)commentExcerpt(excerpt);
+  const safe=event.target.closest('[data-safe-followup]');if(safe)dexDraft(safe.dataset.safeFollowup);
+});
+function installDexEnhancements() {
+  const button=document.createElement('button');button.type='button';button.className='secondary-button';button.textContent='Conexão';button.setAttribute('aria-label','Diagnóstico de conexão');button.onclick=()=>dexConnectionCheck().catch(error=>toast(error.message,'error'));
+  selectors.connectionLabel?.parentElement?.append(button);
+  setInterval(syncDexReadStates,15000);
+  document.addEventListener('visibilitychange',syncDexReadStates);
+  window.addEventListener('focus',syncDexReadStates);
+}
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',installDexEnhancements,{once:true});else installDexEnhancements();
+
+document.addEventListener("close", () => queueMicrotask(renderQuestionPopup), true);

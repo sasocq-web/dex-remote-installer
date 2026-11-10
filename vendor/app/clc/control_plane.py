@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 import json
 import socket
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,27 @@ DEFAULT_SOCKET = Path("/run/sasocq-control/broker.sock")
 class ControlPlaneError(RuntimeError):
     pass
 
+
+
+def request_failure_diagnostic(exc: BaseException) -> dict[str, Any]:
+    """Bounded correlation metadata only; never a receipt or retry authority."""
+    if type(exc) is not ControlPlaneError:
+        return {}
+    trace = getattr(exc, "_request_trace", None)
+    if type(trace) is not tuple or len(trace) != 3:
+        return {}
+    request_id, phase, elapsed_ms = trace
+    if (type(request_id) is not str or len(request_id) != 36
+            or type(phase) is not str or phase not in {"availability", "socket", "connect", "send", "receive", "decode", "response"}
+            or type(elapsed_ms) is not int or not 0 <= elapsed_ms <= 3_600_000):
+        return {}
+    try:
+        parsed = uuid.UUID(request_id)
+    except ValueError:
+        return {}
+    if str(parsed) != request_id or parsed.version != 4:
+        return {}
+    return {"request_id": request_id, "phase": phase, "elapsed_ms": elapsed_ms}
 
 
 def _worker_freeze_observation() -> dict[str, Any]:
@@ -76,14 +98,25 @@ def request(
         "action": action,
         "params": params or {},
     }
+    started = time.monotonic()
+    phase = "availability"
+    def failure(message):
+        error = ControlPlaneError(message)
+        elapsed_ms = int(max(0, min(3_600_000, (time.monotonic() - started) * 1000)))
+        error._request_trace = (payload["request_id"], phase, elapsed_ms)
+        return error
     path = Path(socket_path)
     if not path.exists():
-        raise ControlPlaneError("O broker administrativo SASOCQ ainda não está instalado ou ativo")
+        raise failure("O broker administrativo SASOCQ ainda não está instalado ou ativo")
+    phase = "socket"
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.settimeout(timeout)
+            phase = "connect"
             client.connect(str(path))
+            phase = "send"
             client.sendall(json.dumps(payload, ensure_ascii=False).encode("utf-8") + b"\n")
+            phase = "receive"
             data = b""
             while b"\n" not in data:
                 chunk = client.recv(8192)
@@ -91,17 +124,19 @@ def request(
                     break
                 data += chunk
                 if len(data) > 2_000_000:
-                    raise ControlPlaneError("Resposta administrativa excedeu o limite seguro")
+                    raise failure("Resposta administrativa excedeu o limite seguro")
     except (OSError, TimeoutError) as exc:
-        raise ControlPlaneError(f"Falha ao acessar o broker administrativo: {exc}") from exc
+        raise failure(f"Falha ao acessar o broker administrativo: {exc}") from exc
     if not data:
-        raise ControlPlaneError("O broker administrativo não retornou resposta")
+        raise failure("O broker administrativo não retornou resposta")
+    phase = "decode"
     try:
         response = json.loads(data.split(b"\n", 1)[0].decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ControlPlaneError("Resposta administrativa inválida") from exc
+        raise failure("Resposta administrativa inválida") from exc
+    phase = "response"
     if not isinstance(response, dict):
-        raise ControlPlaneError("Resposta administrativa inválida")
+        raise failure("Resposta administrativa inválida")
     if action in {"watchdog", "resources", "system", "gaming", "steam"} and (params or {}).get("operation", "status") in {"status", "overview", "check"}:
         return _reconcile_quarantine_status(response)
     return response

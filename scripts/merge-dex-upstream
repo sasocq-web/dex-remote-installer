@@ -49,13 +49,9 @@ def read_json(path: Path) -> dict:
 
 
 def latest_release_id() -> str:
-    queue = read_json(ROLLOUT_ROOT / "queue.json").get("releases") or []
-    valid_queue = [item for item in queue if isinstance(item, dict) and item.get("id")]
-    if valid_queue:
-        return str(valid_queue[-1]["id"])
-    pending = read_json(ROLLOUT_ROOT / "pending.json")
-    if pending.get("id"):
-        return str(pending["id"])
+    transaction = read_json(ROLLOUT_ROOT / "update-transaction.json")
+    if transaction and transaction.get("phase") not in {"committed", "rolled_back"}:
+        raise RuntimeError("atualização do Dex em andamento; aguarde a validação")
     try:
         return CURRENT_LINK.resolve(strict=True).parent.name
     except OSError as exc:
@@ -134,6 +130,19 @@ def resolve_startup_conflict(content: bytes) -> bytes | None:
         r"^<<<<<<< [^\n]+\n(?P<local>.*?)^=======\n(?P<remote>.*?)^>>>>>>> [^\n]+\n",
         flags=re.MULTILINE | re.DOTALL,
     )
+    def resolve_reviewed(match):
+        local, remote = match.group("local", "remote")
+        digest = hashlib.sha256((local + "\0" + remote).encode()).hexdigest()
+        before = text[:match.start()]
+        if digest == "2a84e9b0283b0a79056bfabc8d7fd8c5ad628da611b901004b2996418ff95f5a" and before.endswith("async def _share_system_account_with_projects() -> None:\n"):
+            return remote
+        if digest == "9198913ca079ebf714596063088f40f3d1258e95647593a10e712a1b75d1ec1d" and before.endswith('    if project.kind != "system":\n        profile.desktop = False\n'):
+            return remote.replace("profile.system_admin = True", "profile.system_admin = False", 1)
+        return match.group(0)
+
+    text = pattern.sub(resolve_reviewed, text)
+    if "<<<<<<< " not in text:
+        return text.encode("utf-8")
     matches = list(pattern.finditer(text))
     if len(matches) != 1 or text.count("<<<<<<< ") != 1:
         return None
@@ -332,6 +341,21 @@ def main() -> int:
         if relative not in local and relative in base:
             local[relative] = base[relative]
     merged = merge_maps(base, local, remote)
+    # The portable system service is only a client of the Android authority.
+    # Only the host release manager owns the rootless Android unit.
+    entry = merged["clc/__main__.py"]
+    if b"from .android_runtime_bootstrap import reconcile\n" in entry:
+        call = b"    reconcile(Path(__file__).resolve().parents[1], settings.resolved_config_dir)\n"
+        if entry.count(call) != 1:
+            raise RuntimeError("revisar a inicialização Android antes de exportar o instalador")
+        merged["clc/__main__.py"] = entry.replace(call, b"").replace(
+            b"from .android_runtime_bootstrap import reconcile\n", b""
+        ).replace(b"from pathlib import Path\n", b"" if entry.count(b"Path(") == 1 else b"from pathlib import Path\n")
+    # The Projects profile has no System workspace for the update verifier.
+    main = merged["clc/main.py"]
+    start = b'    update_verifier = UpdateVerifier(system_bridge, events, _system_project().path,\n                                     lambda: len(_active_turns) + int(bool(android_lifecycle.background_owner)),\n                                     lambda: _startup_canary_error, lambda: _rollout_gate_closed())\n    update_verifier.task = asyncio.create_task(update_verifier.run(), name="dex-update-functional-verifier")\n'
+    if start in main:
+        merged["clc/main.py"] = main.replace(start, b'    if not settings.projects_only:\n        update_verifier = UpdateVerifier(system_bridge, events, _system_project().path,\n                                         lambda: len(_active_turns) + int(bool(android_lifecycle.background_owner)),\n                                         lambda: _startup_canary_error, lambda: _rollout_gate_closed())\n        update_verifier.task = asyncio.create_task(update_verifier.run(), name="dex-update-functional-verifier")\n', 1)
 
     upstream_version = remote.get("VERSION", b"0.0.0").decode("utf-8", errors="replace").strip()
     merged["VERSION"] = f"{upstream_version}-portable+{remote_id}\n".encode()

@@ -19,7 +19,6 @@ SUPPORTED_METHODS = {
     "item/permissions/requestApproval",
     "mcpServer/elicitation/request",
 }
-PENDING_TTL_SECONDS = 20 * 60
 PENDING_LIMIT = 2_000
 
 
@@ -48,9 +47,16 @@ def _tool_approval_identity(params: dict[str, Any]) -> tuple[str, str] | None:
         return None
     parsed = re.fullmatch(r'Allow the ([A-Za-z0-9_.-]+) MCP server to run tool "([A-Za-z0-9_.-]+)"\?',
                           str(params.get("message") or ""))
-    if not parsed or params.get("serverName") != parsed.group(1):
-        return None
-    return parsed.group(1), parsed.group(2)
+    if parsed and params.get("serverName") == parsed.group(1):
+        return parsed.group(1), parsed.group(2)
+    # Official connectors use a display name rather than the MCP-server wording.
+    connector = re.fullmatch(r'Allow (.+) to run tool "([A-Za-z0-9_.-]+)"\?',
+                             str(params.get("message") or ""))
+    if (connector and params.get("serverName") == "codex_apps"
+            and meta.get("source") == "connector" and meta.get("connector_id")
+            and meta.get("connector_name") == connector.group(1)):
+        return "codex_apps", connector.group(2)
+    return None
 
 
 def project_tool_approval(path: Path, server: str, tool: str) -> bool:
@@ -112,6 +118,9 @@ def approval_type_key(method: Any, params: Any) -> str:
     if method == "mcpServer/elicitation/request":
         if _interactive_elicitation(params):
             return ""
+        identity = _tool_approval_identity(params)
+        if identity is not None:
+            return f"{method}:{_normalized(identity[0], 'mcp')}:{_normalized(identity[1], 'request')}"
         message = str(params.get("message") or "")
         parsed = re.search(
             r"Allow the\s+(.+?)\s+MCP server\s+to run tool\s+[\"']([^\"']+)[\"']",
@@ -187,14 +196,6 @@ class ConversationApprovalRules:
             return None
         return workspace, thread_id, rule_type
 
-    def _purge_pending(self) -> None:
-        cutoff = time.monotonic() - PENDING_TTL_SECONDS
-        self._pending = {key: value for key, value in self._pending.items() if value[1] >= cutoff}
-        if len(self._pending) > PENDING_LIMIT:
-            excess = len(self._pending) - PENDING_LIMIT
-            for key, _value in sorted(self._pending.items(), key=lambda item: item[1][1])[:excess]:
-                self._pending.pop(key, None)
-
     def _matches(self, identity: tuple[str, str, str]) -> bool:
         with closing(self._connect()) as connection:
             row = connection.execute(
@@ -207,10 +208,13 @@ class ConversationApprovalRules:
         if self.site_policy is None:
             return ""
         strings = list(_walk_strings(params))
+        # Host argv paths/unit names are not bare website destinations.
+        # Explicit HTTP(S) destinations still obey site policy.
+        admin_argv = _tool_approval_identity(params) == ("sasocq_system", "sasocq_host_exec")
         domains = {
             domain
             for value in strings
-            for domain in domains_from_text(value, allow_plain=True)
+            for domain in domains_from_text(value, allow_plain=not admin_argv)
         }
         if not domains:
             return ""
@@ -253,8 +257,17 @@ class ConversationApprovalRules:
         params = notification.get("params") or {}
         thread_id = params.get("threadId")
         bridge_ended = event.get("kind") == "bridge_status" and event.get("status") in {"stopped", "error"}
+        if method == "serverRequest/resolved":
+            request_id = params.get("requestId")
+            self._forms.pop((workspace, str(request_id)), None)
+            self._pending.pop((workspace, str(request_id)), None)
         if not bridge_ended and method != "turn/completed":
             return []
+        # Permissions must not reappear after their turn/bridge has finished.
+        for key, (request, _) in list(self._pending.items()):
+            owner = request.get("params", {}).get("threadId")
+            if key[0] == workspace and (bridge_ended or thread_id and owner == thread_id):
+                self._pending.pop(key, None)
         resolved = []
         for key, (request, _) in list(self._forms.items()):
             owner = request.get("params", {}).get("threadId")
@@ -263,9 +276,17 @@ class ConversationApprovalRules:
                 resolved.append({"kind": "mcp_form_resolved", "workspace": workspace, "thread_id": owner, "request_id": key[1]})
         return resolved
 
+    def pending_approval_events(self) -> list[dict[str, Any]]:
+        """Keep permissions until resolution, turn completion or bridge shutdown.
+
+        Wall-clock expiry must not orphan a still-blocked app-server request.
+        """
+        return [{"kind": "server_request", "workspace": key[0], "request": value[0]}
+                for key, value in self._pending.items()]
+
     def pending_form_events(self) -> list[dict[str, Any]]:
-        cutoff = time.monotonic() - 300
-        self._forms = {key: value for key, value in self._forms.items() if value[1] >= cutoff}
+        # Human waits have no implicit expiry: dropping the UI request leaves
+        # the executor blocked. Resolution/completion/shutdown owns cleanup.
         return [{"kind": "server_request", "workspace": key[0], "request": value[0]}
                 for key, value in self._forms.items()]
 
@@ -276,6 +297,19 @@ class ConversationApprovalRules:
         self.pending_form_events()
         if (workspace, str(request_id)) not in self._forms:
             raise ValueError("O formulário expirou; solicite uma nova tentativa.")
+        if record[0].get("method") == "item/tool/requestUserInput":
+            answers = result.get("answers")
+            questions = {q["id"]: q for q in record[0].get("params", {}).get("questions", [])}
+            if not isinstance(answers, dict) or set(result) != {"answers"}:
+                raise ValueError("Resposta de pergunta inválida.")
+            if answers and set(answers) != set(questions):
+                raise ValueError("Responda todas as perguntas.")
+            for answer in answers.values():
+                if (not isinstance(answer, dict) or set(answer) != {"answers"}
+                        or not isinstance(answer["answers"], list) or not answer["answers"]
+                        or any(not isinstance(v, str) or not v.strip() or len(v) > 8192 for v in answer["answers"])):
+                    raise ValueError("Resposta inválida.")
+            return True
         if result.get("action") in {"cancel", "decline"}:
             return True
         if result.get("action") != "accept":
@@ -309,11 +343,20 @@ class ConversationApprovalRules:
                 return {"action": "cancel", "content": None}
             self._forms[(workspace, str(message.get("id")))] = (message, time.monotonic())
             return None
+        if message.get("method") == "item/tool/requestUserInput":
+            self.pending_form_events()
+            if len(self._forms) >= PENDING_LIMIT:
+                return {"answers": {}}
+            self._forms[(workspace, str(message.get("id")))] = (message, time.monotonic())
+            return None
         identity = self._identity(workspace, message)
         if identity is None:
             return None
-        self._purge_pending()
         pending_key = (workspace, str(message.get("id")))
+        # Bound memory by declining the new request, never by evicting a
+        # request for which an executor is still waiting on the operator.
+        if pending_key not in self._pending and len(self._pending) >= PENDING_LIMIT:
+            return self._denial_result(str(message.get("method") or ""))
         self._pending[pending_key] = (message, time.monotonic())
         method = str(message.get("method") or "")
         params = message.get("params") if isinstance(message.get("params"), dict) else {}
@@ -335,7 +378,6 @@ class ConversationApprovalRules:
         return approval_result(method, params)
 
     def remember_pending(self, workspace: str, request_id: Any) -> tuple[tuple[str, str, str], bool]:
-        self._purge_pending()
         pending = self._pending.get((workspace, str(request_id)))
         if pending is None:
             raise ValueError("A solicitação de aprovação não está mais pendente")

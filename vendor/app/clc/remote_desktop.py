@@ -1159,6 +1159,19 @@ wait "$wm_pid"
         if replace_browser:
             await self._terminate_process(self._browser_process, timeout=3)
             self._browser_process = None
+        # Move the launcher before exec/fork. Moving only Chrome's main PID
+        # after startup strands zygotes/renderers in the backend TasksMax.
+        # A scope execs the command with the same PID, environment and streams,
+        # preserving Process.wait/send_signal and the existing owner lock.
+        if replace_browser:
+            argv = [
+                "/usr/bin/systemd-run", "--user", "--scope", "--quiet",
+                "--collect", "--no-ask-password", "--slice=app.slice",
+                f"--unit=clc-managed-browser-{secrets.token_hex(8)}",
+                "-p", "TasksMax=512", "-p", "MemoryHigh=1536M",
+                "-p", "MemoryMax=2G", "-p", "MemorySwapMax=0",
+                "--", *argv,
+            ]
         log_path = self.state_dir / "remote-apps.log"
         log = open(log_path, "ab", buffering=0)
         os.chmod(log_path, 0o600)
