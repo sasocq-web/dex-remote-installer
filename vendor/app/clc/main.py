@@ -3955,6 +3955,55 @@ async def control_disk_activities_api(request: Request) -> Dict[str, Any]:
     return {"activities": values, "checked_at": time.time()}
 
 
+async def _pc_volumes():
+    raw = await _host_insight_command(["lsblk", "-J", "-b", "-o", "NAME,TYPE,SIZE,MODEL,TRAN,ROTA,MOUNTPOINTS"], timeout=15)
+    volumes = []
+    def visit(node, disk):
+        if node.get("type") == "disk":
+            disk = node
+        mounts = [m for m in node.get("mountpoints", []) if m and not m.startswith(("/var/lib/sasocq-control/", "/srv/sasocq/projects/"))]
+        if disk and mounts:
+            volumes.append({"path": mounts[-1], "model": disk.get("model") or disk["name"],
+                "external": disk.get("tran") == "usb", "rotational": bool(disk.get("rota")), "size": disk.get("size")})
+        for child in node.get("children", []):
+            visit(child, disk)
+    for node in json.loads(raw).get("blockdevices", []):
+        visit(node, None)
+    for volume in volumes:
+        raw = await _host_insight_command(["df", "-B1", "--output=size,used,avail,pcent", "--", volume["path"]], timeout=10)
+        fields = raw.splitlines()[-1].split()
+        volume.update(total=int(fields[0]), used=int(fields[1]), free=int(fields[2]), percent=int(fields[3].rstrip("%")))
+    return volumes
+
+
+_pc_tree_cache = {}
+_pc_tree_lock = asyncio.Lock()
+
+@app.get("/api/control/pc-storage-tree")
+async def control_pc_storage_tree_api(request: Request, path: str = "/"):
+    _session(request)
+    from pathlib import Path as HostPath
+    normalized = str(HostPath(path).resolve())
+    if not path.startswith("/") or normalized.startswith(("/proc", "/sys", "/dev", "/run")) or not HostPath(normalized).is_dir():
+        raise HTTPException(status_code=400, detail="Pasta indisponível para análise")
+    async with _pc_tree_lock:
+        cached = _pc_tree_cache.get(normalized)
+        if cached and time.time() - cached["checked_at"] < 90:
+            return cached
+        try:
+            raw = await _host_insight_command(["du", "-x", "-B1", "--max-depth=1", "--exclude=/proc", "--exclude=/sys", "--exclude=/dev", "--exclude=/run", "--exclude=*/.cache/sasocq-transport", "--exclude=/var/lib/sasocq-control/vm-portable", "--", normalized], timeout=180)
+        except ControlPlaneError as exc:
+            raise HTTPException(status_code=503, detail="Não foi possível concluir a leitura. Tente uma pasta menor. " + str(exc)) from exc
+        from .pc_insights import parse_du_output
+        sizes = parse_du_output(raw)
+        children = sorted([{"path": name, "size": size} for name, size in sizes.items() if name != normalized], key=lambda item: item["size"], reverse=True)
+        value = {"path": normalized, "size": sizes.get(normalized, 0), "children": children[:500], "truncated": len(children) > 500, "checked_at": time.time()}
+        if len(_pc_tree_cache) > 100:
+            _pc_tree_cache.clear()
+        _pc_tree_cache[normalized] = value
+        return value
+
+
 @app.get("/api/control/pc-resources")
 async def control_pc_resources_api(request: Request) -> Dict[str, Any]:
     """Return fresh lightweight metrics for the PC data overview."""
@@ -3972,6 +4021,7 @@ async def control_pc_resources_api(request: Request) -> Dict[str, Any]:
         "cpu": machine.get("cpu", {}),
         "memory": machine.get("memory", {}),
         "filesystems": machine.get("filesystems", []),
+        "volumes": await _pc_volumes(),
         "temperatures": machine.get("temperatures", []),
         "hardware": machine.get("hardware", {}),
     }

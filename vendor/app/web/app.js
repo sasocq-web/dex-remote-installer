@@ -425,8 +425,10 @@ function renderPCResources(data) {
   selectors.pcDataContent.innerHTML = `
     <article class="pc-resource-card ${resourceCardClass(health.cpuPercent >= 85, health.cpuPercent >= 95)}"><span>CPU atual</span><strong>${escapeHTML(health.cpuPercent.toFixed(1))}%</strong><small>${escapeHTML(data.cpu?.logical || "—")} threads${hottest.celsius ? ` • ${escapeHTML(hottest.celsius)} °C` : ""}</small></article>
     <article class="pc-resource-card ${resourceCardClass(ramWarning, ramDanger)}"><span>RAM disponível</span><strong>${formatBytes(memoryAvailable)}</strong><small>${formatBytes(Number(health.memory.used || 0))} em uso de ${formatBytes(memoryTotal)}</small></article>
-    <article class="pc-resource-card ${resourceCardClass(diskWarning, diskDanger)}"><span>SSD livre</span><strong>${formatBytes(diskFree)}</strong><small>${escapeHTML(health.rootDisk.percent ?? "—")}% usado de ${formatBytes(diskTotal)}</small></article>
-    ${hdds.map(item => `<button type="button" class="pc-resource-card pc-disk-button" data-pc-disk="${escapeHTML(item.serial || "")}" ${item.serial ? "" : "disabled"}><span>HD total</span><strong>${formatBytes(item.size)}</strong><small>${escapeHTML(item.model || "HD")}</small><small>Ver atividade</small></button>`).join("")}
+    <button type="button" data-pc-tree="/" class="pc-resource-card ${resourceCardClass(diskWarning, diskDanger)}"><span>SSD interno livre</span><strong>${formatBytes(diskFree)}</strong><small>${escapeHTML(health.rootDisk.percent ?? "—")}% usado de ${formatBytes(diskTotal)}</small></button>
+    ${(data.volumes || []).filter(v => v.path !== "/" && v.path !== "/boot" && v.path !== "/boot/efi").map(v => `<button type="button" class="pc-resource-card pc-disk-button" data-pc-tree="${escapeHTML(v.path)}"><span>${v.rotational ? "HD" : "SSD"} ${v.external ? "externo" : "volume"}</span><strong>${formatBytes(v.free)} livres</strong><small>${v.percent}% usado de ${formatBytes(v.total)} • ${escapeHTML(v.model)}</small><small>${escapeHTML(v.path)} • Ver árvore de dados</small></button>`).join("")}
+    ${disks.filter(d => d.transport === "usb" && !(data.volumes || []).some(v => v.model === d.model)).map(d => `<article class="pc-resource-card"><span>${d.rotational ? "HD" : "SSD"} externo</span><strong>Não montado</strong><small>${escapeHTML(d.model)} • ${formatBytes(d.size)}</small></article>`).join("")}
+    ${hdds.map(item => `<button type="button" class="secondary-button" data-pc-disk="${escapeHTML(item.serial || "")}">Ver atividade: ${escapeHTML(item.model || "HD")}</button>`).join("")}
     <section id="pc-disk-activity" class="pc-disk-activity" aria-live="polite"></section>
     <div class="pc-data-details"><strong>${escapeHTML(data.hostname || "Mini PC SASOCQ")}</strong><span>${escapeHTML(hardware.cpu?.model || data.platform || "Processador não identificado")}</span><span>${escapeHTML(disk.model || "SSD interno")} • kernel ${escapeHTML(data.kernel || "—")} • ligado há ${escapeHTML(uptimeDays.toFixed(1))} dia(s)</span></div>`;
   renderPCDiskActivity();
@@ -527,8 +529,33 @@ function formatElapsed(seconds) {
   return `${Math.floor(value / 86400)} d ${Math.floor((value % 86400) / 3600)} h`;
 }
 
+let pcTree = null;
+let pcTreeBusy = false;
+let pcTreeError = "";
+let pcTreeRequest = 0;
+async function openPCStorageTree(path) {
+  const sequence = ++pcTreeRequest;
+  state.pcDataTab = "storage";
+  pcTreeBusy = true; pcTreeError = "";
+  updatePCDataTabs(); renderPCDataPanel();
+  try {
+    const value = await api(`/api/control/pc-storage-tree?path=${encodeURIComponent(path)}`);
+    if (sequence === pcTreeRequest) pcTree = value;
+  } catch (error) { if (sequence === pcTreeRequest) pcTreeError = error.message; }
+  finally { if (sequence === pcTreeRequest) { pcTreeBusy = false; renderPCDataPanel(); } }
+}
+function renderPCStorageTree() {
+  if (pcTreeBusy) return pcDataLoading("Medindo a árvore de dados…");
+  if (pcTreeError) return `<p role="alert">${escapeHTML(pcTreeError)}</p><button type="button" data-pc-tree="${escapeHTML(pcTree?.path || "/")}">Tentar novamente</button>`;
+  if (!pcTree) return "";
+  const parts = pcTree.path.split("/").filter(Boolean);
+  const crumbs = ["/", ...parts.map((_, i) => "/" + parts.slice(0, i + 1).join("/"))];
+  return `<section class="pc-storage-tree"><h3>Árvore de dados • ${formatBytes(pcTree.size)}</h3><nav aria-label="Caminho da pasta">${crumbs.map(path => `<button type="button" class="secondary-button" data-pc-tree="${escapeHTML(path)}">${escapeHTML(path === "/" ? "/" : path.split("/").pop())}</button>`).join(" / ")}</nav><p>Pastas em ordem de tamanho. Clique para expandir. Barras indicam a proporção nesta pasta.</p>${pcTree.children.map((item, index) => {const percent = pcTree.size ? Math.min(100, item.size / pcTree.size * 100) : 0; return `<button type="button" class="storage-tree-row" data-pc-tree="${escapeHTML(item.path)}"><span>${index + 1}. 📁 ${escapeHTML(item.path.split("/").pop())}</span><b>${formatBytes(item.size)} • ${percent.toFixed(1)}%</b><span class="storage-tree-bar"><i style="width:${percent}%"></i></span></button>`;}).join("") || "<p>Nenhuma subpasta. O total também inclui arquivos nesta pasta.</p>"}${pcTree.truncated ? "<p>Exibindo as 500 maiores pastas.</p>" : ""}<small>Leitura somente de tamanhos, sem abrir arquivos. Outros volumes são analisados separadamente. Atualizado em ${formatTime(pcTree.checked_at)}.</small></section>`;
+}
+
 function renderPCStorage() {
   const data = state.pcStorage;
+  if (pcTreeBusy || pcTree || pcTreeError) return renderPCStorageTree();
   if (state.pcStorageLoading) return pcDataLoading("Analisando as pastas do SSD…");
   if (!data) return `<div class="pc-manager-empty"><strong>Consumo ainda não analisado</strong><span>Selecione “Analisar armazenamento” para medir as pastas sem apagar ou modificar arquivos.</span><button class="primary-button" type="button" data-pc-load="storage">Analisar armazenamento</button></div>`;
   const filesystem = data.filesystem || {};
@@ -547,11 +574,11 @@ function renderPCStorage() {
     <section class="pc-manager-section"><div class="pc-manager-section-title"><strong>Por categoria</strong><small>Pastas principais do mesmo SSD</small></div>
       <div class="storage-category-list">${(data.categories || []).map(item => {
         const percent = used ? Math.min(100, Number(item.size || 0) / used * 100) : 0;
-        return `<article class="storage-row"><div><strong>${escapeHTML(item.label)}</strong><small>${escapeHTML(item.path)}</small></div><span>${formatBytes(item.size)}</span><div class="storage-row-meter"><span style="width:${percent.toFixed(2)}%"></span></div></article>`;
+        return `<article tabindex="0" role="button" data-pc-tree="${escapeHTML(item.path)}" class="storage-row"><div><strong>${escapeHTML(item.label)}</strong><small>${escapeHTML(item.path)}</small></div><span>${formatBytes(item.size)}</span><div class="storage-row-meter"><span style="width:${percent.toFixed(2)}%"></span></div></article>`;
       }).join("") || '<div class="panel-empty">Nenhuma categoria encontrada.</div>'}</div>
     </section>
     <section class="pc-manager-section"><div class="pc-manager-section-title"><strong>O que mais ocupa espaço</strong><small>Itens reconhecidos, sem expor conteúdo pessoal</small></div>
-      <div class="storage-largest-list">${largest.map((item, index) => `<article class="storage-largest-row"><span class="storage-rank">${index + 1}</span><div><strong>${escapeHTML(item.label)}</strong><small>${escapeHTML(item.path)}</small></div><b>${formatBytes(item.size)}</b></article>`).join("") || '<div class="panel-empty">Nenhum item relevante encontrado.</div>'}</div>
+      <div class="storage-largest-list">${largest.map((item, index) => `<article tabindex="0" role="button" data-pc-tree="${escapeHTML(item.path)}" class="storage-largest-row"><span class="storage-rank">${index + 1}</span><div><strong>${escapeHTML(item.label)}</strong><small>${escapeHTML(item.path)}</small></div><b>${formatBytes(item.size)}</b></article>`).join("") || '<div class="panel-empty">Nenhum item relevante encontrado.</div>'}</div>
     </section>
     <div class="pc-manager-note">Esta página apenas mede o consumo. Exclusões e limpezas continuam exigindo uma solicitação explícita ao Codex para preservar servidor, painel e backups.</div>`;
 }
@@ -596,7 +623,7 @@ function renderPCDataPanel() {
   updatePCDataTabs();
   if (state.pcDataTab === "storage") selectors.pcDataPanel.innerHTML = renderPCStorage();
   else if (state.pcDataTab === "activities") selectors.pcDataPanel.innerHTML = renderPCActivities();
-  else selectors.pcDataPanel.innerHTML = `<div class="pc-overview-intro"><strong>Mini PC SASOCQ em tempo real</strong><span>Use o gerenciador de armazenamento para descobrir o que ocupa o SSD e o gerenciador de atividades para acompanhar CPU, memória e processos.</span><div class="pc-overview-actions"><button class="primary-button" type="button" data-pc-open-tab="storage">Ver armazenamento</button><button class="secondary-button" type="button" data-pc-open-tab="activities">Ver atividades</button></div></div>`;
+  else selectors.pcDataPanel.innerHTML = `<div class="pc-overview-intro"><strong>Mini PC SASOCQ em tempo real</strong><span>Clique nos discos para explorar a árvore de dados e descobrir o que ocupa o armazenamento e o gerenciador de atividades para acompanhar CPU, memória e processos.</span><div class="pc-overview-actions"><button class="primary-button" type="button" data-pc-open-tab="storage">Ver armazenamento</button><button class="secondary-button" type="button" data-pc-open-tab="activities">Ver atividades</button></div></div>`;
 }
 
 async function loadPCStorage({refresh = false, announce = false} = {}) {
@@ -652,7 +679,7 @@ async function selectPCDataTab(tab) {
   if (!["overview", "storage", "activities"].includes(tab)) return;
   state.pcDataTab = tab;
   renderPCDataPanel();
-  if (tab === "storage" && !state.pcStorage) await loadPCStorage();
+  if (tab === "storage" && !pcTree) await openPCStorageTree("/");
   if (tab === "activities") await loadPCActivities();
   startPCActivityRefresh();
 }
@@ -10188,3 +10215,11 @@ function installDexEnhancements() {
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',installDexEnhancements,{once:true});else installDexEnhancements();
 
 document.addEventListener("close", () => queueMicrotask(renderQuestionPopup), true);
+
+document.addEventListener("click", event => {
+  const target = event.target.closest("[data-pc-tree]");
+  if (target) void openPCStorageTree(target.dataset.pcTree);
+});
+document.addEventListener("keydown", event => {
+  if ((event.key === "Enter" || event.key === " ") && event.target.matches("article[data-pc-tree]")) { event.preventDefault(); void openPCStorageTree(event.target.dataset.pcTree); }
+});
