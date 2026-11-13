@@ -1918,11 +1918,39 @@ def _active_conversation_summaries() -> list[Dict[str, Any]]:
     return summaries
 
 
+
+_storage_closure_instance = None
+
+def _storage_closure():
+    global _storage_closure_instance
+    if _storage_closure_instance is None:
+        from .backend_storage_closure import PersistentClosure
+        _storage_closure_instance = PersistentClosure()
+    return _storage_closure_instance
+
+def _storage_closure_blocks():
+    try:
+        return _storage_closure().blocks()
+    except Exception:
+        return True
+
+async def _storage_revocation_health():
+    try:
+        return await asyncio.to_thread(_storage_closure().revocation_health, update_safety_release())
+    except Exception:
+        return None
+
+async def _storage_execution_health():
+    try:
+        return await asyncio.to_thread(_storage_closure().health, update_safety_release())
+    except Exception:
+        return None
+
 def _rollout_gate_closed() -> bool:
     global _rollout_quiescing_until
     if _rollout_quiescing_until and time.monotonic() >= _rollout_quiescing_until:
         _rollout_quiescing_until = 0.0
-    return _rollout_quiescing_until > 0 or update_safety_gate_closed()
+    return _storage_closure_blocks() or _rollout_quiescing_until > 0 or update_safety_gate_closed()
 
 
 def _playwright_workspace_for_thread(thread_id: str) -> str:
@@ -2911,6 +2939,8 @@ async def health() -> Dict[str, Any]:
         "active_turns": len(blocking_conversations),
         "blocking_conversations": blocking_conversations,
         "accepting_turns": not _rollout_gate_closed(),
+        "storage_execution": await _storage_execution_health(),
+        "storage_revocation": await _storage_revocation_health(),
         "update_safety": update_verifier.last if update_verifier is not None else {},
         "release_id": update_safety_release(),
         "functional_canary": {
@@ -3316,6 +3346,8 @@ async def rollout_quiesce(request: Request) -> Dict[str, Any]:
     if client not in {"127.0.0.1", "::1"}:
         raise HTTPException(status_code=403, detail="quiescência disponível somente no host local")
     async with _rollout_gate_lock:
+        if _storage_closure_blocks():
+            raise HTTPException(status_code=409, detail="original persistent storage closure requires reconciliation")
         await android_lifecycle.refresh()
         blocking_conversations = _active_conversation_summaries()
         if blocking_conversations:
@@ -3348,6 +3380,8 @@ async def rollout_unquiesce(request: Request) -> Dict[str, Any]:
     if client not in {"127.0.0.1", "::1"}:
         raise HTTPException(status_code=403, detail="quiescência disponível somente no host local")
     async with _rollout_gate_lock:
+        if _storage_closure_blocks():
+            raise HTTPException(status_code=409, detail="persistent storage closure requires its original terminal receipt")
         _rollout_quiescing_until = 0.0
         return {
             "ok": True,
@@ -3355,6 +3389,91 @@ async def rollout_unquiesce(request: Request) -> Dict[str, Any]:
             "blocking_conversations": _active_conversation_summaries(),
             "accepting_turns": True,
         }
+
+
+
+@app.post("/api/internal/storage/quiesce")
+async def storage_quiesce(request: Request) -> Dict[str, Any]:
+    client = request.client.host if request.client else ""
+    if client not in {"127.0.0.1", "::1"}:
+        raise HTTPException(status_code=403, detail="storage closure is loopback only")
+    if int(request.headers.get("content-length") or "0") > 2048:
+        raise HTTPException(status_code=413, detail="storage locator too large")
+    raw = await request.body()
+    if len(raw) > 2048:
+        raise HTTPException(status_code=413, detail="storage locator too large")
+    try:
+        locator = json.loads(raw)
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid storage locator") from None
+    async with _rollout_gate_lock:
+        if _storage_closure_blocks():
+            raise HTTPException(status_code=409, detail="original persistent storage closure requires reconciliation")
+        await android_lifecycle.refresh()
+        blocking = _active_conversation_summaries()
+        if blocking:
+            raise HTTPException(status_code=409, detail="active conversations")
+        result = await android_lifecycle.quiesce()
+        try:
+            hold = await asyncio.to_thread(_storage_closure().acquire, locator,
+                update_safety_release(), len(blocking), result.get("quiesced") is True)
+        except Exception:
+            raise HTTPException(status_code=409, detail="original storage authority required") from None
+        if hold is None:
+            raise HTTPException(status_code=409, detail="original storage hold requires review")
+        return {"ok": True, "active_turns": 0, "blocking_conversations": [],
+                "accepting_turns": False, "storage_execution": hold}
+
+@app.post("/api/internal/storage/release")
+async def storage_release(request: Request) -> Dict[str, Any]:
+    client = request.client.host if request.client else ""
+    if client not in {"127.0.0.1", "::1"}:
+        raise HTTPException(status_code=403, detail="storage release is loopback only")
+    raw = await request.body()
+    if len(raw) > 2048:
+        raise HTTPException(status_code=413, detail="storage locator too large")
+    try:
+        locator = json.loads(raw)
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid storage locator") from None
+    async with _rollout_gate_lock:
+        try:
+            result = await asyncio.to_thread(_storage_closure().release_original, locator)
+        except Exception:
+            raise HTTPException(status_code=409, detail="original terminal receipt and consistent storage required") from None
+        return {"ok": True, **result, "accepting_turns": not _rollout_gate_closed()}
+
+
+@app.post("/api/internal/storage/revoke-unstarted")
+async def storage_revoke_unstarted(request: Request) -> Dict[str, Any]:
+    client = request.client.host if request.client else ""
+    if client not in {"127.0.0.1", "::1"}:
+        raise HTTPException(status_code=403, detail="storage revocation is loopback only")
+    if int(request.headers.get("content-length") or "0") > 2048:
+        raise HTTPException(status_code=413, detail="storage locator too large")
+    raw = await request.body()
+    if len(raw) > 2048:
+        raise HTTPException(status_code=413, detail="storage locator too large")
+    try:
+        locator = json.loads(raw)
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid storage locator") from None
+    async with _rollout_gate_lock:
+        if _storage_closure_blocks():
+            raise HTTPException(status_code=409, detail="existing hold cannot be revoked as unstarted")
+        await android_lifecycle.refresh()
+        blocking = _active_conversation_summaries()
+        if blocking:
+            raise HTTPException(status_code=409, detail="active conversations")
+        result = await android_lifecycle.quiesce()
+        try:
+            proof = await asyncio.to_thread(_storage_closure().revoke_unstarted,
+                locator, update_safety_release(), len(blocking), result.get("quiesced") is True)
+        except Exception:
+            raise HTTPException(status_code=409, detail="original authority required for revocation") from None
+        if proof is None:
+            raise HTTPException(status_code=409, detail="durable revocation readback required")
+        return {"ok": True, "storage_revocation": proof, "accepting_turns": not _rollout_gate_closed()}
 
 
 async def _rollout_control(command: str, **values: Any) -> Dict[str, Any]:
