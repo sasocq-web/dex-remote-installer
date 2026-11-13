@@ -499,7 +499,7 @@
     const results = projects.map(project => useCache ? (state.projectThreads.get(project.id) || []) : []);
     const publish = () => {
       if (generation !== state.threadLoadGeneration) return false;
-      state.threads = results.flat().sort((left, right) => threadActivityTimestamp(right) - threadActivityTimestamp(left));
+      state.threads = (useCache ? projects.flatMap((project,index) => state.projectThreads.get(project.id) || results[index]) : results.flat()).sort((left, right) => threadActivityTimestamp(right) - threadActivityTimestamp(left));
       renderProjects();
       renderThreads();
       renderOtherConversationApprovals();
@@ -517,6 +517,7 @@
         const project = projects[index];
         try {
           const requestLimit = state.activeProject ? PROJECT_CONVERSATION_LIMIT : 24;
+          const requestStartedAt = Date.now();
           const data = await api(`/api/threads?project_id=${encodeURIComponent(project.id)}&archived=${state.archivedThreads}&limit=${requestLimit}${state.activeProject ? "&overview=false" : "&overview=true"}`);
           if (generation !== state.threadLoadGeneration) return;
           const threads = (data.data || []).map(thread => {
@@ -529,6 +530,15 @@
               _projectKind:project.kind,
             };
           });
+          if (!state.archivedThreads) {
+  const fresh = new Map(threads.map(row => [row.id, row]));
+  for (const cached of state.projectThreads.get(project.id) || []) {
+    const current = fresh.get(cached.id);
+    if (current) current._recentActivityAt = cached._recentActivityAt;
+    else if (cached._recentActivityAt >= requestStartedAt) threads.push(cached);
+  }
+  threads.sort((a,b) => threadActivityTimestamp(b) - threadActivityTimestamp(a));
+}
           await enrichActiveThreadExecution(project, threads);
           if (generation !== state.threadLoadGeneration) return;
           if (useCache) state.projectThreads.set(project.id, threads);

@@ -168,6 +168,17 @@ class OperationsStore:
     def metadata(self) -> dict[str, Any]:
         with self._lock:
             data = self._read()
+            history_file = self.path.with_name("request-progress-history.json")
+            try:
+                stamp = history_file.stat().st_mtime_ns
+                if getattr(self, "_history_stamp", None) != stamp:
+                    self._progress_history = json.loads(history_file.read_bytes())
+                    self._history_stamp = stamp
+                for key, history in self._progress_history.items():
+                    if key in data.get("threads", {}):
+                        data["threads"][key]["progress_history"] = history
+            except (OSError, ValueError):
+                pass
             return {
                 "threads": data.get("threads", {}),
                 "projects": data.get("projects", {}),
@@ -202,6 +213,42 @@ class OperationsStore:
                           "read_turn_id": item.get("read_turn_id", "")}
                     for key, item in self._read().get("threads", {}).items()}
 
+    def record_reported_progress(self, thread_id, turn_id, text):
+        import re
+        matches = re.findall(r"(?im)^\s*(?:\*\*)?Progresso:\s*(\d{1,4})\s*/\s*(\d{1,4})\s+entregas?\b", text or "")
+        if not turn_id or not matches:
+            return
+        done, total = map(int, matches[-1])
+        if not 0 <= done <= total or total == 0:
+            return
+        with self._lock:
+            data = self._read()
+            item = data.get("threads", {}).get(thread_id, {})
+            timing = item.get("execution_timing") or {}
+            if turn_id != (timing.get("active_turn_id") or timing.get("last_completed_turn_id")):
+                return
+            value = {"turn_id": turn_id, "total": total, "done": done, "unit": "entregas"}
+            if item.get("request_progress") != value:
+                item["request_progress"] = value
+                self._write(data)
+
+    def record_request_plan(self, thread_id, turn_id, plan):
+        if not turn_id or not isinstance(plan, list) or not plan:
+            return
+        valid = {"pending", "inProgress", "in_progress", "completed"}
+        if any(not isinstance(row, dict) or row.get("status") not in valid for row in plan):
+            return
+        progress = {"turn_id": turn_id, "total": len(plan),
+                    "done": sum(row["status"] == "completed" for row in plan)}
+        with self._lock:
+            data = self._read()
+            item = data.get("threads", {}).get(thread_id, {})
+            if (item.get("execution_timing") or {}).get("active_turn_id") != turn_id:
+                return
+            if item.get("request_progress") != progress:
+                item["request_progress"] = progress
+                self._write(data)
+
     def record_thread_execution(
         self,
         thread_id: str,
@@ -218,6 +265,7 @@ class OperationsStore:
             timing = dict(item.get("execution_timing") or {})
             started = max(0, int(started_at_ms or 0))
             completed = max(0, int(completed_at_ms or 0))
+            timing["last_activity_at"] = max(started, completed, int(timing.get("last_activity_at") or 0))
             first_started = max(0, int(timing.get("first_started_at") or 0))
             if started and (not first_started or started < first_started):
                 timing["first_started_at"] = started

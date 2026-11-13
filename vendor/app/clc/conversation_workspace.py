@@ -83,6 +83,28 @@ def install_conversation_workspace(app, *, session_guard, project_lookup, projec
     snapshots = Path(config_dir) / "conversation-versions"
     fork_lock = asyncio.Lock()
 
+    def observe_plan(event):
+        msg = event.get("notification") or {}
+        if msg.get("method") == "turn/plan/updated":
+            params = msg.get("params") or {}
+            operations.record_request_plan(params.get("threadId"), params.get("turnId"), params.get("plan"))
+
+        elif msg.get("method") == "item/completed":
+            params = msg.get("params") or {}
+            item = params.get("item") or {}
+            if item.get("type") == "agentMessage":
+                operations.record_reported_progress(params.get("threadId"), params.get("turnId"), item.get("text"))
+
+    @app.on_event("startup")
+    async def subscribe_request_progress():
+        from .main import events
+        events.add_critical_observer(observe_plan)
+
+    @app.on_event("shutdown")
+    async def unsubscribe_request_progress():
+        from .main import events
+        events.remove_critical_observer(observe_plan)
+
     def guard(request, project_id, thread_id=None, mutate=False):
         session_guard(request, mutate=mutate)
         project = project_lookup(project_id)

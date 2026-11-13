@@ -3435,7 +3435,7 @@ async function loadThreads() {
   const results = projects.map(project => state.projectThreads.get(project.id) || []);
   const publish = () => {
     if (generation !== state.threadLoadGeneration) return false;
-    state.threads = results.flat().sort((left, right) => threadActivityTimestamp(right) - threadActivityTimestamp(left));
+    state.threads = projects.flatMap((project,index) => state.projectThreads.get(project.id) || results[index]).sort((left, right) => threadActivityTimestamp(right) - threadActivityTimestamp(left));
     renderProjects();
     renderThreads();
     renderOtherConversationApprovals();
@@ -3455,6 +3455,7 @@ async function loadThreads() {
       if (!bridge?.initialized) continue;
       try {
         const requestLimit = PROJECT_CONVERSATION_LIMIT;
+        const requestStartedAt = Date.now();
         const data = await api(`/api/threads?project_id=${encodeURIComponent(project.id)}&limit=${requestLimit}${state.activeProject ? "&overview=false" : "&overview=true"}`);
         if (generation !== state.threadLoadGeneration) return;
         const threads = (data.data || []).map(thread => {
@@ -3467,6 +3468,15 @@ async function loadThreads() {
             _projectKind:project.kind,
           };
         });
+        if (!state.archivedThreads) {
+  const fresh = new Map(threads.map(row => [row.id, row]));
+  for (const cached of state.projectThreads.get(project.id) || []) {
+    const current = fresh.get(cached.id);
+    if (current) current._recentActivityAt = cached._recentActivityAt;
+    else if (cached._recentActivityAt >= requestStartedAt) threads.push(cached);
+  }
+  threads.sort((a,b) => threadActivityTimestamp(b) - threadActivityTimestamp(a));
+}
         await enrichActiveThreadExecution(project, threads);
         if (generation !== state.threadLoadGeneration) return;
         state.projectThreads.set(project.id, threads);
@@ -3488,9 +3498,9 @@ function persistThreadSummaryCache() {
   try {
     const compact = {};
     for (const [projectId, threads] of state.projectThreads) {
-      compact[projectId] = threads.slice(0, 24).map(thread => ({
+      compact[projectId] = [...threads].sort((a,b) => threadActivityTimestamp(b) - threadActivityTimestamp(a)).slice(0, 24).map(thread => ({
         id:thread.id, name:thread.name, preview:String(thread.preview || "").slice(0, 600),
-        createdAt:thread.createdAt, updatedAt:thread.updatedAt, startedAt:thread.startedAt,
+        createdAt:thread.createdAt, updatedAt:thread.updatedAt, startedAt:thread.startedAt, _recentActivityAt:thread._recentActivityAt,
         completedAt:thread.completedAt, finishedAt:thread.finishedAt, status:thread.status,
         archived:thread.archived, clc:thread.clc, _projectId:thread._projectId,
         _projectName:thread._projectName, _projectKind:thread._projectKind,
@@ -3508,10 +3518,25 @@ function publishCachedThreadSummaries(projects = state.activeProject ? [state.ac
 }
 
 function threadActivityTimestamp(thread) {
-  const value = thread.completedAt || thread.finishedAt || thread.updatedAt || thread.startedAt || thread.createdAt || 0;
-  if (typeof value === "number") return value < 1e12 ? value * 1000 : value;
-  const parsed = Date.parse(value);
-  return Number.isFinite(parsed) ? parsed : 0;
+  const timing = thread.clc?.execution_timing || {};
+  return Math.max(0, ...[thread.createdAt, thread.updatedAt, thread.startedAt,
+    thread.completedAt, thread.finishedAt, thread._recentActivityAt,
+    timing.active_started_at, timing.last_activity_at].map(epochMilliseconds));
+}
+
+function rememberRecentActivity(project, threadId, at, summary = {}) {
+  if (!project || !threadId || !at || summary.archived) return;
+  const rows = state.projectThreads.get(project.id) || [];
+  const previous = rows.find(row => row.id === threadId);
+  const row = {...previous, ...summary, id:threadId, _projectId:project.id,
+    _projectName:project.name, _projectKind:project.kind,
+    _recentActivityAt:Math.max(previous?._recentActivityAt || 0, at)};
+  const next = [row, ...rows.filter(item => item.id !== threadId)]
+    .sort((a,b) => threadActivityTimestamp(b) - threadActivityTimestamp(a));
+  state.projectThreads.set(project.id, next);
+  state.projectActivity.set(project.id, threadActivityTimestamp(next[0]));
+  if (!state.archivedThreads) publishCachedThreadSummaries();
+  persistThreadSummaryCache();
 }
 
 function threadStatus(thread) {
@@ -4163,6 +4188,30 @@ function handleThreadSearchInput() {
   }, THREAD_SEARCH_DEBOUNCE_MS);
 }
 
+function requestProgressHTML(thread) {
+  const meta = thread.clc || {};
+  const timing = meta.execution_timing || {};
+  const plan = meta.request_progress;
+  const currentTurn = timing.active_turn_id || timing.last_completed_turn_id;
+  const measured = plan && plan.turn_id === currentTurn && Number.isInteger(plan.total)
+    && plan.total > 0 && Number.isInteger(plan.done) && plan.done >= 0 && plan.done <= plan.total;
+  const history = meta.progress_history;
+  const prior = history && history.turn_id === currentTurn ? history : null;
+  const status = threadStatus(thread);
+  const counts = measured ? plan : prior?.total ? prior : null;
+  if (counts) {
+    const percent = Math.floor(100 * counts.done / counts.total);
+    const unit = counts.unit === "entregas" ? "entregas" : "etapas";
+    return `<span class="request-progress"><progress aria-label="Progresso da solicitação" max="${counts.total}" value="${counts.done}"></progress><span>${percent}% · ${counts.done} de ${counts.total} ${unit}</span></span>`;
+  }
+  const phase = status === "active" ? "working" : status === "waiting" ? "waiting"
+    : status === "failed" ? "failed" : prior?.phase || (timing.last_completed_turn_id ? "answered" : "unknown");
+  const label = {working:"Em execução · estimando progresso", waiting:"Aguardando sua ação",
+    failed:"Execução interrompida", pending:"Resposta com pendências", answered:"Resposta enviada · sem contagem de entregas",
+    unknown:"Aguardando registro de progresso"}[phase];
+  return `<span class="request-progress phase-${phase}"><span class="request-track" aria-hidden="true"></span><span>${label}${phase === "pending" && Number.isInteger(prior?.remaining) ? " · " + prior.remaining + " em aberto" : ""}</span></span>`;
+}
+
 function renderThreads() {
   window.DexConversationWorkspace?.refreshOverview();
   const searchInput = el("thread-search");
@@ -4221,7 +4270,7 @@ function renderThreads() {
         ? `<span class="thread-state waiting">${escapeHTML(waitingLabel)}</span>`
         : statusClass === "active" ? '<span class="thread-state active">Em execução</span>' : "";
     const executionTime = threadExecutionTimeHTML(thread);
-    button.innerHTML = `<span class="nav-dot ${statusClass}"></span><span class="nav-copy"><span class="recent-thread-meta"><span class="project-badge">${escapeHTML(projectName)}</span>${statusLabel}${executionTime}<time>${escapeHTML(formatTime(activity) || "")}</time></span><span class="nav-title">${escapeHTML(title)}</span><span class="nav-preview">${escapeHTML(preview || "")}</span></span><span class="recent-thread-arrow" aria-hidden="true">›</span>`;
+    button.innerHTML = `<span class="nav-dot ${statusClass}"></span><span class="nav-copy"><span class="recent-thread-meta"><span class="project-badge">${escapeHTML(projectName)}</span>${statusLabel}${executionTime}<time>${escapeHTML(formatTime(activity) || "")}</time></span><span class="nav-title">${escapeHTML(title)}</span><span class="nav-preview">${escapeHTML(preview || "")}</span>${requestProgressHTML(thread)}</span><span class="recent-thread-arrow" aria-hidden="true">›</span>`;
     button.addEventListener("click", async () => {
       if (thread._projectId && state.activeProject?.id !== thread._projectId) await selectProject(thread._projectId);
       await openThread(thread.id);
@@ -5103,6 +5152,8 @@ async function sendMessage() {
   }
   const viewGeneration = state.conversationViewGeneration;
   const initialThreadId = state.activeThreadId;
+  const submissionProject = state.activeProject;
+  const submittedAt = Date.now();
   clearThreadTerminalStatus(initialThreadId);
   setThreadAwaitingUserAction(initialThreadId, false);
   const messageReferences = (state.references || []).map(reference => ({...reference}));
@@ -5134,6 +5185,7 @@ async function sendMessage() {
     if (!state.activeThreadId) {
       data = await api("/api/threads", {method:"POST", body:JSON.stringify(payload)});
       finishComposerSubmission(submissionDraft, true);
+      rememberRecentActivity(submissionProject, data.thread?.id, submittedAt, {...data.thread, preview:data.thread?.preview || message});
       adoptCreatedThreadDraft(data.thread?.id, submissionDraft);
       if (state.conversationViewGeneration !== viewGeneration || state.activeThreadId !== initialThreadId) {
         state.turnSubmissionPending = false;
@@ -5153,6 +5205,7 @@ async function sendMessage() {
       if (data.toolProfile) state.toolProfile = normalizeToolProfile(data.toolProfile);
     } else {
       data = await api(`/api/threads/${encodeURIComponent(state.activeThreadId)}/messages`, {method:"POST", body:JSON.stringify(payload)});
+      rememberRecentActivity(submissionProject, initialThreadId, submittedAt);
       finishComposerSubmission(submissionDraft, true);
       if (state.conversationViewGeneration !== viewGeneration || state.activeThreadId !== initialThreadId) {
         state.turnSubmissionPending = false;
@@ -5360,6 +5413,55 @@ function handleEvent(event) {
   const params = notification.params || {};
   const eventThreadId = String(params.threadId || params.turn?.threadId || "");
   if (!eventThreadId || eventThreadId === state.activeThreadId) state.executionActivityAt = Date.now();
+  if (["turn/started","turn/completed","thread/started"].includes(method)) {
+    const id = eventThreadId || params.thread?.id;
+    const project = state.projects.find(p => rawWorkspace === "project:"+p.id ||
+      (rawWorkspace === "system" && p.kind === "system") ||
+      state.projectThreads.get(p.id)?.some(row => row.id === id));
+    const turn = params.turn || {};
+    const at = epochMilliseconds(method === "turn/completed" ? turn.completedAt ?? turn.completed_at :
+      turn.startedAt ?? turn.started_at) || epochMilliseconds(params.thread?.createdAt) || Date.now();
+    rememberRecentActivity(project, id, at, params.thread || {});
+  }
+  if (eventThreadId && method === "item/completed" && params.item?.type === "agentMessage") {
+    const reports = [...String(params.item.text || "").matchAll(/^\s*(?:\*\*)?Progresso:\s*(\d{1,4})\s*\/\s*(\d{1,4})\s+entregas?\b/gim)];
+    const last = reports.at(-1);
+    if (last && params.turnId && +last[2] > 0 && +last[1] <= +last[2]) {
+      for (const row of new Set([...state.threads, ...Array.from(state.projectThreads.values()).flat()])) {
+        if (row.id !== eventThreadId) continue;
+        const meta = row.clc ||= {};
+        const timing = meta.execution_timing ||= {};
+        if ((timing.active_turn_id || timing.last_completed_turn_id || params.turnId) !== params.turnId) continue;
+        meta.request_progress = {turn_id:params.turnId, done:+last[1], total:+last[2], unit:"entregas"};
+      }
+      persistThreadSummaryCache();
+      renderThreads();
+    }
+  }
+  if (eventThreadId && (method === "turn/plan/updated" || method === "turn/started")) {
+    const turnId = params.turnId || params.turn?.id;
+    const plan = params.plan;
+    const valid = Array.isArray(plan) && plan.length && plan.every(row =>
+      ["pending","inProgress","in_progress","completed"].includes(row?.status));
+    if (turnId && (method === "turn/started" || valid)) {
+      const rows = new Set([...state.threads, ...Array.from(state.projectThreads.values()).flat()]);
+      for (const row of rows) {
+        if (row.id !== eventThreadId) continue;
+        const meta = row.clc ||= {};
+        const timing = meta.execution_timing ||= {};
+        if (method === "turn/started") timing.active_turn_id = turnId;
+        else if ((timing.active_turn_id || turnId) === turnId && timing.last_completed_turn_id !== turnId) {
+          timing.active_turn_id = turnId;
+          meta.request_progress = {turn_id:turnId, total:plan.length,
+            done:plan.filter(step => step.status === "completed").length};
+        }
+      }
+      if (method === "turn/plan/updated") {
+        persistThreadSummaryCache();
+        renderThreads();
+      }
+    }
+  }
   let runtimeStatus = null;
   if (method === "thread/status/changed") runtimeStatus = params.status || null;
   else if (method === "turn/started") {

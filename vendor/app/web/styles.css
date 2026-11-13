@@ -2841,3 +2841,21 @@ html { font-size: calc(100% * var(--dex-font-scale, 1)); }
 .pc-disk-activity progress { display:block; width:100%; height:18px; accent-color:var(--accent, #52a9ff); }
 
 .pc-storage-tree nav {display:flex;flex-wrap:wrap;gap:6px}.storage-tree-row {display:flex;flex-wrap:wrap;gap:8px;justify-content:space-between;width:100%;padding:12px;margin:6px 0;border:1px solid var(--border-color,#5555);border-radius:10px;background:transparent;color:inherit;text-align:left;cursor:pointer}.storage-tree-row>span:first-child {overflow-wrap:anywhere;min-width:0}.storage-tree-bar {display:block;width:100%;height:9px;background:#8883;border-radius:8px;overflow:hidden}.storage-tree-bar i {display:block;height:100%;background:linear-gradient(90deg,#319ef5,#ed8b35)}
+
+.recent-thread-card .request-progress {display:flex;align-items:center;gap:.55rem;font-size:.75rem;color:var(--muted);margin-top:.3rem}
+.request-progress progress,.request-progress .request-track {width:clamp(3rem,17%,6rem);height:.35rem;border:0;border-radius:1rem;overflow:hidden;background:#64748b45;accent-color:#5796ef}
+.request-progress progress::-webkit-progress-bar {background:#64748b45}
+.request-progress progress::-webkit-progress-value {background:#5796ef}
+.request-progress progress::-moz-progress-bar {background:#5796ef}
+.request-progress .request-track {background:repeating-linear-gradient(120deg,#64748b55 0 3px,transparent 3px 6px)}
+
+.recent-thread-card .request-progress {--fill:linear-gradient(100deg,#7296ff,#5dc7f5 52%,#55e1b2);gap:.65rem;margin-top:.45rem;line-height:1.35}
+.request-progress progress,.request-progress .request-track {position:relative;display:inline-block;width:clamp(3.5rem,21%,7rem);flex:none;height:.45rem;appearance:none;background:#47567166;border-radius:999px;overflow:hidden}
+.request-progress progress::-webkit-progress-bar {background:#47567166;border-radius:999px}
+.request-progress progress::-webkit-progress-value {background:var(--fill);border-radius:999px}
+.request-progress progress::-moz-progress-bar {background:var(--fill);border-radius:999px}
+.request-progress .request-track {background:repeating-linear-gradient(110deg,#7184b255 0 4px,#485a7855 4px 8px)}
+.phase-working .request-track::after {content:"";position:absolute;inset:0 auto 0 0;width:45%;background:var(--fill);border-radius:inherit;animation:request-sweep 1.8s ease-in-out infinite alternate}
+.phase-pending .request-track,.phase-waiting .request-track {background:repeating-linear-gradient(110deg,#d69c5c88 0 4px,#afa0c855 4px 8px)}
+@keyframes request-sweep {to{transform:translateX(122%)}}
+@media(prefers-reduced-motion:reduce){.phase-working .request-track::after{animation:none;left:28%}}
