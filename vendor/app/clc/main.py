@@ -293,6 +293,7 @@ _playwright_observed_front_key: tuple[str, str] | None = None
 _playwright_viewport_markers: Dict[tuple[str, str], tuple[int, int]] = {}
 _playwright_release_locks: Dict[tuple[str, str], asyncio.Lock] = {}
 _playwright_preview_locks: Dict[tuple[str, str], asyncio.Lock] = {}
+_playwright_runtime_lock = asyncio.Lock()
 _playwright_remote_owner_lock = asyncio.Lock()
 _playwright_focus_lock = asyncio.Lock()
 _browser_credential_routes: Dict[str, Dict[str, Any]] = {}
@@ -2519,7 +2520,7 @@ def _playwright_cleanup_due(state: Dict[str, Any], now: float, viewers: bool) ->
     return bool(state.get("release_pending")) or idle_for >= PLAYWRIGHT_CONTEXT_IDLE_SECONDS
 
 
-async def _restart_playwright_mcp_bridge(reason: str) -> None:
+async def _restart_playwright_mcp_bridge_unlocked(reason: str) -> None:
     """Renew the shared MCP server only after its CDP browser was replaced."""
     process = await asyncio.create_subprocess_exec(
         "systemctl",
@@ -2541,15 +2542,22 @@ async def _restart_playwright_mcp_bridge(reason: str) -> None:
     LOGGER.warning("Ponte Playwright MCP renovada após %s", reason)
 
 
+async def _restart_playwright_mcp_bridge(reason: str) -> None:
+    from .playwright_recovery import renew_bridge
+    await renew_bridge(lambda: _restart_playwright_mcp_bridge_unlocked(reason))
+
+
 async def _ensure_playwright_runtime() -> None:
-    """Recover Chromium/CDP without touching the Dex service or other sessions."""
-    if not remote_desktop.running:
-        await remote_desktop.start(adaptive_geometry(1440, 900, device_type="desktop"))
-    if await remote_desktop.browser_surface_ready():
-        return
-    result = await remote_desktop.ensure_browser(mode="desktop", url="about:blank")
-    LOGGER.warning("Chromium Playwright recuperado automaticamente: pid=%s", result.get("pid"))
-    await _restart_playwright_mcp_bridge("substituição do Chromium/CDP")
+    """Recover shared Chromium once; reusing a recovery must not reset clients."""
+    async with _playwright_runtime_lock:
+        if not remote_desktop.running:
+            await remote_desktop.start(adaptive_geometry(1440, 900, device_type="desktop"))
+        if await remote_desktop.browser_surface_ready():
+            return
+        result = await remote_desktop.ensure_browser(mode="desktop", url="about:blank")
+        if not result.get("reused"):
+            LOGGER.warning("Chromium Playwright recuperado automaticamente: pid=%s", result.get("pid"))
+            await _restart_playwright_mcp_bridge("substituição do Chromium/CDP")
 
 
 async def _playwright_conversation_worker() -> None:
