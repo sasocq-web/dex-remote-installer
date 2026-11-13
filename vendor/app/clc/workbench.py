@@ -183,6 +183,35 @@ def install_workbench(
     router = APIRouter(prefix="/api/workbench", tags=["workbench"])
     store = JsonStore(config_dir / "workbench.json")
 
+    tree_jobs = {}
+
+    @app.get("/api/control/pc-storage-tree-status")
+    async def storage_tree_status(request: Request, path: str = "/"):
+        session_guard(request)
+        from .main import control_pc_storage_tree_api
+        if not path.startswith("/") or len(path) > 4096:
+            raise HTTPException(400, "Caminho inválido")
+        key = os.path.realpath(path)
+        now = time.monotonic()
+        for name, (task, started) in list(tree_jobs.items()):
+            if task.done() and now - started > 300:
+                tree_jobs.pop(name)
+        if key not in tree_jobs:
+            if len(tree_jobs) >= 128 or sum(not task.done() for task, _ in tree_jobs.values()) >= 4:
+                return {"pending": True}
+            task = asyncio.create_task(control_pc_storage_tree_api(request, path))
+            # Observe failures even if the browser leaves before the next poll.
+            task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+            tree_jobs[key] = (task, now)
+        task, _ = tree_jobs[key]
+        if not task.done():
+            return {"pending": True}
+        try:
+            return task.result()
+        except Exception:
+            tree_jobs.pop(key, None)
+            raise
+
     def project(request: Request, project_id: str, mutate: bool = False) -> Any:
         session_guard(request, mutate=mutate)
         return project_lookup(project_id)

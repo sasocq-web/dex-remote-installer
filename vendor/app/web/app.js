@@ -533,20 +533,41 @@ let pcTree = null;
 let pcTreeBusy = false;
 let pcTreeError = "";
 let pcTreeRequest = 0;
+let pcTreePath = "/";
 async function openPCStorageTree(path) {
+  if (pcTreeBusy && pcTreePath === path) return;
+  pcTreePath = path;
   const sequence = ++pcTreeRequest;
   state.pcDataTab = "storage";
   pcTreeBusy = true; pcTreeError = "";
   updatePCDataTabs(); renderPCDataPanel();
   try {
-    const value = await api(`/api/control/pc-storage-tree?path=${encodeURIComponent(path)}`);
-    if (sequence === pcTreeRequest) pcTree = value;
-  } catch (error) { if (sequence === pcTreeRequest) pcTreeError = error.message; }
+    let failures = 0;
+    while (sequence === pcTreeRequest) {
+      try {
+        const value = await api(`/api/control/pc-storage-tree-status?path=${encodeURIComponent(path)}`);
+        if (sequence !== pcTreeRequest) return;
+        failures = 0;
+        if (!value.pending) {
+          if (!Array.isArray(value.children)) throw new Error("Resposta de armazenamento incompleta.");
+          pcTree = value;
+          return;
+        }
+      } catch (error) {
+        const transient = error instanceof TypeError || [502,504].includes(error.status)
+          || (error.status === 503 && !error.detail);
+        if (!transient || ++failures >= 12) throw error;
+      }
+      await new Promise(resolve => setTimeout(resolve, failures ? 3000 : 2000));
+    }
+  } catch (error) {
+    if (sequence === pcTreeRequest) pcTreeError = "Falha ao medir " + path + ". " + error.message;
+  }
   finally { if (sequence === pcTreeRequest) { pcTreeBusy = false; renderPCDataPanel(); } }
 }
 function renderPCStorageTree() {
   if (pcTreeBusy) return pcDataLoading("Medindo a árvore de dados…");
-  if (pcTreeError) return `<p role="alert">${escapeHTML(pcTreeError)}</p><button type="button" data-pc-tree="${escapeHTML(pcTree?.path || "/")}">Tentar novamente</button>`;
+  if (pcTreeError) return `<p role="alert">${escapeHTML(pcTreeError)}</p><button type="button" data-pc-tree="${escapeHTML(pcTreePath)}">Tentar novamente</button>`;
   if (!pcTree) return "";
   const parts = pcTree.path.split("/").filter(Boolean);
   const crumbs = ["/", ...parts.map((_, i) => "/" + parts.slice(0, i + 1).join("/"))];
@@ -1368,7 +1389,10 @@ async function api(path, options = {}) {
     return api(path, {...options, _retried:true});
   }
   if (!response.ok) {
-    throw new Error(readableApiError(detail, response.status));
+    const error = new Error(readableApiError(detail, response.status));
+    error.status = response.status;
+    error.detail = data?.detail;
+    throw error;
   }
   return data;
 }
@@ -1387,7 +1411,7 @@ function readableApiError(detail, status = 0) {
   const gatewayHtml = status === 502 && (/<!doctype\s+html|<html[\s>]/i.test(text)
     || (/\b502\b/.test(text) && /bad gateway|cloudflare/i.test(text)));
   if (gatewayHtml) {
-    return "O serviço do Codex encontrou uma falha temporária de gateway (502) ao iniciar a conversa. Tente novamente em alguns instantes.";
+    return "O serviço do Codex encontrou uma falha temporária de gateway (502) ao acessar o Dex. Tente novamente em alguns instantes.";
   }
   return text.length > 1600 ? `${text.slice(0, 1600)}…` : text;
 }
