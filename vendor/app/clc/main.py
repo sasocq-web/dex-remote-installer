@@ -898,20 +898,8 @@ async def _prepare_project_bridge(project: Project, *, configure: bool = True) -
         prepared = (target.running and target.initialized
                     and getattr(target, "_clc_worker_prepared_process", None) is target.process)
         if not prepared:
-            await _register_project_worker(project)
             await target.start()
-            applied = not settings.control_plane_enabled
-            if settings.control_plane_enabled:
-                try:
-                    response = await control_request_async(
-                        "workers", {"operation": "apply", "project_id": project.id},
-                        socket_path=settings.control_broker_socket, timeout=30)
-                    _unpack_control(response)
-                    applied = True
-                except Exception as exc:
-                    LOGGER.warning("Não foi possível aplicar os limites do worker %s: %s", project.id, exc)
-            if applied:
-                target._clc_worker_prepared_process = target.process
+            target._clc_worker_prepared_process = target.process
         if configure and settings.full_experience_installed and not getattr(target, "_clc_mcp_configured", False):
             await _configure_bundled_mcp(target, include_desktop=False)
             target._clc_mcp_configured = True

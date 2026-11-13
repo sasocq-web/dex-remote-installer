@@ -17,15 +17,17 @@ MESSAGE = ("Retomada automática da solicitação original. Confira o último re
 
 WAIT = re.compile(r"(?im)^Aguardar recibo: ([0-9a-f]{32}) (queued|dispatching|running|blocked|waiting_operator)$")
 
-def receipt_waiting(directory, thread, markers):
+def receipt_waiting(directory, thread, markers, delivered=()):
     """Only authenticated receipts from this thread can defer its execution."""
     if not markers:
         return False
     source = directory / "dot-system-bridge" / "requests.sqlite3"
     with sqlite3.connect(source.as_uri() + "?mode=ro", uri=True) as db:
         for rid, status in markers:
-            row = db.execute("SELECT r.status FROM requests r JOIN native_request_origins n ON r.id=n.id WHERE n.thread=? AND r.id=?", (thread, rid)).fetchone()
-            if row != (status,):
+            row = db.execute("SELECT r.status,r.updated FROM requests r JOIN native_request_origins n ON r.id=n.id WHERE n.thread=? AND r.id=?", (thread, rid)).fetchone()
+            if row is None or row[0] != status:
+                return False
+            if status == "blocked" and (rid, row[1]) not in delivered:
                 return False
     return True
 
@@ -34,6 +36,7 @@ class Continuations:
         self.path = path
         with self.db() as db:
             db.execute("CREATE TABLE IF NOT EXISTS work(thread TEXT PRIMARY KEY, turn TEXT NOT NULL, mode TEXT NOT NULL, due REAL NOT NULL, attempts INTEGER NOT NULL DEFAULT 0)")
+            db.execute("CREATE TABLE IF NOT EXISTS delivered_blocks(thread TEXT, receipt TEXT, updated REAL, PRIMARY KEY(thread,receipt))")
             db.execute("CREATE TABLE IF NOT EXISTS waits(thread TEXT PRIMARY KEY, turn TEXT NOT NULL, receipts TEXT NOT NULL)")
     def db(self):
         return sqlite3.connect(self.path)
@@ -83,7 +86,23 @@ class Continuations:
     def waiting(self,thread,turn):
         with self.db() as db:
             row = db.execute("SELECT receipts FROM waits WHERE thread=? AND turn=?", (thread,turn)).fetchone()
-        return bool(row and receipt_waiting(self.path.parent,thread,json.loads(row[0])))
+            delivered = set(db.execute("SELECT receipt,updated FROM delivered_blocks WHERE thread=?", (thread,)))
+        return bool(row and receipt_waiting(self.path.parent,thread,json.loads(row[0]),delivered))
+
+    def blocked_versions(self, thread, turn):
+        with self.db() as db:
+            row = db.execute("SELECT receipts FROM waits WHERE thread=? AND turn=?", (thread, turn)).fetchone()
+        if not row:
+            return []
+        source = self.path.parent / "dot-system-bridge" / "requests.sqlite3"
+        with sqlite3.connect(source.as_uri() + "?mode=ro", uri=True) as db:
+            versions = []
+            for rid, status in json.loads(row[0]):
+                if status == "blocked":
+                    record = db.execute("SELECT r.updated FROM requests r JOIN native_request_origins n ON n.id=r.id WHERE n.thread=? AND r.id=? AND r.status='blocked'", (thread, rid)).fetchone()
+                    if record:
+                        versions.append((thread, rid, record[0]))
+            return versions
     def later(self,thread,turn,delay,attempts):
         with self.db() as db:
             db.execute("UPDATE work SET due=?,attempts=? WHERE thread=? AND turn=?",
@@ -107,7 +126,10 @@ async def monitor(work, context):
         await asyncio.sleep(10)
         for thread,turn,mode,attempt in work.due():
             try:
-                if main._rollout_gate_closed() or any(t==thread for _,t in main._active_turns):
+                # Background resumes must leave an idle window for a queued release.
+                # The updater removes pending.json when it consumes or retires the request.
+                pending = Path.home()/".local/share/codex-linux-control/rollout/pending.json"
+                if pending.is_file() or main._rollout_gate_closed() or any(t==thread for _,t in main._active_turns):
                     work.later(thread,turn,20,attempt)
                     continue
                 if mode=="onedrive" and cloud_busy():
@@ -138,7 +160,14 @@ async def monitor(work, context):
                     continue
                 # Persist a lease before dispatch. Always reconcile the newest native turn on retry.
                 work.later(thread,turn,300,attempt+1)
-                await main._run_claimed_queue_item(thread,{**ctx,"message":MESSAGE,"references":[]})
+                versions = work.blocked_versions(thread, turn)
+                message = MESSAGE
+                if versions:
+                    message += " Um recibo bloqueado já tem resultado. Leia o motivo e prossiga com as entregas independentes. Respeite aprovações e confira efeitos anteriores antes de qualquer nova tentativa."
+                await main._run_claimed_queue_item(thread,{**ctx,"message":message,"references":[]})
+                if versions:
+                    with work.db() as db:
+                        db.executemany("INSERT OR REPLACE INTO delivered_blocks VALUES(?,?,?)", versions)
                 LOG.info("Retomada aceita para %s",thread)
             except Exception as exc:
                 work.later(thread,turn,min(900,30*2**min(attempt,5)),attempt+1)
