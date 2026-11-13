@@ -83,6 +83,13 @@ def install_conversation_workspace(app, *, session_guard, project_lookup, projec
     snapshots = Path(config_dir) / "conversation-versions"
     fork_lock = asyncio.Lock()
 
+    from .request_continuations import Continuations, monitor, MARK
+    continuations = Continuations(Path(config_dir)/"request-continuations.sqlite3")
+    resume_worker = None
+
+    def original_context(thread, turn):
+        return store.read().get("contexts", {}).get(thread, {}).get(turn)
+
     def observe_plan(event):
         msg = event.get("notification") or {}
         if msg.get("method") == "turn/plan/updated":
@@ -93,6 +100,10 @@ def install_conversation_workspace(app, *, session_guard, project_lookup, projec
             params = msg.get("params") or {}
             item = params.get("item") or {}
             if item.get("type") == "agentMessage":
+                if item.get("phase") == "final_answer":
+                    markers = MARK.findall((item.get("text") or "").replace("*",""))
+                    if markers:
+                        continuations.finish(params.get("threadId"), params.get("turnId"), markers[-1].lower())
                 if item.get("phase") == "commentary":
                     operations.record_progress_note(params.get("threadId"), params.get("turnId"), item.get("text"))
                 operations.record_reported_progress(params.get("threadId"), params.get("turnId"), item.get("text"))
@@ -100,12 +111,19 @@ def install_conversation_workspace(app, *, session_guard, project_lookup, projec
     @app.on_event("startup")
     async def subscribe_request_progress():
         from .main import events
+        nonlocal resume_worker
         events.add_critical_observer(observe_plan)
+        events.add_critical_observer(continuations.observe)
+        resume_worker = asyncio.create_task(monitor(continuations, original_context))
 
     @app.on_event("shutdown")
     async def unsubscribe_request_progress():
         from .main import events
         events.remove_critical_observer(observe_plan)
+        events.remove_critical_observer(continuations.observe)
+        if resume_worker:
+            resume_worker.cancel()
+            await asyncio.gather(resume_worker, return_exceptions=True)
 
     def guard(request, project_id, thread_id=None, mutate=False):
         session_guard(request, mutate=mutate)
