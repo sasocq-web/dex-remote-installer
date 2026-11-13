@@ -93,6 +93,8 @@ def install_conversation_workspace(app, *, session_guard, project_lookup, projec
             params = msg.get("params") or {}
             item = params.get("item") or {}
             if item.get("type") == "agentMessage":
+                if item.get("phase") == "commentary":
+                    operations.record_progress_note(params.get("threadId"), params.get("turnId"), item.get("text"))
                 operations.record_reported_progress(params.get("threadId"), params.get("turnId"), item.get("text"))
 
     @app.on_event("startup")

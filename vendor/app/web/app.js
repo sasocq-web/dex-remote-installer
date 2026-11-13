@@ -534,9 +534,11 @@ let pcTreeBusy = false;
 let pcTreeError = "";
 let pcTreeRequest = 0;
 let pcTreePath = "/";
+const pcTreeRecent = new Map();
 async function openPCStorageTree(path) {
   if (pcTreeBusy && pcTreePath === path) return;
   pcTreePath = path;
+  pcTree = pcTreeRecent.get(path) || null;
   const sequence = ++pcTreeRequest;
   state.pcDataTab = "storage";
   pcTreeBusy = true; pcTreeError = "";
@@ -545,12 +547,18 @@ async function openPCStorageTree(path) {
     let failures = 0;
     while (sequence === pcTreeRequest) {
       try {
-        const value = await api(`/api/control/pc-storage-tree-status?path=${encodeURIComponent(path)}`);
+        const value = await api(`/api/control/pc-storage-tree-status?path=${encodeURIComponent(path)}&preview=${!pcTree}`);
         if (sequence !== pcTreeRequest) return;
         failures = 0;
+        if (value.pending && !pcTree && value.listing) {
+          pcTree = value.listing;
+          renderPCDataPanel();
+        }
         if (!value.pending) {
           if (!Array.isArray(value.children)) throw new Error("Resposta de armazenamento incompleta.");
           pcTree = value;
+          pcTreeRecent.set(path, value);
+          if (pcTreeRecent.size > 48) pcTreeRecent.delete(pcTreeRecent.keys().next().value);
           return;
         }
       } catch (error) {
@@ -566,12 +574,16 @@ async function openPCStorageTree(path) {
   finally { if (sequence === pcTreeRequest) { pcTreeBusy = false; renderPCDataPanel(); } }
 }
 function renderPCStorageTree() {
-  if (pcTreeBusy) return pcDataLoading("Medindo a árvore de dados…");
+  if (pcTreeBusy && !pcTree) return pcDataLoading("Abrindo as pastas…");
   if (pcTreeError) return `<p role="alert">${escapeHTML(pcTreeError)}</p><button type="button" data-pc-tree="${escapeHTML(pcTreePath)}">Tentar novamente</button>`;
   if (!pcTree) return "";
   const parts = pcTree.path.split("/").filter(Boolean);
   const crumbs = ["/", ...parts.map((_, i) => "/" + parts.slice(0, i + 1).join("/"))];
-  return `<section class="pc-storage-tree"><h3>Árvore de dados • ${formatBytes(pcTree.size)}</h3><nav aria-label="Caminho da pasta">${crumbs.map(path => `<button type="button" class="secondary-button" data-pc-tree="${escapeHTML(path)}">${escapeHTML(path === "/" ? "/" : path.split("/").pop())}</button>`).join(" / ")}</nav><p>Pastas em ordem de tamanho. Clique para expandir. Barras indicam a proporção nesta pasta.</p>${pcTree.children.map((item, index) => {const percent = pcTree.size ? Math.min(100, item.size / pcTree.size * 100) : 0; return `<button type="button" class="storage-tree-row" data-pc-tree="${escapeHTML(item.path)}"><span>${index + 1}. 📁 ${escapeHTML(item.path.split("/").pop())}</span><b>${formatBytes(item.size)} • ${percent.toFixed(1)}%</b><span class="storage-tree-bar"><i style="width:${percent}%"></i></span></button>`;}).join("") || "<p>Nenhuma subpasta. O total também inclui arquivos nesta pasta.</p>"}${pcTree.truncated ? "<p>Exibindo as 500 maiores pastas.</p>" : ""}<small>Leitura somente de tamanhos, sem abrir arquivos. Outros volumes são analisados separadamente. Atualizado em ${formatTime(pcTree.checked_at)}.</small></section>`;
+  if (pcTree.preview) {
+    const parent = crumbs.length > 1 ? crumbs[crumbs.length - 2] : null;
+    return `<section class="pc-storage-tree"><h3>Árvore de dados</h3><div>${parent ? `<button class="secondary-button" data-pc-tree="${escapeHTML(parent)}">Voltar</button> ` : ""}${escapeHTML(pcTree.path)}</div><p>Calculando tamanhos…</p>${pcTree.children.map(item => `<button type="button" class="storage-tree-row" data-pc-tree="${escapeHTML(item.path)}"><span>📁 ${escapeHTML(item.path.split("/").pop())}</span></button>`).join("")}${pcTree.truncated ? "<small>Prévia limitada a 500 pastas.</small>" : ""}</section>`;
+  }
+  return `<section class="pc-storage-tree"><h3>Árvore de dados • ${formatBytes(pcTree.size)}</h3>${pcTreeBusy ? "<p>Atualizando tamanhos…</p>" : ""}<nav aria-label="Caminho da pasta">${crumbs.map(path => `<button type="button" class="secondary-button" data-pc-tree="${escapeHTML(path)}">${escapeHTML(path === "/" ? "/" : path.split("/").pop())}</button>`).join(" / ")}</nav><p>Pastas em ordem de tamanho. Clique para expandir. Barras indicam a proporção nesta pasta.</p>${pcTree.children.map((item, index) => {const percent = pcTree.size ? Math.min(100, item.size / pcTree.size * 100) : 0; return `<button type="button" class="storage-tree-row" data-pc-tree="${escapeHTML(item.path)}"><span>${index + 1}. 📁 ${escapeHTML(item.path.split("/").pop())}</span><b>${formatBytes(item.size)} • ${percent.toFixed(1)}%</b><span class="storage-tree-bar"><i style="width:${percent}%"></i></span></button>`;}).join("") || "<p>Nenhuma subpasta. O total também inclui arquivos nesta pasta.</p>"}${pcTree.truncated ? "<p>Exibindo as 500 maiores pastas.</p>" : ""}<small>Leitura somente de tamanhos, sem abrir arquivos. Outros volumes são analisados separadamente. Atualizado em ${formatTime(pcTree.checked_at)}.</small></section>`;
 }
 
 function renderPCStorage() {
@@ -4212,6 +4224,29 @@ function handleThreadSearchInput() {
   }, THREAD_SEARCH_DEBOUNCE_MS);
 }
 
+const liveRequestActions = new Map();
+function showRequestActivity(id, turn, method, item) {
+  if (!id || !turn || !item) return;
+  const kinds = {commandExecution:"Comando", fileChange:"Alteração de arquivos",
+    mcpToolCall:"Consulta a ferramenta", dynamicToolCall:"Chamada de ferramenta", webSearch:"Pesquisa"};
+  const previous = liveRequestActions.get(id);
+  const activity = previous?.turn === turn ? previous : {turn};
+  if (item.type === "agentMessage" && method === "item/completed" && item.phase === "commentary") {
+    const text = String(item.text || "").split(/\r?\n/).filter(line=>line.trim() && !/^\s*\*{0,2}Progresso:/i.test(line)).join(" ").slice(0,240);
+    if (!text) return;
+    activity.note = text;
+  } else if (kinds[item.type]) {
+    const verb = method === "item/started" ? "Em andamento" : "Última atividade";
+    activity.action = verb + " · " + kinds[item.type] + (item.status === "failed" ? " com falha" : "");
+  } else return;
+  liveRequestActions.set(id,activity);
+  if (liveRequestActions.size > 128) liveRequestActions.delete(liveRequestActions.keys().next().value);
+  const card = selectors.threadList.querySelector(`[data-thread-id="${CSS.escape(id)}"]`);
+  const row = state.threads.find(thread=>thread.id === id);
+  const target = card?.querySelector(".request-summary");
+  if (row && target) target.innerHTML = requestProgressHTML(row);
+}
+
 function requestProgressHTML(thread) {
   const meta = thread.clc || {};
   const timing = meta.execution_timing || {};
@@ -4222,11 +4257,28 @@ function requestProgressHTML(thread) {
   const history = meta.progress_history;
   const prior = history && history.turn_id === currentTurn ? history : null;
   const status = threadStatus(thread);
+  const live = liveRequestActions.get(thread.id);
+  const activity = live && live.turn === currentTurn ? live : {};
+  const note = activity.note || (meta.progress_note?.turn_id === currentTurn ? meta.progress_note?.text : "");
+  const signals = (activity.action ? `<span class="request-step">${escapeHTML(activity.action)}</span>` : "")
+    + (note ? `<span class="request-step"><b>Último relato</b> ${escapeHTML(note)}</span>` : "");
   const counts = measured ? plan : prior?.total ? prior : null;
   if (counts) {
-    const percent = Math.floor(100 * counts.done / counts.total);
+    const [finished, amount, label] = counts.partial || [];
+    const partial = counts.done < counts.total && Number.isInteger(amount) && amount > 0
+      && Number.isInteger(finished) && finished >= 0 && finished <= amount;
+    const value = counts.done + (partial ? finished / amount : 0);
+    const percent = counts.done < counts.total ? Math.min(99, Math.floor(100 * value / counts.total)) : 100;
     const unit = counts.unit === "entregas" ? "entregas" : "etapas";
-    return `<span class="request-progress"><progress aria-label="Progresso da solicitação" max="${counts.total}" value="${counts.done}"></progress><span>${percent}% · ${counts.done} de ${counts.total} ${unit}</span></span>`;
+    const detail = [["Em andamento",counts.current],["Última conclusão",counts.last],["A seguir",counts.next]]
+      .filter(([,text]) => text).map(([name,text]) =>
+        `<span class="request-step"><b>${name}</b> ${escapeHTML(text)}</span>`).join("");
+    const batch = partial ? `<span class="request-step">${finished} de ${amount} ${escapeHTML(label)} na etapa atual</span>` : "";
+    if (status === "active" && !value) {
+      return `<span class="request-progress phase-working"><span class="request-track" aria-hidden="true"></span><span>Trabalhando na primeira entrega</span></span>${detail}${signals}<span class="request-step">${counts.total} ${unit} previstas</span>`;
+    }
+    return `<span class="request-progress"><progress aria-label="Progresso da solicitação" max="${counts.total}" value="${Math.min(value, percent === 99 ? counts.total * .99 : counts.total)}"></progress><span>${partial ? "≈ " : ""}${percent}% · ${counts.done} de ${counts.total} ${unit}</span></span>${batch}${detail}${signals}`;
+
   }
   const phase = status === "active" ? "working" : status === "waiting" ? "waiting"
     : status === "failed" ? "failed" : prior?.phase || (timing.last_completed_turn_id ? "answered" : "unknown");
@@ -4294,7 +4346,7 @@ function renderThreads() {
         ? `<span class="thread-state waiting">${escapeHTML(waitingLabel)}</span>`
         : statusClass === "active" ? '<span class="thread-state active">Em execução</span>' : "";
     const executionTime = threadExecutionTimeHTML(thread);
-    button.innerHTML = `<span class="nav-dot ${statusClass}"></span><span class="nav-copy"><span class="recent-thread-meta"><span class="project-badge">${escapeHTML(projectName)}</span>${statusLabel}${executionTime}<time>${escapeHTML(formatTime(activity) || "")}</time></span><span class="nav-title">${escapeHTML(title)}</span><span class="nav-preview">${escapeHTML(preview || "")}</span>${requestProgressHTML(thread)}</span><span class="recent-thread-arrow" aria-hidden="true">›</span>`;
+    button.innerHTML = `<span class="nav-dot ${statusClass}"></span><span class="nav-copy"><span class="recent-thread-meta"><span class="project-badge">${escapeHTML(projectName)}</span>${statusLabel}${executionTime}<time>${escapeHTML(formatTime(activity) || "")}</time></span><span class="nav-title">${escapeHTML(title)}</span><span class="nav-preview">${escapeHTML(preview || "")}</span><span class="request-summary">${requestProgressHTML(thread)}</span></span><span class="recent-thread-arrow" aria-hidden="true">›</span>`;
     button.addEventListener("click", async () => {
       if (thread._projectId && state.activeProject?.id !== thread._projectId) await selectProject(thread._projectId);
       await openThread(thread.id);
@@ -5436,6 +5488,9 @@ function handleEvent(event) {
   const method = notification.method;
   const params = notification.params || {};
   const eventThreadId = String(params.threadId || params.turn?.threadId || "");
+  if (method === "item/started" || method === "item/completed") {
+    showRequestActivity(eventThreadId, params.turnId, method, params.item);
+  }
   if (!eventThreadId || eventThreadId === state.activeThreadId) state.executionActivityAt = Date.now();
   if (["turn/started","turn/completed","thread/started"].includes(method)) {
     const id = eventThreadId || params.thread?.id;
@@ -5457,6 +5512,15 @@ function handleEvent(event) {
         const timing = meta.execution_timing ||= {};
         if ((timing.active_turn_id || timing.last_completed_turn_id || params.turnId) !== params.turnId) continue;
         meta.request_progress = {turn_id:params.turnId, done:+last[1], total:+last[2], unit:"entregas"};
+        const report = meta.request_progress;
+        const message = String(params.item.text);
+        for (const [label, field] of [["Atual","current"],["Concluído","last"],["Próxima","next"]]) {
+          const line = message.split(/\r?\n/).map(text=>text.trim().replace(/^\*\*/, "")).filter(text=>text.toLowerCase().startsWith(label.toLowerCase()+":")).at(-1);
+          if (line) report[field] = line.slice(label.length+1).trim().slice(0,220);
+        }
+        const part = [...message.matchAll(/^\s*(?:\*\*)?Parcial:[ \t]*(\d{1,9})\/(\d{1,9})[ \t]+([^\r\n]+)/gim)].at(-1);
+        if (report.current && report.done < report.total && part && +part[2] > 0 && +part[1] <= +part[2]) report.partial = [+part[1], +part[2], part[3].trim().slice(0,48)];
+
       }
       persistThreadSummaryCache();
       renderThreads();
@@ -5477,7 +5541,10 @@ function handleEvent(event) {
         else if ((timing.active_turn_id || turnId) === turnId && timing.last_completed_turn_id !== turnId) {
           timing.active_turn_id = turnId;
           meta.request_progress = {turn_id:turnId, total:plan.length,
-            done:plan.filter(step => step.status === "completed").length};
+            done:plan.filter(step => step.status === "completed").length,
+            current:plan.find(row => ["inProgress","in_progress"].includes(row.status))?.step?.slice(0,220),
+            last:plan.filter(row=>row.status==="completed").at(-1)?.step?.slice(0,220),
+            next:plan.find(row=>row.status==="pending")?.step?.slice(0,220)};
         }
       }
       if (method === "turn/plan/updated") {

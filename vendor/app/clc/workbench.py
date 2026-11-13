@@ -185,27 +185,45 @@ def install_workbench(
 
     tree_jobs = {}
 
+    def list_immediate_folders(key):
+        from itertools import islice
+        try:
+            with os.scandir(key) as entries:
+                names = list(islice((entry.path for entry in entries
+                    if entry.is_dir(follow_symlinks=False)
+                    and not entry.path.startswith(("/proc", "/sys", "/dev", "/run"))), 501))
+        except OSError:
+            return None
+        return {"path": key, "preview": True, "truncated": len(names) > 500,
+                "children": [{"path": name} for name in sorted(names[:500])]}
+
+
     @app.get("/api/control/pc-storage-tree-status")
-    async def storage_tree_status(request: Request, path: str = "/"):
+    async def storage_tree_status(request: Request, path: str = "/", preview: bool = False):
         session_guard(request)
         from .main import control_pc_storage_tree_api
         if not path.startswith("/") or len(path) > 4096:
             raise HTTPException(400, "Caminho inválido")
         key = os.path.realpath(path)
+        if key.startswith(("/proc", "/sys", "/dev", "/run")) or not os.path.isdir(key):
+            raise HTTPException(400, "Pasta indisponível para análise")
+        partial = {"pending": True}
+        if preview:
+            partial["listing"] = await asyncio.to_thread(list_immediate_folders, key)
         now = time.monotonic()
         for name, (task, started) in list(tree_jobs.items()):
             if task.done() and now - started > 300:
                 tree_jobs.pop(name)
         if key not in tree_jobs:
             if len(tree_jobs) >= 128 or sum(not task.done() for task, _ in tree_jobs.values()) >= 4:
-                return {"pending": True}
+                return partial
             task = asyncio.create_task(control_pc_storage_tree_api(request, path))
             # Observe failures even if the browser leaves before the next poll.
             task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
             tree_jobs[key] = (task, now)
         task, _ = tree_jobs[key]
         if not task.done():
-            return {"pending": True}
+            return partial
         try:
             return task.result()
         except Exception:
@@ -602,7 +620,7 @@ def install_workbench(
         guidance = ("\nEm solicitações com várias entregas, use update_plan para registrar etapas "
                     "verificáveis que cubram o pedido inicial, inclusive a validação. Atualize as "
                     "etapas conforme os resultados. Ao continuar o pedido, retome o plano completo "
-                    "com as etapas já comprovadas. Quando update_plan estiver indisponível, inclua nas mensagens de andamento e na resposta final uma linha Progresso: X/Y entregas, usando números referentes ao pedido inicial. Conte somente entregas verificadas e mantenha o total nas retomadas salvo mudança de escopo. Respeite o modo de planejamento quando ativo.")
+                    "com as etapas já comprovadas. Quando update_plan estiver indisponível, inclua nas mensagens de andamento e na resposta final uma linha Progresso: X/Y entregas, usando números referentes ao pedido inicial. Conte somente entregas verificadas e mantenha o total nas retomadas salvo mudança de escopo. Divida entregas grandes em marcos verificáveis; nomeie o objeto e o resultado de cada etapa. Para lotes com total conhecido, informe o avanço dentro da etapa atual usando linhas separadas: Progresso: X/Y entregas; Atual: nome da entrega; Parcial: A/B unidades; Concluído: último resultado verificado; Próxima: próxima ação. Use apenas os campos aplicáveis e números observados. Atualize o andamento quando houver avanço material. Se houver plano nativo, mantenha X/Y compatível com ele. Respeite o modo de planejamento quando ativo.")
         return guidance + memory_context(project_id, message)
 
     return {"memory_context": conversation_context}

@@ -2859,3 +2859,5 @@ html { font-size: calc(100% * var(--dex-font-scale, 1)); }
 .phase-pending .request-track,.phase-waiting .request-track {background:repeating-linear-gradient(110deg,#d69c5c88 0 4px,#afa0c855 4px 8px)}
 @keyframes request-sweep {to{transform:translateX(122%)}}
 @media(prefers-reduced-motion:reduce){.phase-working .request-track::after{animation:none;left:28%}}
+
+.recent-thread-card .request-step {display:block;white-space:normal;overflow-wrap:anywhere;font-size:.77rem;line-height:1.4;color:var(--muted);margin-top:.15rem}.request-step b{color:inherit;font-weight:600}
