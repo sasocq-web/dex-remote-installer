@@ -183,18 +183,24 @@ class ToolProfileStore:
         return profile
 
     def remember_thread_project(self, thread_id: str, project_id: str) -> None:
-        """Persist routing for a thread without changing its tool choices."""
+        self.remember_thread_projects([thread_id], project_id)
 
+    def remember_thread_projects(self, thread_ids, project_id: str) -> None:
+        """Update routing for a page with one read and at most one write."""
         with self._lock:
             data = self._read()
             threads = data.setdefault("threads", {})
-            raw = threads.get(thread_id)
-            value = dict(raw) if isinstance(raw, dict) else ToolProfile().as_dict()
-            if value.get("project_id") == project_id:
-                return
-            value["project_id"] = project_id
-            threads[thread_id] = value
-            self._write(data)
+            changed = False
+            for thread_id in thread_ids:
+                raw = threads.get(thread_id)
+                if isinstance(raw, dict) and raw.get("project_id") == project_id:
+                    continue
+                value = dict(raw) if isinstance(raw, dict) else ToolProfile().as_dict()
+                value["project_id"] = project_id
+                threads[thread_id] = value
+                changed = True
+            if changed:
+                self._write(data)
 
     def thread_project_id(self, thread_id: str) -> Optional[str]:
         """Return the workspace/project that owns a persisted thread."""

@@ -517,7 +517,7 @@
         const project = projects[index];
         try {
           const requestLimit = state.activeProject ? PROJECT_CONVERSATION_LIMIT : 24;
-          const data = await api(`/api/threads?project_id=${encodeURIComponent(project.id)}&archived=${state.archivedThreads}&limit=${requestLimit}`);
+          const data = await api(`/api/threads?project_id=${encodeURIComponent(project.id)}&archived=${state.archivedThreads}&limit=${requestLimit}${state.activeProject ? "&overview=false" : "&overview=true"}`);
           if (generation !== state.threadLoadGeneration) return;
           const threads = (data.data || []).map(thread => {
             const terminal = state.threadTerminalStatuses.get(thread.id);

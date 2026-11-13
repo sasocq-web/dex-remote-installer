@@ -1,7 +1,8 @@
 """Fixed native feedback guard, event wakeups and 24 hour recovery."""
 import asyncio, contextlib, json, logging, time, re
 from pathlib import Path
-from .control_plane import request
+from .control_plane import ControlPlaneError, request
+from .project_relay import ValidationTemporarilyUnavailable
 from .feedback_native import FeedbackNative
 FEEDBACK_AUTOMATION_ID="03a1f80223504265bc55691dcb74ebe8"
 RESIDENT="01a11ac1-3b34-7d31-b2f5-000ac0978dd7"
@@ -59,7 +60,10 @@ class FeedbackScheduler:
             argv=["runuser","-u","codex-worker","--","python3",helper],
             input_text=json.dumps(data),timeout=22),timeout=28)
         raw=result.get("result",{}).get("output",{})
-        if not result.get("ok") or raw.get("returncode"):raise RuntimeError("Feedback transport unavailable")
+        if not result.get("ok") or raw.get("returncode"):
+            if data.get("action") == "native_validate_batch":
+                raise ValidationTemporarilyUnavailable("Feedback validation transport unavailable")
+            raise RuntimeError("Feedback transport unavailable")
         reply=json.loads(raw.get("output","{}"))
         if reply.get("ok") is False:raise RuntimeError("Feedback operation rejected")
         return reply.get("result",reply)
@@ -104,17 +108,31 @@ class FeedbackScheduler:
             raise ValueError("Feedback route disabled")
         current=await asyncio.to_thread(self.record)
         if not self.permitted(current,config):raise ValueError("Feedback automation paused")
-        fence=await asyncio.to_thread(self.remote,dict(action="native_validate_batch",
-            batch_id=meta["batch_id"],token=meta["token"],sites=list(config["sites"]),
-            not_before_epoch=config["not_before_epoch"],
-            adopted_event_ids=config.get("adopted_event_ids",[]),
-            route_paths={s:r["path_prefixes"] for s,r in config["sites"].items() if "path_prefixes" in r},
-            **({"canary_mode":True,"event_ids":config["event_ids"]} if config.get("canary_mode") else {})))
+        try:
+            fence=await asyncio.to_thread(self.remote,dict(action="native_validate_batch",
+                batch_id=meta["batch_id"],token=meta["token"],sites=list(config["sites"]),
+                not_before_epoch=config["not_before_epoch"],
+                adopted_event_ids=config.get("adopted_event_ids",[]),
+                route_paths={s:r["path_prefixes"] for s,r in config["sites"].items() if "path_prefixes" in r},
+                **({"canary_mode":True,"event_ids":config["event_ids"]} if config.get("canary_mode") else {})))
+        except ControlPlaneError as exc:
+            raise ValidationTemporarilyUnavailable("Feedback validation transport unavailable") from exc
         if not fence.get("allowed"):raise ValueError("Feedback cancelled or outside scope")
     async def start(self):
         self.task=asyncio.create_task(self.loop(),name="clc-feedback-native-events")
+    def next_check(self):
+        due = min(self.last_result.get("next_check", self.last_check + 86400), self.last_check + 86400)
+        reason = self.last_result.get("skip_reason")
+        if reason == "running":
+            return min(due, self.last_check + 60)
+        if reason in ("awaiting_native_receipt", "continuation_prepared"):
+            return min(due, self.last_check + 15)
+        return due
+
     async def loop(self):
+        idle_delay = 5
         while True:
+            delay = 5
             try:
                 record=await asyncio.to_thread(self.record)
                 config=self.config()
@@ -122,17 +140,19 @@ class FeedbackScheduler:
                     data=dict(_transport_mode="events",cutoff=config["not_before_epoch"],wait_seconds=0)
                     if self.event_cursor:data["after_seq"]=self.event_cursor
                     wake=await asyncio.to_thread(self.remote,data)
-                    next_check=self.last_result.get("next_check",self.last_check+86400)
-                    if wake.get("events") or time.time()>=min(self.last_check+86400,next_check):
+                    if wake.get("events") or time.time()>=self.next_check():
                         await self.run(record)
                     if wake.get("next_seq"):self.event_cursor=wake["next_seq"]
-                    # Active claims must receive receipts/renewal promptly, not 15 min later.
-                    if self.last_result.get("skip_reason") in ("awaiting_native_receipt","running","continuation_prepared") and time.time()-self.last_check>=15:
-                        await self.run(record)
+                    urgent = self.last_result.get("skip_reason") == "awaiting_native_receipt"
+                    idle_delay = 5 if wake.get("events") or urgent else min(120, idle_delay * 2)
+                    due = self.next_check()
+                    delay = min(idle_delay, max(5, due - time.time()))
             except asyncio.CancelledError:raise
             except Exception:
                 LOG.exception("Native feedback event check failed closed")
-            await asyncio.sleep(5)
+                idle_delay = min(120, idle_delay * 2)
+                delay = idle_delay
+            await asyncio.sleep(delay)
     async def close(self):
         if self.task:
             self.task.cancel()

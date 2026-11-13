@@ -3455,7 +3455,7 @@ async function loadThreads() {
       if (!bridge?.initialized) continue;
       try {
         const requestLimit = PROJECT_CONVERSATION_LIMIT;
-        const data = await api(`/api/threads?project_id=${encodeURIComponent(project.id)}&limit=${requestLimit}`);
+        const data = await api(`/api/threads?project_id=${encodeURIComponent(project.id)}&limit=${requestLimit}${state.activeProject ? "&overview=false" : "&overview=true"}`);
         if (generation !== state.threadLoadGeneration) return;
         const threads = (data.data || []).map(thread => {
           const terminal = state.threadTerminalStatuses.get(thread.id);

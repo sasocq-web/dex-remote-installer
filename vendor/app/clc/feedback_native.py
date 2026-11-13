@@ -79,7 +79,10 @@ class FeedbackNative:
         # Keep durable keys/receipts; the next tick reconciles rather than resending.
         if out['errors']:
             out['next_check']=min(out['next_check'],self.clock()+60)
-        if out['skip_reason'] in ('awaiting_native_receipt','running','continuation_prepared'):
+        if out['skip_reason']=='running':
+            # Confirmed project turns renew a 30-minute lease. New events still wake the guard.
+            out['next_check']=min(out['next_check'],self.clock()+60)
+        elif out['skip_reason'] in ('awaiting_native_receipt','continuation_prepared'):
             out['next_check']=min(out['next_check'],self.clock()+15)
         p=self.state_dir/('status.'+str(os.getpid())+'.tmp');p.write_text(json.dumps(out));os.replace(p,self.state_dir/'status.json')
         return out

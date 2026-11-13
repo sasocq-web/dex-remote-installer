@@ -8,6 +8,10 @@ import sqlite3
 import time
 import uuid
 
+class ValidationTemporarilyUnavailable(RuntimeError):
+    """The delivery has not started and its read-only validation could not run."""
+
+
 class ProjectRelay:
     def __init__(self, directory, handler, owner_uid, worker_uid):
         self.handler, self.owner_uid, self.worker_uid = handler, owner_uid, worker_uid
@@ -59,12 +63,28 @@ class ProjectRelay:
         self.db.commit()
         return self.public(self.db.execute('SELECT * FROM requests WHERE id=?',(rid,)).fetchone())
 
+    def defer_validation(self, row):
+        prior = json.loads(row['result'])
+        delay = min(300, max(5, int(prior.get('retry_delay', 0)) * 2))
+        waiting = {'retry_delay': delay, 'validation_retry_at': time.time() + delay,
+                   'reason': 'validation_temporarily_unavailable'}
+        self.db.execute("UPDATE requests SET status='queued',result=? WHERE id=?",
+                        (json.dumps(waiting), row['id']))
+        self.db.commit()
+
     async def dispatch_one(self):
-        row = self.db.execute("SELECT * FROM requests WHERE status='queued' ORDER BY created LIMIT 1").fetchone()
+        row = self.db.execute(
+            "SELECT * FROM requests WHERE status='queued' "
+            "AND COALESCE(json_extract(result, '$.validation_retry_at'), 0) <= ? "
+            "ORDER BY created LIMIT 1", (time.time(),)
+        ).fetchone()
         if row is None: return
         payload=json.loads(row['payload'])
         try:
             await self.handler('validate',payload)
+        except ValidationTemporarilyUnavailable:
+            self.defer_validation(row)
+            return
         except Exception:
             self.db.execute("UPDATE requests SET status='rejected',result=? WHERE id=?",(json.dumps({'error':'Projeto/conversa indisponível; nenhuma mensagem enviada.'}),row['id']))
             self.db.commit()
@@ -74,6 +94,10 @@ class ProjectRelay:
         try:
             result=await self.handler('send',payload)
             status='queued' if result.get('status')=='busy' else 'dispatched'
+        except ValidationTemporarilyUnavailable:
+            # Raised by the feedback guard before the executor is called.
+            self.defer_validation(row)
+            return
         except Exception:
             result={'error':'Entrega não confirmada. Não repetir com outra chave; revisar no Sistema.'}
             status='dispatch_uncertain'

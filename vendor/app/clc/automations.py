@@ -450,9 +450,12 @@ class AutomationManager:
             return {"automationId": automation_id, "deleted": True}
         raise AutomationValidationError("mode inválido")
 
-    async def scheduler(self, runner: Callable[[dict[str, Any]], Awaitable[str]], interval: float = 15.0) -> None:
+    async def scheduler(self, runner: Callable[[dict[str, Any]], Awaitable[str]], interval: float = 15.0, *, ready: Callable[[], bool] = lambda: True) -> None:
         while True:
             try:
+                if not ready():
+                    await asyncio.sleep(interval)
+                    continue
                 due = await asyncio.to_thread(self.store.claim_due)
                 for automation in due:
                     run_id = await asyncio.to_thread(self.store.start_run, automation["id"])

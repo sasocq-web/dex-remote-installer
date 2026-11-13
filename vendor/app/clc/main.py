@@ -2709,8 +2709,6 @@ async def startup_event() -> None:
             _startup_canary_checked_at = time.time()
             LOGGER.warning("Workspace Codex %s iniciou degradado: %s", system_bridge.label, exc)
     normal = [item for item in projects.list() if item.kind != "system"]
-    for project in normal:
-        await _register_project_worker(project)
     # Start only the first project bridge for account onboarding. Other project
     # app-servers are lazy and consume no resources until selected or scheduled.
     if normal:
@@ -2750,7 +2748,7 @@ async def startup_event() -> None:
                                          lambda: _startup_canary_error, lambda: _rollout_gate_closed())
         update_verifier.task = asyncio.create_task(update_verifier.run(), name="dex-update-functional-verifier")
     automation_worker_task = asyncio.create_task(
-        automations.scheduler(_run_automation), name="clc-automation-scheduler"
+        automations.scheduler(_run_automation, ready=lambda: not _rollout_gate_closed()), name="clc-automation-scheduler"
     )
 
     global dot_system_bridge
@@ -6557,10 +6555,16 @@ async def list_threads(
     project_id: str,
     archived: bool = False,
     limit: int = Query(default=100, ge=1, le=100),
+    overview: Optional[bool] = None,
 ) -> Dict[str, Any]:
     _session(request)
+    if overview is None:
+        overview = limit == 24
     project = _project_or_404(project_id)
-    target = _bridge_for_project(project)
+    # The overview reads the shared project account catalogue. Only thread/list
+    # with this registered cwd is routed here. Turns always use their own worker.
+    reader = (_first_normal_project() if overview and project.kind != "system" else project)
+    target = _bridge_for_project(reader or project)
     result = await _rpc(
         "thread/list",
         {
@@ -6579,13 +6583,18 @@ async def list_threads(
     if isinstance(result, dict):
         metadata = operations.metadata().get("threads", {})
         threads = [thread for thread in result.get("data") or [] if isinstance(thread, dict)]
-        await _repair_generated_thread_titles(project, target, threads, metadata)
+        if overview and project.kind != "system":
+            threads = [row for row in threads if row.get("cwd") == project.path]
+            result["data"] = threads
+        if not overview:
+            await _repair_generated_thread_titles(project, target, threads, metadata)
+        if threads:
+            tool_profiles.remember_thread_projects((row["id"] for row in threads if row.get("id")), project_id)
         for thread in threads:
             thread_id = str(thread.get("id") or "") if isinstance(thread, dict) else ""
             if thread_id:
-                tool_profiles.remember_thread_project(thread_id, project_id)
                 thread_metadata = metadata.get(thread_id, {})
-                if not (thread_metadata.get("execution_timing") or {}).get("turn_count"):
+                if not overview and not (thread_metadata.get("execution_timing") or {}).get("turn_count"):
                     timing = _rollout_execution_timing(thread.get("path"))
                     if timing:
                         thread_metadata = operations.set_metadata("threads", thread_id, {"execution_timing": timing})
@@ -7238,6 +7247,16 @@ async def _start_turn(
             + ", ".join(related_paths[1:])
             + ". Trate a primeira pasta como principal e preserve os limites entre repositórios."
         )
+    if collaboration_mode != "plan":
+        operating_context += (
+            "\nEm pedidos de execução, trabalhe até entregar e verificar o resultado pedido. "
+            "Se uma etapa terminar e houver outra etapa autorizada e viável, execute-a neste turno. "
+            "Use mensagens de progresso durante o trabalho. Antes da resposta final, confira cada "
+            "entrega pedida e prossiga com o que faltar. Ao aguardar uma operação iniciada, acompanhe "
+            "o resultado pelo recibo existente. Preserve cancelamentos e evite repetir efeitos incertos. "
+            "Se o trabalho depender de uma decisão, credencial ou permissão que só o operador pode fornecer, "
+            "indique a dependência exata. Respeite pedidos de explicação, planejamento, pausa e limites de escopo."
+        )
     operating_context += workbench["memory_context"](project.id, message)
     referenced_message = await _message_with_references(message, references or [])
     params: Dict[str, Any] = {
@@ -7351,6 +7370,8 @@ async def _run_automation(automation: Dict[str, Any]) -> str:
             raise RuntimeError("Guarda nativa de feedback indisponível; nenhum modelo iniciado")
         return await feedback_scheduler.run(automation)
     project_id = str(automation.get("project_id") or SYSTEM_PROJECT_ID)
+    if automation.get("workspace") == "system" and project_id in ("system", "system-sasocq"):
+        project_id = SYSTEM_PROJECT_ID
     project = _project_or_404(project_id)
     target = _bridge_for_project(project)
     kind = str(automation.get("kind") or "heartbeat")
@@ -7530,7 +7551,7 @@ def _completion_push_payload(event: Dict[str, Any]) -> Dict[str, Any] | None:
         title = "Atividade do Dex interrompida"
         body = "A execução foi interrompida."
     else:
-        title = "Atividade concluída no Dex"
+        title = "Resposta disponível no Dex"
         body = "A resposta está pronta."
         for item in reversed(turn.get("items") or []):
             if item.get("type") == "agentMessage" and str(item.get("text") or "").strip():
