@@ -1,6 +1,7 @@
 """Resume unfinished Dex requests using the original execution context."""
 import asyncio
 import fcntl
+import json
 import logging
 import re
 import sqlite3
@@ -14,11 +15,26 @@ MESSAGE = ("Retomada automática da solicitação original. Confira o último re
            "Se a dependência persistir, informe a condição. Preserve pausas, cancelamentos e aprovações. "
            "Não repita efeitos já aceitos. Se tudo estiver concluído, encerre.")
 
+WAIT = re.compile(r"(?im)^Aguardar recibo: ([0-9a-f]{32}) (queued|dispatching|running|blocked|waiting_operator)$")
+
+def receipt_waiting(directory, thread, markers):
+    """Only authenticated receipts from this thread can defer its execution."""
+    if not markers:
+        return False
+    source = directory / "dot-system-bridge" / "requests.sqlite3"
+    with sqlite3.connect(source.as_uri() + "?mode=ro", uri=True) as db:
+        for rid, status in markers:
+            row = db.execute("SELECT r.status FROM requests r JOIN native_request_origins n ON r.id=n.id WHERE n.thread=? AND r.id=?", (thread, rid)).fetchone()
+            if row != (status,):
+                return False
+    return True
+
 class Continuations:
     def __init__(self, path):
         self.path = path
         with self.db() as db:
             db.execute("CREATE TABLE IF NOT EXISTS work(thread TEXT PRIMARY KEY, turn TEXT NOT NULL, mode TEXT NOT NULL, due REAL NOT NULL, attempts INTEGER NOT NULL DEFAULT 0)")
+            db.execute("CREATE TABLE IF NOT EXISTS waits(thread TEXT PRIMARY KEY, turn TEXT NOT NULL, receipts TEXT NOT NULL)")
     def db(self):
         return sqlite3.connect(self.path)
     def schedule(self, thread, turn, mode, delay=0):
@@ -34,6 +50,7 @@ class Continuations:
     def forget(self, thread):
         with self.db() as db:
             db.execute("DELETE FROM work WHERE thread=?", (thread,))
+            db.execute("DELETE FROM waits WHERE thread=?", (thread,))
     def observe(self,event):
         n = event.get("notification") or {}
         method = n.get("method")
@@ -53,12 +70,20 @@ class Continuations:
             if not msg: return
             self.forget(thread)
             return
-        self.finish(thread,turn.get("id"),markers[-1].lower())
-    def finish(self,thread,turn,mode):
+        self.finish(thread,turn.get("id"),markers[-1].lower(),msg)
+    def finish(self,thread,turn,mode,msg=""):
         if mode in {"operador","concluída"}:
             self.forget(thread)
         else:
-            self.schedule(thread,turn,mode,15 if mode=="agora" else 60)
+            self.schedule(thread,turn,mode,0 if mode=="agora" else 15)
+            receipts = WAIT.findall(msg.replace("*",""))
+            if mode == "temporária" and receipts:
+                with self.db() as db:
+                    db.execute("INSERT OR REPLACE INTO waits VALUES(?,?,?)",(thread,turn,json.dumps(receipts)))
+    def waiting(self,thread,turn):
+        with self.db() as db:
+            row = db.execute("SELECT receipts FROM waits WHERE thread=? AND turn=?", (thread,turn)).fetchone()
+        return bool(row and receipt_waiting(self.path.parent,thread,json.loads(row[0])))
     def later(self,thread,turn,delay,attempts):
         with self.db() as db:
             db.execute("UPDATE work SET due=?,attempts=? WHERE thread=? AND turn=?",
@@ -88,11 +113,14 @@ async def monitor(work, context):
                 if mode=="onedrive" and cloud_busy():
                     work.later(thread,turn,20,attempt)
                     continue
+                if mode=="temporária" and work.waiting(thread,turn):
+                    work.later(thread,turn,15,attempt)
+                    continue
                 ctx = context(thread,turn)
                 if not ctx or ctx.get("collaboration_mode")=="plan":
                     work.later(thread,turn,300,attempt)
                     continue
-                project=main.projects.get(ctx["project_id"])
+                project=main._project_or_404(ctx["project_id"])
                 if not project or main._project_id_for_thread(thread)!=project.id:
                     work.later(thread,turn,300,attempt)
                     continue

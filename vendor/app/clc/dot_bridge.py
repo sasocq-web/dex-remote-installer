@@ -193,7 +193,7 @@ class Bridge:
             return
         if self.db.execute("SELECT count(*) FROM requests WHERE status IN ('dispatching','running','dispatch_uncertain')").fetchone()[0]:
             return
-        held = {self.conflict_scope(r) for r in self.db.execute("SELECT * FROM requests WHERE (status='waiting_operator' OR (status='blocked' AND result LIKE 'Executor sem turno ativo;%'))")}
+        held = {self.conflict_scope(r) for r in self.db.execute("SELECT * FROM requests WHERE (status='waiting_operator' OR (mode='maintain' AND status='blocked' AND result LIKE 'Executor sem turno ativo;%'))")}
         row = next((r for r in self.db.execute("SELECT * FROM requests WHERE status='queued' ORDER BY created,id") if r["mode"] == "inspect" or self.conflict_scope(r) not in held), None)
         if row is None:
             return

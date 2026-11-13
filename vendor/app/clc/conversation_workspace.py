@@ -103,7 +103,7 @@ def install_conversation_workspace(app, *, session_guard, project_lookup, projec
                 if item.get("phase") == "final_answer":
                     markers = MARK.findall((item.get("text") or "").replace("*",""))
                     if markers:
-                        continuations.finish(params.get("threadId"), params.get("turnId"), markers[-1].lower())
+                        continuations.finish(params.get("threadId"), params.get("turnId"), markers[-1].lower(), item.get("text") or "")
                 if item.get("phase") == "commentary":
                     operations.record_progress_note(params.get("threadId"), params.get("turnId"), item.get("text"))
                 operations.record_reported_progress(params.get("threadId"), params.get("turnId"), item.get("text"))
