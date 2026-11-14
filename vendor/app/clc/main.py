@@ -1935,11 +1935,15 @@ async def _storage_execution_health():
     except Exception:
         return None
 
+def _apt_maintenance_blocks() -> bool:
+    from .apt_maintenance_fence import blocked
+    return blocked()
+
 def _rollout_gate_closed() -> bool:
     global _rollout_quiescing_until
     if _rollout_quiescing_until and time.monotonic() >= _rollout_quiescing_until:
         _rollout_quiescing_until = 0.0
-    return _storage_closure_blocks() or _rollout_quiescing_until > 0 or update_safety_gate_closed()
+    return _apt_maintenance_blocks() or _storage_closure_blocks() or _rollout_quiescing_until > 0 or update_safety_gate_closed()
 
 
 def _playwright_workspace_for_thread(thread_id: str) -> str:
@@ -3347,6 +3351,8 @@ async def rollout_quiesce(request: Request) -> Dict[str, Any]:
     if client not in {"127.0.0.1", "::1"}:
         raise HTTPException(status_code=403, detail="quiescência disponível somente no host local")
     async with _rollout_gate_lock:
+        if _apt_maintenance_blocks():
+            raise HTTPException(status_code=409, detail="persistent APT maintenance requires its original terminal receipt")
         if _storage_closure_blocks():
             raise HTTPException(status_code=409, detail="original persistent storage closure requires reconciliation")
         await android_lifecycle.refresh()
@@ -3381,6 +3387,8 @@ async def rollout_unquiesce(request: Request) -> Dict[str, Any]:
     if client not in {"127.0.0.1", "::1"}:
         raise HTTPException(status_code=403, detail="quiescência disponível somente no host local")
     async with _rollout_gate_lock:
+        if _apt_maintenance_blocks():
+            raise HTTPException(status_code=409, detail="persistent APT maintenance requires its original terminal receipt")
         if _storage_closure_blocks():
             raise HTTPException(status_code=409, detail="persistent storage closure requires its original terminal receipt")
         _rollout_quiescing_until = 0.0
