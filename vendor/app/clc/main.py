@@ -2672,6 +2672,10 @@ async def _system_request_thread_probe(thread_id: str) -> str:
     return "inactive" if kind == "idle" else "unknown"
 
 
+def _operator_update_ready() -> bool:
+    return (not _startup_canary_error and not _rollout_gate_closed()
+            and sum(workspace == "system" for workspace, _ in _active_turns) <= 1)
+
 def _dot_system_ready() -> bool:
     return not _startup_canary_error and not _rollout_gate_closed() and not any(
         workspace == "system" for workspace, thread_id in _active_turns
@@ -2780,6 +2784,7 @@ async def startup_event() -> None:
         dot_system_bridge = DotSystemBridge(
             settings.resolved_config_dir / "dot-system-bridge",
             _run_automation, _dot_system_ready, project_handler=None, thread_probe=_system_request_thread_probe,
+            update_ready=_operator_update_ready,
         )
         await dot_system_bridge.start()
     except Exception:

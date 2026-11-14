@@ -22,7 +22,9 @@ def validate_binding(workspace, payload):
 
 async def authenticate(payload, values):
     # Bound child, no shell, secret argv/env/file, stderr or MCP session trace.
-    program = Path(__file__).resolve().parents[1] / "system/http_auth.mjs"
+    backend = urlsplit(payload["url"]).path.split("/")[4].lower()
+    module = "meuth_http_diagnostic.mjs" if backend in {"meuth", "meuth.nuclep.gov.br"} else "http_auth.mjs"
+    program = Path(__file__).resolve().parents[1] / "system" / module
     node = "/home/codex/.local/share/codex-linux-control/tools/node/bin/node"
     proc = None
     try:
@@ -41,6 +43,7 @@ async def authenticate(payload, values):
             "scheme": result.get("scheme") if result.get("scheme") in {"basic","digest","ntlm","negotiate"} else "unknown",
             "http_status":result.get("status") if type(result.get("status")) is int and 100<=result["status"]<=599 else None,
             "auth_callback_received":result.get("auth_event") is True,
+            **({"diagnostic": sanitize_diagnostic(result.get("diagnostic"))} if module == "meuth_http_diagnostic.mjs" else {}),
             "reason":result.get("reason") if result.get("reason") in {"authenticated","authentication_not_completed","challenge_outside_binding","http_challenge_without_auth_callback","browser_network_auth_error","no_response_observed"} else "invalid_receipt"}
     except Exception:
         raise RuntimeError("protected_http_auth_failed") from None
@@ -49,3 +52,15 @@ async def authenticate(payload, values):
         if proc and proc.returncode is None:
             proc.kill()
             await proc.wait()
+
+
+def sanitize_diagnostic(value):
+    """Fixed schema only. Never forward a URL, identity, header or CDP payload."""
+    if not isinstance(value, dict):
+        return {"terminal": "unavailable"}
+    safe = {k: value[k] for k in ("callbacks", "provided", "repeated_url", "outside_binding")
+            if type(value.get(k)) is int and 0 <= value[k] <= 255}
+    terminals = {"deadline", "repeated_url_cancelled", "binding_cancelled", "http_error",
+                 "document_ready", "network_failed", "protocol_error"}
+    safe["terminal"] = value.get("terminal") if isinstance(value.get("terminal"), str) and value.get("terminal") in terminals else "unavailable"
+    return safe

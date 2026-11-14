@@ -508,6 +508,11 @@ async function loadPCResources({openDialog = false, announce = false} = {}) {
   try {
     const data = await api("/api/control/pc-resources");
     renderPCResources(data);
+    if (openDialog) {
+      for (const card of selectors.pcDataContent?.querySelectorAll(".pc-resource-card[data-pc-tree]") || []) {
+        void warmPCDiskTree(card.dataset.pcTree);
+      }
+    }
     if (announce) toast("Dados atuais do PC carregados.", "success");
     return data;
   } catch (error) {
@@ -535,6 +540,50 @@ let pcTreeError = "";
 let pcTreeRequest = 0;
 let pcTreePath = "/";
 const pcTreeRecent = new Map();
+const pcTreeWarming = new Set();
+async function warmPCDiskTree(path) {
+  if (pcTreeWarming.has(path)) return;
+  pcTreeWarming.add(path);
+  try {
+    while (selectors.pcDataDialog?.open && !(pcTreeBusy && pcTreePath === path)) {
+      const tree = await api(`/api/control/pc-storage-tree-status?path=${encodeURIComponent(path)}`);
+      if (!tree.pending) {
+        if (Array.isArray(tree.children) && tree.path === path) pcTreeRecent.set(path, tree);
+        break;
+      }
+      await new Promise(resolve => setTimeout(resolve, 2000));
+    }
+  } catch {
+    // Opening the disk retries through the interactive error handler.
+  } finally {
+    pcTreeWarming.delete(path);
+  }
+}
+
+function pcDiskChart(path) {
+  const data = state.pcResources;
+  const volume = path === "/" ? (data?.filesystems || []).find(v => v.path === path)
+                              : (data?.volumes || []).find(v => v.path === path);
+  if (!volume || !(volume.total > 0) || !Number.isFinite(volume.free)) return "";
+  const free = Math.max(0, Math.min(volume.total, volume.free));
+  const used = volume.total - free;
+  return `<section class="pc-disk-summary"><h3>Distribuição do disco</h3><span>${escapeHTML(path)}</span>
+    <div class="pc-disk-band" aria-hidden="true"><i style="width:${100 * used / volume.total}%"></i></div>
+    <p>Ocupado: ${formatBytes(used)} · Livre: ${formatBytes(free)}</p></section>`;
+}
+
+function pcFolderChart(tree) {
+  if (!(tree.size > 0)) return "";
+  const children = tree.children.filter(item => Number.isFinite(item.size) && item.size > 0).slice(0, 12);
+  if (!children.length) return "";
+  return `<div class="pc-folder-band" aria-label="Distribuição por pasta">${children.map((item, i) => {
+    const share = Math.min(100, 100 * item.size / tree.size);
+    const name = item.path.split("/").pop() || "/";
+    const label = name + " · " + formatBytes(item.size);
+    return `<button type="button" data-pc-tree="${escapeHTML(item.path)}" title="${escapeHTML(label)}" aria-label="${escapeHTML(label)}" style="width:${share}%;background:hsl(${(200+i*43)%360} 48% 39%)">${share >= 10 ? escapeHTML(name) : ""}</button>`;
+  }).join("")}</div>`;
+}
+
 async function openPCStorageTree(path) {
   if (pcTreeBusy && pcTreePath === path) return;
   pcTreePath = path;
@@ -575,20 +624,20 @@ async function openPCStorageTree(path) {
 }
 function renderPCStorageTree() {
   if (pcTreeBusy && !pcTree) return pcDataLoading("Abrindo as pastas…");
-  if (pcTreeError) return `<p role="alert">${escapeHTML(pcTreeError)}</p><button type="button" data-pc-tree="${escapeHTML(pcTreePath)}">Tentar novamente</button>`;
+  if (pcTreeError && !pcTree) return `<p role="alert">${escapeHTML(pcTreeError)}</p><button type="button" data-pc-tree="${escapeHTML(pcTreePath)}">Tentar novamente</button>`;
   if (!pcTree) return "";
   const parts = pcTree.path.split("/").filter(Boolean);
   const crumbs = ["/", ...parts.map((_, i) => "/" + parts.slice(0, i + 1).join("/"))];
   if (pcTree.preview) {
     const parent = crumbs.length > 1 ? crumbs[crumbs.length - 2] : null;
-    return `<section class="pc-storage-tree"><h3>Árvore de dados</h3><div>${parent ? `<button class="secondary-button" data-pc-tree="${escapeHTML(parent)}">Voltar</button> ` : ""}${escapeHTML(pcTree.path)}</div><p>Calculando tamanhos…</p>${pcTree.children.map(item => `<button type="button" class="storage-tree-row" data-pc-tree="${escapeHTML(item.path)}"><span>📁 ${escapeHTML(item.path.split("/").pop())}</span></button>`).join("")}${pcTree.truncated ? "<small>Prévia limitada a 500 pastas.</small>" : ""}</section>`;
+    return `<section class="pc-storage-tree"><h3>Árvore de dados</h3><div>${parent ? `<button class="secondary-button" data-pc-tree="${escapeHTML(parent)}">Voltar</button> ` : ""}${escapeHTML(pcTree.path)}</div>${pcTreeError ? `<p role="alert">${escapeHTML(pcTreeError)} <button type="button" data-pc-tree="${escapeHTML(pcTreePath)}">Tentar novamente</button></p>` : "<p>Calculando tamanhos…</p>"}${pcTree.children.map(item => `<button type="button" class="storage-tree-row" data-pc-tree="${escapeHTML(item.path)}"><span>📁 ${escapeHTML(item.path.split("/").pop())}</span></button>`).join("")}${pcTree.truncated ? "<small>Prévia limitada a 500 pastas.</small>" : ""}</section>`;
   }
-  return `<section class="pc-storage-tree"><h3>Árvore de dados • ${formatBytes(pcTree.size)}</h3>${pcTreeBusy ? "<p>Atualizando tamanhos…</p>" : ""}<nav aria-label="Caminho da pasta">${crumbs.map(path => `<button type="button" class="secondary-button" data-pc-tree="${escapeHTML(path)}">${escapeHTML(path === "/" ? "/" : path.split("/").pop())}</button>`).join(" / ")}</nav><p>Pastas em ordem de tamanho. Clique para expandir. Barras indicam a proporção nesta pasta.</p>${pcTree.children.map((item, index) => {const percent = pcTree.size ? Math.min(100, item.size / pcTree.size * 100) : 0; return `<button type="button" class="storage-tree-row" data-pc-tree="${escapeHTML(item.path)}"><span>${index + 1}. 📁 ${escapeHTML(item.path.split("/").pop())}</span><b>${formatBytes(item.size)} • ${percent.toFixed(1)}%</b><span class="storage-tree-bar"><i style="width:${percent}%"></i></span></button>`;}).join("") || "<p>Nenhuma subpasta. O total também inclui arquivos nesta pasta.</p>"}${pcTree.truncated ? "<p>Exibindo as 500 maiores pastas.</p>" : ""}<small>Leitura somente de tamanhos, sem abrir arquivos. Outros volumes são analisados separadamente. Atualizado em ${formatTime(pcTree.checked_at)}.</small></section>`;
+  return `<section class="pc-storage-tree"><h3>Árvore de dados • ${formatBytes(pcTree.size)}</h3>${pcFolderChart(pcTree)}${pcTreeError ? `<p role="alert">${escapeHTML(pcTreeError)} <button type="button" data-pc-tree="${escapeHTML(pcTreePath)}">Tentar novamente</button></p>` : ""}${pcTreeBusy ? "<p>Atualizando tamanhos…</p>" : ""}<nav aria-label="Caminho da pasta">${crumbs.map(path => `<button type="button" class="secondary-button" data-pc-tree="${escapeHTML(path)}">${escapeHTML(path === "/" ? "/" : path.split("/").pop())}</button>`).join(" / ")}</nav><p>Pastas em ordem de tamanho. Clique para expandir. Barras indicam a proporção nesta pasta.</p>${pcTree.children.map((item, index) => {const percent = pcTree.size ? Math.min(100, item.size / pcTree.size * 100) : 0; return `<button type="button" class="storage-tree-row" data-pc-tree="${escapeHTML(item.path)}"><span>${index + 1}. 📁 ${escapeHTML(item.path.split("/").pop())}</span><b>${formatBytes(item.size)} • ${percent.toFixed(1)}%</b><span class="storage-tree-bar"><i style="width:${percent}%"></i></span></button>`;}).join("") || "<p>Nenhuma subpasta. O total também inclui arquivos nesta pasta.</p>"}${pcTree.truncated ? "<p>Exibindo as 500 maiores pastas.</p>" : ""}<small>Leitura somente de tamanhos, sem abrir arquivos. Outros volumes são analisados separadamente. Atualizado em ${formatTime(pcTree.checked_at)}.</small></section>`;
 }
 
 function renderPCStorage() {
   const data = state.pcStorage;
-  if (pcTreeBusy || pcTree || pcTreeError) return renderPCStorageTree();
+  if (pcTreeBusy || pcTree || pcTreeError) return pcDiskChart(pcTreePath) + renderPCStorageTree();
   if (state.pcStorageLoading) return pcDataLoading("Analisando as pastas do SSD…");
   if (!data) return `<div class="pc-manager-empty"><strong>Consumo ainda não analisado</strong><span>Selecione “Analisar armazenamento” para medir as pastas sem apagar ou modificar arquivos.</span><button class="primary-button" type="button" data-pc-load="storage">Analisar armazenamento</button></div>`;
   const filesystem = data.filesystem || {};

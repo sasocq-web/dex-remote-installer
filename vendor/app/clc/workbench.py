@@ -621,15 +621,22 @@ def install_workbench(
                     "verificáveis que cubram o pedido inicial, inclusive a validação. Atualize as "
                     "etapas conforme os resultados. Ao continuar o pedido, retome o plano completo "
                     "com as etapas já comprovadas. Quando update_plan estiver indisponível, inclua nas mensagens de andamento e na resposta final uma linha Progresso: X/Y entregas, usando números referentes ao pedido inicial. Conte somente entregas verificadas e mantenha o total nas retomadas salvo mudança de escopo. Divida entregas grandes em marcos verificáveis; nomeie o objeto e o resultado de cada etapa. Para lotes com total conhecido, informe o avanço dentro da etapa atual usando linhas separadas: Progresso: X/Y entregas; Atual: nome da entrega; Parcial: A/B unidades; Concluído: último resultado verificado; Próxima: próxima ação. Use apenas os campos aplicáveis e números observados. Atualize o andamento quando houver avanço material. Se houver plano nativo, mantenha X/Y compatível com ele. Respeite o modo de planejamento quando ativo.")
-        guidance += ("\nEm pedidos de execução, conclua no turno as etapas autorizadas e viáveis. "
-                     "Execute cada etapa viável imediatamente na mesma conversa, inclusive as independentes de uma espera. Não crie automações de continuação para um pedido único. Use agendamentos somente para recorrência ou horário solicitado. Se restarem exclusivamente recibos nativos do Sistema, registre uma linha por recibo no formato Aguardar recibo: ID STATUS, com o estado observado. Se um limite do turno ou uma dependência impedir a conclusão, finalize com uma linha isolada 'Retomada: agora' "
-                     "se houver trabalho executável, 'Retomada: onedrive' se a única dependência for "
-                     "a trava da conta OneDrive, ou 'Retomada: temporária' para outra condição "
-                     "transitória. Indique a condição e o recibo para conferência na retomada. "
-                     "Se depender exclusivamente de decisão, permissão, credencial ou ação humana, "
-                     "ou houver pedido de pausa/cancelamento, use 'Retomada: operador'. "
-                     "Uma tarefa já realizada ou que apenas pede uma análise termina normalmente. "
-                     "Respeite horários explicitamente solicitados e automações pausadas.")
+        guidance += (
+            "\nEm pedidos de execução, trabalhe no turno atual até verificar o objetivo original. "
+            "Enquanto existir uma ação autorizada e viável, execute-a antes de responder em definitivo. "
+            "Use mensagens de andamento entre etapas. Um marco do plano, a duração do trabalho ou "
+            "uma espera breve não encerram o turno. Acompanhe operações já iniciadas pelo recibo, "
+            "faça o trabalho independente e prossiga assim que a dependência liberar. "
+            "Use agenda somente para horário ou recorrência pedidos pelo usuário. "
+            "Antes da resposta final, confira cada entrega e sua validação contra a solicitação. "
+            "Se a conclusão exigir o fim deste turno (por exemplo, ativação que aguarda conversas ociosas), "
+            "ou uma interrupção técnica efetiva impedir todo avanço, identifique a condição observada. "
+            "Para espera externa persistente, use 'Retomada: temporária' ou, para a trava da conta "
+            "OneDrive, 'Retomada: onedrive', em linha isolada. Para recibos nativos em espera, "
+            "registre Aguardar recibo: ID STATUS por recibo. Se restar apenas decisão, permissão, "
+            "credencial ou ação humana, ou houver pausa ou cancelamento, use 'Retomada: operador'. "
+            "Respeite pedidos somente de análise e o modo de planejamento."
+        )
         return guidance + memory_context(project_id, message)
 
     return {"memory_context": conversation_context}

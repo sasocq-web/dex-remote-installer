@@ -2861,3 +2861,11 @@ html { font-size: calc(100% * var(--dex-font-scale, 1)); }
 @media(prefers-reduced-motion:reduce){.phase-working .request-track::after{animation:none;left:28%}}
 
 .recent-thread-card .request-step {display:block;white-space:normal;overflow-wrap:anywhere;font-size:.77rem;line-height:1.4;color:var(--muted);margin-top:.15rem}.request-step b{color:inherit;font-weight:600}
+
+.pc-disk-summary { padding: .8rem 1rem; border: 1px solid #53657b; border-radius: .8rem; margin-bottom: .65rem; }
+.pc-disk-summary h3, .pc-disk-summary p { margin: .35rem 0; }
+.pc-disk-band,.pc-folder-band { display:flex; overflow:hidden; background:#46566a; border-radius:.55rem; margin:.6rem 0; }
+.pc-disk-band { height:.85rem; }
+.pc-disk-band i { display:block; background:linear-gradient(90deg,#4c79f5,#31c4b4); }
+.pc-folder-band button { height:3rem; min-width:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; padding:0; color:white; border:0; border-radius:0; }
+.pc-folder-band button:focus-visible { outline:2px solid white; outline-offset:-3px; }

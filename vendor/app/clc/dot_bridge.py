@@ -43,11 +43,12 @@ apenas a limitação e mantenha os detalhes nesta conversa do Sistema.
 """
 
 class Bridge:
-    def __init__(self, directory: Path, runner, ready, owner_uid=None, worker_uid=1001, project_handler=None, queue_limit=50, hourly_limit=60, thread_probe=None):
+    def __init__(self, directory: Path, runner, ready, owner_uid=None, worker_uid=1001, project_handler=None, queue_limit=50, hourly_limit=60, thread_probe=None, update_ready=None):
         if not 1 <= queue_limit <= 500 or not 1 <= hourly_limit <= 1000:
             raise ValueError("limites de fila inválidos")
         self.queue_limit, self.hourly_limit = queue_limit, hourly_limit
         self.thread_probe = thread_probe
+        self.update_ready = update_ready or (lambda: False)
         self._last_reconcile = 0.0
         self.directory = Path(directory)
         self.runner, self.ready = runner, ready
@@ -186,15 +187,16 @@ class Bridge:
         return self.public(self.record(rid))
 
     async def dispatch_one(self):
-        if not self.ready():
+        if not (self.ready() or self.update_ready()):
             return
         await self.reconcile()
-        if not self.ready():
+        ordinary_ready = self.ready()
+        if not (ordinary_ready or self.update_ready()):
             return
         if self.db.execute("SELECT count(*) FROM requests WHERE status IN ('dispatching','running','dispatch_uncertain')").fetchone()[0]:
             return
         held = {self.conflict_scope(r) for r in self.db.execute("SELECT * FROM requests WHERE (status='waiting_operator' OR (mode='maintain' AND status='blocked' AND result LIKE 'Executor sem turno ativo;%'))")}
-        row = next((r for r in self.db.execute("SELECT * FROM requests WHERE status='queued' ORDER BY created,id") if r["mode"] == "inspect" or self.conflict_scope(r) not in held), None)
+        row = next((r for r in self.db.execute("SELECT * FROM requests WHERE status='queued' ORDER BY created,id") if (ordinary_ready or (r["uid"] == self.owner_uid and r["topic"] == "updates")) and (r["mode"] == "inspect" or self.conflict_scope(r) not in held)), None)
         if row is None:
             return
         row = dict(row)
