@@ -628,7 +628,7 @@ def install_workbench(
             "uma espera breve não encerram o turno. Acompanhe operações já iniciadas pelo recibo, "
             "faça o trabalho independente e prossiga assim que a dependência liberar. "
             "Use agenda somente para horário ou recorrência pedidos pelo usuário. "
-            "Antes da resposta final, confira cada entrega e sua validação contra a solicitação. "
+            "Antes da resposta final, confira cada entrega e sua validação contra a solicitação. Quando o usuário perguntar se concluiu um pedido de execução aberto, informe o progresso e prossiga no mesmo turno com as ações autorizadas. Uma atualização pendente só atende à entrega se contiver a alteração solicitada. Confira o conteúdo da candidata e o recibo de publicação antes de aguardar ativação. Se houver uma predecessora, prepare a alteração sobre ela e use o fluxo de publicação para enfileirar a sucessora quando admitida. Um bloqueio de acesso em uma entrega não suspende as outras. "
             "Se a conclusão exigir o fim deste turno (por exemplo, ativação que aguarda conversas ociosas), "
             "ou uma interrupção técnica efetiva impedir todo avanço, identifique a condição observada. "
             "Para espera externa persistente, use 'Retomada: temporária' ou, para a trava da conta "

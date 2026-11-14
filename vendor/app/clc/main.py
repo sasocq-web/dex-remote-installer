@@ -4122,27 +4122,19 @@ async def control_pc_storage_tree_api(request: Request, path: str = "/"):
         return value
 
 
+_pc_overview_sample = {}
+_pc_overview_lock = asyncio.Lock()
+
+
 @app.get("/api/control/pc-resources")
 async def control_pc_resources_api(request: Request) -> Dict[str, Any]:
-    """Return fresh lightweight metrics for the PC data overview."""
     _session(request)
-    try:
-        machine = await _fresh_machine_overview()
-    except ControlPlaneError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    return {
-        "checked_at": time.time(),
-        "hostname": machine.get("hostname", ""),
-        "platform": machine.get("platform", ""),
-        "kernel": machine.get("kernel", ""),
-        "uptime_seconds": machine.get("uptime_seconds", 0),
-        "cpu": machine.get("cpu", {}),
-        "memory": machine.get("memory", {}),
-        "filesystems": machine.get("filesystems", []),
-        "volumes": await _pc_volumes(),
-        "temperatures": machine.get("temperatures", []),
-        "hardware": machine.get("hardware", {}),
-    }
+    from .pc_overview import sample
+    async with _pc_overview_lock:
+        if time.monotonic() - _pc_overview_sample.get("at", -100) >= 3:
+            value = await asyncio.to_thread(sample)
+            _pc_overview_sample.update(at=time.monotonic(), value=value)
+        return _pc_overview_sample["value"]
 
 
 _pc_storage_cache: Dict[str, Any] = {"checked_at": 0.0, "value": None}

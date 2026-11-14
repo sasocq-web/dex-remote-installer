@@ -506,7 +506,7 @@ function openPCDiskActivity(serial) {
 async function loadPCResources({openDialog = false, announce = false} = {}) {
   if (openDialog && selectors.pcDataDialog && !selectors.pcDataDialog.open) selectors.pcDataDialog.showModal();
   try {
-    const data = await api("/api/control/pc-resources");
+    const data = await api("/api/control/pc-resources", {signal: AbortSignal.timeout(8000)});
     renderPCResources(data);
     if (openDialog) {
       for (const card of selectors.pcDataContent?.querySelectorAll(".pc-resource-card[data-pc-tree]") || []) {
@@ -516,7 +516,12 @@ async function loadPCResources({openDialog = false, announce = false} = {}) {
     if (announce) toast("Dados atuais do PC carregados.", "success");
     return data;
   } catch (error) {
-    if (openDialog && selectors.pcDataContent) selectors.pcDataContent.innerHTML = `<div class="inline-notice error">${escapeHTML(error.message)}</div>`;
+    if (selectors.pcDataDialog?.open) {
+      el("pc-data-updated").textContent = state.pcResources
+        ? "Falha ao atualizar • última leitura " + formatTime(state.pcResources.checked_at)
+        : "Métricas indisponíveis • toque em Atualizar agora";
+      if (!state.pcResources) selectors.pcDataContent.innerHTML = '<div class="inline-notice error">Não foi possível consultar as métricas do mini PC.</div>';
+    }
     if (announce) toast(error.message, "error");
     return null;
   }

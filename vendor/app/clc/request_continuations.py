@@ -129,7 +129,11 @@ async def monitor(work, context):
                 # Background resumes must leave an idle window for a queued release.
                 # The updater removes pending.json when it consumes or retires the request.
                 pending = Path.home()/".local/share/codex-linux-control/rollout/pending.json"
-                if pending.is_file() or main._rollout_gate_closed() or any(t==thread for _,t in main._active_turns):
+                # When another user turn already prevents activation, independent work
+                # can proceed. Yield the idle window once that turn finishes.
+                active_threads = {t for _, t in main._active_turns}
+                if (main._rollout_gate_closed() or thread in active_threads
+                        or (pending.is_file() and (not active_threads or mode != "agora"))):
                     work.later(thread,turn,20,attempt)
                     continue
                 if mode=="onedrive" and cloud_busy():
