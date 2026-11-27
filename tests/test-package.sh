@@ -35,6 +35,10 @@ done
 
 [[ -f "$DEB" ]]
 [[ "$(dpkg-deb -f "$DEB" Package)" == "dex-remote-installer" ]]
+RESILIENCE_TEST="$(mktemp -d)"
+dpkg-deb -x "$DEB" "$RESILIENCE_TEST"
+(cd "$RESILIENCE_TEST/opt/dex-remote/resilience" && PYTHONPATH="$RESILIENCE_TEST/opt/dex-remote/app" /usr/bin/python3 -B -m unittest -v test_gateway test_install_resilience)
+rm -rf -- "$RESILIENCE_TEST"
 [[ "$(dpkg-deb -f "$DEB" Architecture)" == "all" ]]
 [[ "$(dpkg-deb -f "$DEB" Version)" == "$VERSION" ]]
 

@@ -1,0 +1,17 @@
+[Unit]
+Description=Authorized Dex repair through Linux Codex CLI
+After=network-online.target
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -B /usr/local/lib/dex-rescue/restore_runner.py
+Environment=PATH=/home/codex/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+UMask=0077
+Slice=app.slice
+TimeoutStopSec=30
+KillMode=control-group
+MemoryHigh=1536M
+MemoryMax=2G
+TasksMax=256
+Nice=5

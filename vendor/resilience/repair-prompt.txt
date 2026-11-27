@@ -1,0 +1,1 @@
+Restaure o Dex SASOCQ. Diagnostique os serviços e siga a skill clc-system-admin. Use sasocq-brokerctl para operações administrativas. Preserve conversas, arquivos e sessões, não reinicie a máquina, não interrompa turnos saudáveis e não repita operações incertas. Se já estiver saudável, verifique e encerre. Registre o resultado em português.

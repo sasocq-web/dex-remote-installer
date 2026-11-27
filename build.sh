@@ -29,6 +29,7 @@ install -m 0644 "$ROOT/CONTROL_PLANE_VERSION" "$STAGE/opt/dex-remote/CONTROL_PLA
 find "$STAGE/opt/dex-remote/app" -type f -name '*.pyc' -delete
 find "$STAGE/opt/dex-remote/app" -type d -name '__pycache__' -empty -delete
 cp -a "$ROOT/vendor/helpers/." "$STAGE/usr/lib/dex-remote/"
+cp -a "$ROOT/vendor/resilience" "$STAGE/opt/dex-remote/resilience"
 install -m 0755 "$ROOT/scripts/dex-remote-launcher" "$STAGE/usr/bin/dex-remote"
 install -m 0755 "$ROOT/scripts/dex-remote-configure" "$STAGE/usr/sbin/dex-remote-setup"
 install -m 0755 "$ROOT/scripts/dex-remote-restore" "$STAGE/usr/sbin/dex-remote-restore"

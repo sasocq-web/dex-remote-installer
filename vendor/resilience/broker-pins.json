@@ -1,0 +1,18 @@
+{
+  "bounded_protocol.py": {
+    "old": "b282e5bb0a7051531f909e78625c2225c96bd3754a6c13140a0161e51c82dc3e",
+    "new": "71fda7501f5f12ae0cfec226836995705c38648d89bf7ede62335375796bd00e"
+  },
+  "broker_queue.py": {
+    "old": "fc6c19e187de1ea5224c7ee206e7f74527c9c2b50fd8becbcdace3d152e8981a",
+    "new": "e9d6d3d90218cf4f1e6efa45770eb4803d837a5e928e2102e47dc3a536643e89"
+  },
+  "outcome_journal.py": {
+    "old": "4a9b038b312311a949fa6e0ff54605b206ed0b3fced30bde26c860a969ebcef9",
+    "new": "5fd6371bcad2103689586340be9a3161a6c8f6332c6813e41a0c69f02c15f8fc"
+  },
+  "identified_units.py": {
+    "old": "7fabf59bcb17aa34cd7382a987f5a4e35140d4444393df641e827fdda2968b1c",
+    "new": "e41ecd188e22d14ed9dec635ef82f716b309e29aa5d739fda240b91aad22fb71"
+  }
+}

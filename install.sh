@@ -153,5 +153,9 @@ if [[ -n "$RESTORE_FROM" ]]; then
   dex-remote-restore --from "$RESTORE_FROM" --confirm
 fi
 
+if [[ "$MODE" == "sasocq" ]]; then
+  /usr/bin/python3 -B /opt/dex-remote/resilience/restore-native-resilience.py
+fi
+
 curl --fail --silent --show-error http://127.0.0.1:8787/api/health >/dev/null
 echo "Dex reinstalado e validado em http://127.0.0.1:8787."
